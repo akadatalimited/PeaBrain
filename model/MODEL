@@ -241,6 +241,20 @@ reason; the 6a/6b prototypes are preserved as proven research (driver
 contact without libcuda is real and repeatable) in case constraints
 ever change (dlopen-libcuda-with-fallback would unblock 6c/6d at once).
 No further GPU stages planned.
+Dmesg corroboration (operator-provided sudo dmesg, 615.78.08 boot):
+clean driver load, nvidia-drm on minor 0, fbcon healthy, no Xid, no
+resets — plus the two smoking guns from our own probes, named by the
+driver itself: 8x "NVRM:unknown NVRM ioctl command: 0xb" (our eight
+XFER-wrapped map attempts: the XFER escape itself is unrecognized on
+this driver, stronger than inner rejection) and "nvidia-uvm: ioctl 35
+not found. Did you mean to insmod with uvm_enable_builtin_tests=1?"
+(UVM_MEM_MAP is a test-only ioctl, absent from production builds).
+Both 6c dead ends confirmed driver-side, not merely empirically.
+Note: /usr/src/gpu-unlock is enabled on homer (local power-limit
+patch set on top of the open modules). Our ABI work tracks the
+published tag and revalidates by execution, so local patches are
+tolerated — but any gpu-unlock/driver update means re-running the 6a/6b
+proofs before trusting them.
 CPU path (the supported backend): AVX2/FMA FP32 + scalar reference
 (IDENTICAL suites), INT8/VNNI inference prototype, H=1..16 configurable
 at init, batch<=128 enforced (129 correctly rejected), PBMD stores H.
