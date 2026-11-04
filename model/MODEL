@@ -186,5 +186,40 @@ Branch note: feat/gpu-probe forks 1cae991; the allocator fix b32ef31
 lives on feat/usage-rowid-fix. The final executable must merge both;
 no integration until GPU work is ready (prototypes stay standalone).
 
+Stage 6c (memory mapping: HARD GATE FOUND, work suspended for direction):
+Alloc side PROVEN (C, repeated): NV01_MEMORY_LOCAL_USER (0x40) alloc/
+free under device/subdevice with NVOS02 params, explicit handles,
+any tested flags; subdevice (0x2080) + channel-group (0xa06c, zeroed
+params) also alloc cleanly. Mapping side BLOCKED on every route tried:
+ - classic RmMapMemory (0x21/XFER, NVOS33 exact per header): EINVAL x12
+   variants (both fds, subdevice, sizes 44/48, flags 0/0x4000). Modern
+   libcuda issues ZERO XFER ioctls: the classic RMAPI-via-XFER path is
+   dead on 610.xx (rm_validate rejects it).
+ - fd-mmap after alloc: no mapping context exists (EINVAL); contexts are
+   created only by a successful map call (circular).
+ - dma-buf export (17, published struct): EINVAL x14 (fds, types,
+   parents, multi-object lists). Closed-RM dup gate; libcuda never uses
+   it here (CUDA-IPC uses another mechanism).
+ - UVM (libcuda-proven for transfers): INITIALIZE/PAGEABLE/CREATE_RANGE
+   all succeed, but REGISTER_GPU fails 27 (INSUFFICIENT_PERMISSIONS)
+   with byte-identical inputs to libcuda's succeeding call. Root cause:
+   UVM GPU registration needs the vaspace/channel tree (libcuda owns
+   channel-group 0xa06c + channels 0xc56f/0xc7c0/0xc7b5 + ctx-share
+   0x9067 + events BEFORE registering; its hVaSpace IS a channel).
+   Replicating that tree IS channel bring-up, i.e. 6d-adjacent work.
+ - BAR static windows: none pre-registered (mmap fails).
+UVM call ledger (bare ints on nvidia-uvm fds): INITIALIZE=0x30000001
+(first op per fd, else later calls fail 22), MM_INIT=75 (two-fd bind
+pattern observed), REGISTER_GPU=37, VASPACE=25, MAP_EXTERNAL=33
+(needs registered GPU; attr {uuid,1,0,0,0,0} observed), plus 1/2/34/38
+reserve/free/unregister. Full libcuda traffic map captured in session.
+VERDICT: 6c-as-specified (memory before channels) is infeasible on this
+driver: UVM mapping requires channel infrastructure. Options: (i) fold
+channel-group/channel bring-up into 6c (merges with 6d-part), (ii) pause
+memory until 6d builds channels first, (iii) accept 6c-partial (alloc/
+free/sizes proven, mapping deferred). Awaiting operator direction.
+Box left clean: ~50 test procs closed fds (kernel freed RM state),
+smi shows pre-existing desktop only, 19W/41C baseline.
+
 BACKEND PRIORITY: proven-GPU(explicit opt-in) > VNNI-quant > AVX2/FMA FP32 >
 reference. model_status always reports selected backend + why others lost.
