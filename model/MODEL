@@ -160,13 +160,31 @@ Road ahead (staged, each a standalone prototype like Stages 1-4):
   6b: RM client/device/subdevice alloc via NV_ESC_IOCTL_XFER_CMD
       (needs src/common/sdk/nvidia/inc RM control headers, same tag).
   6c: device memory alloc + CPU map (NV01_MEMORY_LOCAL_USER) within a
-      VRAM budget (default cap 2-4GB of 12GB, configurable; CPU stays
-      default, GPU strictly opt-in, reported in model_status).
+      VRAM budget (default 512 MiB, 1 GiB ceiling per the standing
+      agreement — NOT the 2-4 GiB floated earlier; CPU stays default,
+      GPU strictly opt-in, reported in model_status).
   6d: channel/GPFIFO + SASS pushbuffer (kernels via on-system ptxas),
       fences; INT8/VNNI lessons reused for quant upload.
   Honest costing: 6b-6d reimplement a slice of the CUDA driver; the
 probe above is the last cheap step. No kernel executed yet; gpu stays
 "unavailable" in model_status until a stage actually computes.
+
+Stage 6b (PASS 20/20, isolated prototype model/rm_client.asm, 1874B):
+RM client + device alloc/free via raw syscalls. PCI discovery prefers
+/dev/dri/by-path (pci-*-render), verifies sysfs vendor/device/driver
+(10de/2504/nvidia, 0000:01:00.0), then RM ops go through /dev/nvidiactl
+(DRM node is NOT a substitute). Opcodes observed from installed
+libcuda traffic + confirmed by direct C experiments (never linked):
+  0x2b/48B = RM_ALLOC {hClient,hParent,hObject,hClass,pParams,...562b6f0
+  0x29/16B = RM_FREE {hClient,hParent,hObject,flags}
+  NV01_DEVICE_0 = 0x80; zeroed alloc = root client (hClass echoes 0x41).
+Run: pci=0000:01:00.0, client=0xc1d000cd, device=0xcaf00000 (RM-assigned),
+both freed r=0, exit 0. 20 fresh processes, dmesg empty of NVRM/Xid,
+smi shows only pre-existing desktop clients. No modeset, no rebind,
+no VFIO disturbance, no reboot. DB and model code untouched.
+Branch note: feat/gpu-probe forks 1cae991; the allocator fix b32ef31
+lives on feat/usage-rowid-fix. The final executable must merge both;
+no integration until GPU work is ready (prototypes stay standalone).
 
 BACKEND PRIORITY: proven-GPU(explicit opt-in) > VNNI-quant > AVX2/FMA FP32 >
 reference. model_status always reports selected backend + why others lost.
