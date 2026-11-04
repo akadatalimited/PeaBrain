@@ -8440,6 +8440,8 @@ ov_cell:
 ov_first:
     mov byte [hfirst], 0
 ov_emit:
+    mov al, '{'
+    call out_byte
     lea rsi, [jc_rowid + 1]       ; '"rowid":' (skip leading {)
     call out_cstr
     mov rax, [tmprow]
