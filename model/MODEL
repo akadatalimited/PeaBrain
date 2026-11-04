@@ -117,11 +117,34 @@ leaky-ReLU with He-scale weights (the representative PeaBrain-init case),
   value (stored b2f address, added pointer bits); (4) FNV is a hash.
 - Live tinythink.db never touched (model/ + /tmp only). No GPU (Stage 5).
 
-GPU (Stage 5+6): RTX3060 sm_86, 12GB. No libcuda, no shared libs, no ioctl
-guessing, no register poking without validated protocol. Probe /dev/nvidia*
-presence + driver version safely, document the ABI gap, conclude honestly.
-No GPU claim until a real kernel returns verified results. Fallback is always
-automatic; mid-train GPU failure rolls back before CPU resume.
+GPU (Stage 5: feasibility PROBE, 2026-11-04 — read-only recon, no devices
+opened, no ioctls, no driver changes; verdict: NOT FEASIBLE under the hard
+requirements, CPU remains backend of record).
+Hardware/driver (all present, healthy): RTX 3060 GA106 LHR (01:00.0),
+sm_86, 12GB (12288MiB), driver 610.57.04, kernel modules nvidia/nvidia_uvm/
+nvidia_modeset/nvidia_drm loaded, nodes /dev/nvidia0+nvidiactl+nvidia-uvm
+(+tools)+nvidia-modeset all 0666, DRM renderD128 present. nvidia.ko license
+Dual MIT/GPL (open kernel modules flavor).
+Routes examined and why each is blocked:
+(a) libcuda.so.1 (EXISTS, 112MB, CUDA Driver API + PTX JIT for sm_86):
+the sane route, HARD-BANNED (no libcuda, no shared libs, no dynamic deps).
+(b) NVML: same ban; mgmt-only anyway.
+(c) Direct /dev/nvidia* ioctls with hand-written userspace: the ioctl ABI
+is proprietary/undocumented; open kernel sources publish numbers but the
+working protocol (GSP-RPC sequences, channel/VASpace choreography,
+per-engine pushbuffer methods, UVM fault handling, runlist submit) is the
+multi-hundred-KLOC libcuda+firmware stack. Reimplementing it without
+guessing layouts (banned) or destabilising the shared box is infeasible;
+validating it would require the interfaces it replaces.
+(d) Nouveau/DRM/NVK: proprietary driver owns the GPU (rebind = operational
+change to shared homer); Nouveau Ampere is bring-up-grade (no reclocking,
+fractional clocks) even if bound. Out, technically and operationally.
+(e) Vulkan compute: needs Nouveau (see d) or libvulkan (banned, same as a).
+Revisit ONLY if: requirements relax to dlopen-libcuda-with-fallback, or a
+stable documented low-level compute ABI appears. Stated plainly: at current
+model scale (65 params) the GPU buys nothing; revisit at millions of
+embedding dims. model_status reports CPU backend + GPU-unavailable reason.
+NO GPU CLAIM MADE (no kernel executed, per the rule). Stage 6 stays shut.
 
 BACKEND PRIORITY: proven-GPU(explicit opt-in) > VNNI-quant > AVX2/FMA FP32 >
 reference. model_status always reports selected backend + why others lost.
