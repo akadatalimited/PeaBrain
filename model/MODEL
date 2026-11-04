@@ -255,6 +255,14 @@ patch set on top of the open modules). Our ABI work tracks the
 published tag and revalidates by execution, so local patches are
 tolerated — but any gpu-unlock/driver update means re-running the 6a/6b
 proofs before trusting them.
+Journal attribution (operator-provided journalctl, same boot): kernel
+cmdline carries gpu_unlock.targets=all (+intel_iommu=on iommu=pt for
+Egg's VFIO, undisturbed); gpu-unlock runs claim/layout/dma/gfw/fwsec/
+publish/host/FLR/handoff on 0000:01:00.0, all ret=0, "unlocked", then
+NVRM 615.78.08 loads cleanly — healthy bring-up, nothing to work
+around. The 8x 0xb (23:27:18) and ioctl-35 (23:27:22) lines are our own
+post-upgrade re-probes (nvmap 8-combo sweep, nvuvm mem_map experiment),
+confirming identical rejections on 615: no other actor, no new faults.
 CPU path (the supported backend): AVX2/FMA FP32 + scalar reference
 (IDENTICAL suites), INT8/VNNI inference prototype, H=1..16 configurable
 at init, batch<=128 enforced (129 correctly rejected), PBMD stores H.
