@@ -3,7 +3,7 @@ tinythink - thinking + memory MCP server in pure x86-64 assembly
 
 Sequential-thinking mimic plus a conclusion tool and a small memory
 core, backed by a real SQLite database written in pure asm (no includes,
-no libc). One ~42K statically-linked Linux binary.
+no libc). One ~43K statically-linked Linux binary.
 
 Needs: fasm (flat assembler) 1.73+, Linux x86-64 with x86-64-v3
 microarchitecture (AVX/AVX2/FMA/BMI1/BMI2/LZCNT; check
@@ -88,6 +88,14 @@ size-ordered leaf splits, root interior on first split, dead space on
   the freelist, whole-db flock, fsync per write txn. No overflow pages;
   rollback journal (TJRR) with recovery + truncate on open, commit
   (fsync, unlink, dirsync) on close. Read-only txns skip fsync entirely.
+
+  Multi-access (no WAL file; lock modes instead): reads take LOCK_SH
+  and run fully concurrently; writes take LOCK_EX. A reader escalates
+  (UN then EX — never upgrade, which could deadlock two upgraders)
+  only when mutation may be needed: empty DB, a leftover journal, or
+  a missing table. Recovery always runs under EX. One pipe still
+  serves requests sequentially: concurrent clients must match replies
+  by id (pipelined 20/20 verified); naive FIFO pairing garbles.
 
 Connection-warm caches (per-process, generation-guarded by db
 ino/size/mtime, write-through, flushed on mismatch):

@@ -1701,7 +1701,7 @@ oc_noconc:
     or qword [cmask], 4
 oc_noval:
     ; open (lazy create) for every conclusion op
-    call db_open
+    call db_open_ex
     test rax, rax
     jnz oc_db
     test qword [cmask], 2
@@ -2711,7 +2711,7 @@ uf_restore:
 use_flush_exit:
     cmp qword [udirty], 0
     je ufe_ret
-    call db_open
+    call db_open_ex
     test rax, rax
     jnz ufe_ret
     call use_flush
@@ -3175,7 +3175,92 @@ mg_bad:
     ret
 
 ; db_open: path, open+lock, validate or create. rax 0 ok / 1 err.
+; jhave: rax 1 if a journal file exists (crashed writer leftovers), else 0.
+; Preserves rbx,rbp,r12-r15.
+jhave:
+    mov eax, 2
+    lea rdi, [jpath]
+    xor esi, esi
+    xor edx, edx
+    syscall
+    test rax, rax
+    js jh_no
+    mov rdi, rax
+    mov eax, 3
+    syscall
+    mov eax, 1
+    ret
+jh_no:
+    xor eax, eax
+    ret
+
+; need_create: rax 1 if any memory table is missing (creation needs EX).
+; Read-only walk; saves/restores maxrowid/mmaxrowid that find_table touches.
+need_create:
+    push qword [maxrowid]
+    push qword [mmaxrowid]
+    lea rsi, [m_conct]
+    mov edx, 11
+    call find_table
+    test rax, rax
+    js nc_yes
+    jz nc_yes
+    lea rsi, [t_facts_n]
+    mov edx, 5
+    call find_table
+    test rax, rax
+    js nc_yes
+    jz nc_yes
+    lea rsi, [t_ent_n]
+    mov edx, 8
+    call find_table
+    test rax, rax
+    js nc_yes
+    jz nc_yes
+    lea rsi, [t_obs_n]
+    mov edx, 12
+    call find_table
+    test rax, rax
+    js nc_yes
+    jz nc_yes
+    lea rsi, [t_rel_n]
+    mov edx, 9
+    call find_table
+    test rax, rax
+    js nc_yes
+    jz nc_yes
+    lea rsi, [t_task_n]
+    mov edx, 5
+    call find_table
+    test rax, rax
+    js nc_yes
+    jz nc_yes
+    lea rsi, [t_use_n]
+    mov edx, 5
+    call find_table
+    test rax, rax
+    js nc_yes
+    jz nc_yes
+    pop qword [mmaxrowid]
+    pop qword [maxrowid]
+    xor eax, eax
+    ret
+nc_yes:
+    pop qword [mmaxrowid]
+    pop qword [maxrowid]
+    mov eax, 1
+    ret
+
+; db_open: shared/read (LOCK_SH). db_open_ex: exclusive/write (LOCK_EX).
+; Readers never block each other; any journal/creation/missing-table case
+; escalates a reader to EX (UN then EX, never upgrade) before mutating.
 db_open:
+    xor edi, edi
+    jmp do_open_body
+db_open_ex:
+    mov edi, 1
+do_open_body:
+    mov [dbwmode], rdi
     mov eax, 89                 ; readlink /proc/self/exe
     lea rdi, [dbexe]
     lea rsi, [exebuf]
@@ -3273,7 +3358,9 @@ do_open:
     syscall
     test rax, rax
     js do_closeerr
-    mov eax, 73                 ; flock LOCK_EX
+    cmp qword [dbwmode], 0
+    je do_shlock
+    mov eax, 73                 ; flock LOCK_EX (writers)
     mov rdi, [dbfd]
     mov esi, 2
     syscall
@@ -3282,6 +3369,15 @@ do_open:
     call jrecover               ; rollback torn txn if journal present
     test rax, rax
     jnz do_closeerr
+    jmp do_fstat
+do_shlock:
+    mov eax, 73                 ; flock LOCK_SH (readers share)
+    mov rdi, [dbfd]
+    mov esi, 1
+    syscall
+    test rax, rax
+    js do_closeerr
+do_fstat:
     mov eax, 5                  ; fstat: st_size @ +48
     mov rdi, [dbfd]
     lea rsi, [dbstat]
@@ -3298,6 +3394,19 @@ do_open:
     mov eax, dword [dbstat + 28]
     cmp eax, ecx
     jne do_closeerr
+    cmp qword [dbwmode], 0
+    jne do_guards_done
+    ; SH guards: creation / recovery / missing tables need EX
+    mov rax, qword [dbstat + 48]
+    test rax, rax
+    jz do_escalate
+    call jhave                  ; stale journal from a crashed writer?
+    test rax, rax
+    jnz do_escalate
+    call need_create            ; any table missing?
+    test rax, rax
+    jnz do_escalate
+do_guards_done:
     ; cache generation: same ino/size/mtime as our last close -> warm
     mov rax, qword [dbstat + 8]
     cmp rax, [cino]
@@ -3369,6 +3478,26 @@ do_ensure:
 do_cached:
     xor eax, eax
     ret
+; do_escalate: SH holder needs mutation. UN then EX (never upgrade: two
+; simultaneous upgraders would deadlock), recover, redo from fstat as EX.
+do_escalate:
+    mov qword [dbwmode], 1
+    mov eax, 73
+    mov rdi, [dbfd]
+    mov esi, 8
+    syscall
+    test rax, rax
+    js do_closeerr
+    mov eax, 73
+    mov rdi, [dbfd]
+    mov esi, 2
+    syscall
+    test rax, rax
+    js do_closeerr
+    call jrecover
+    test rax, rax
+    jnz do_closeerr
+    jmp do_fstat
 do_closeerr:
     push rax
     mov eax, 3
@@ -6144,7 +6273,7 @@ op_fwrite:
     call ascii_only
     test rax, rax
     jnz oc_ascii
-    call db_open
+    call db_open_ex
     test rax, rax
     jnz oc_db
     mov rdi, [f_root_facts]
@@ -6468,7 +6597,7 @@ om_notype:
     test rax, rax
     jnz oc_ascii
 om_noproj:
-    call db_open
+    call db_open_ex
     test rax, rax
     jnz oc_db
     ; dup? -> return existing, created:false
@@ -6704,7 +6833,7 @@ op_addobs:
     jne dc_params
     inc rax
     mov [obsarr], rax
-    call db_open
+    call db_open_ex
     test rax, rax
     jnz oc_db
     ; ensure entity (auto-create stub)
@@ -6881,7 +7010,7 @@ op_mkrel:
     call ascii_only
     test rax, rax
     jnz oc_ascii
-    call db_open
+    call db_open_ex
     test rax, rax
     jnz oc_db
     ; dup triple? scan all rel rows for exact match
@@ -7910,7 +8039,7 @@ omt_noproj:
     test rax, rax
     jnz dc_params
 omt_nopri:
-    call db_open
+    call db_open_ex
     test rax, rax
     jnz oc_db
     mov rax, [taskseq]
@@ -8426,7 +8555,7 @@ ou_noproj:
 ou_nopri:
     test qword [tmask], 31
     jz dc_params
-    call db_open
+    call db_open_ex
     test rax, rax
     jnz oc_db
     ; find latest row with tid==qtid (newest-first walk)
@@ -9305,6 +9434,7 @@ udirty dq 0
 uloaded dq 0
 ulkey dq 0
 ulhits dq 0
+dbwmode dq 0
 sroot dq 0
 smode dq 0
 scount dq 0
