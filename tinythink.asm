@@ -3609,11 +3609,17 @@ use_flush:
     lea rdi, [svstate + 224]
     mov ecx, 8
     rep movsq
-    ; No scan_max here (it was O(rows) per flush -> O(n^2) total once every
-    ; write flushes): [maxrowid] is already txn-fresh (scanned at open,
-    ; our own inserts ++ it, concurrent writers are locked out by our EX
-    ; lock), so ++maxrowid rowids cannot collide. A scan remains only for
-    ; cold opens, not per-flush.
+    ; Fresh usage high-water mark: the shared [maxrowid] may hold another
+    ; table's max (every op refreshes it for its own table) or a pre-flush
+    ; value, so bare ++[maxrowid] rowids can collide with existing usage
+    ; rows (duplicates) or land below the true max (out-of-order cells).
+    ; O(depth) rightmost descent; also primes dstack for the right-edge
+    ; place_cell calls below. Failure here wrote nothing, so the normal
+    ; abort path (which restores the untouched counter) stays correct.
+    mov rdi, [f_root_use]
+    call tail_max
+    test rax, rax
+    jnz uf_abort
 uf_slot:
     mov rax, [uq_head]
     cmp rax, [uq_tail]
@@ -3720,9 +3726,22 @@ uf_done:
     test rax, rax
     jnz uf_abort
     mov qword [udirty], 0
-    push rax
-    jmp uf_restore
+    mov rax, [maxrowid]
+    mov qword [svstate + 8], rax   ; keep the advanced high-water mark:
+    push rax                       ; the shared restore below must not
+    jmp uf_restore                 ; revert it to the pre-flush value
 uf_abort:
+    ; Placed rows persist (the piggyback commits with the outer txn, and
+    ; the exit path commits too), so the pre-flush counter must not come
+    ; back: re-sync to the true max. If the re-sync itself fails the tree
+    ; is unreadable and the stale value is no worse.
+    mov rdi, [f_root_use]
+    call tail_max
+    test rax, rax
+    jnz uf_abortkeep
+    mov rax, [maxrowid]
+    mov qword [svstate + 8], rax
+uf_abortkeep:
     push rax
     mov rax, 1
     mov [rsp], rax
@@ -7799,8 +7818,12 @@ sr_cell:
     test rcx, rcx
     jz sr_corrupt
     mov [tmprow], rax
-    mov rsi, rcx                ; rec
-    call varint_get             ; hdrsize
+    cmp rax, [maxrowid]
+    jbe sr_hadmax
+    mov [maxrowid], rax         ; track table max during the walk, so the
+sr_hadmax:                      ; oc_insert ++[maxrowid] below is post-lock
+    mov rsi, rcx                ; fresh under concurrency (zero extra I/O:
+    call varint_get             ; hdrsize every visited cell is read anyway)
     test rcx, rcx
     jz sr_corrupt
     mov rsi, rcx
