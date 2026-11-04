@@ -260,13 +260,37 @@ oh_d:
     add al, '0'
     jmp out_byte
 
-emit:
+; write_all(rdi=fd, rsi=buf, rdx=len): rax=0 ok, 1 err.
+write_all:
+    test rdx, rdx
+    jz wa_ok
+wa_loop:
+    push rdi
+    push rsi
+    push rdx
     mov eax, 1
-    mov edi, 1
+    syscall
+    pop rdx
+    pop rsi
+    pop rdi
+    cmp rax, 0
+    jle wa_bad
+    add rsi, rax
+    sub rdx, rax
+    test rdx, rdx
+    jnz wa_loop
+wa_ok:
+    xor eax, eax
+    ret
+wa_bad:
+    mov eax, 1
+    ret
+
+emit:
+    mov edi, 1                ; looped write: big history output may partial-write
     lea rsi, [outbuf]
     mov rdx, [outlen]
-    syscall
-    ret
+    jmp write_all
 
 ; ---------------- parsers ----------------
 ; find_val(rsi=start, rdi=key, rcx=keylen): rax=ptr after colon+ws, 0=no.
@@ -1012,6 +1036,84 @@ do_call:
     call cmp_name
     test rax, rax
     jnz op_conclusion
+    lea rsi, [toolbuf]
+    mov rdx, [toollen]
+    lea rdi, [t_hist]
+    call cmp_name
+    test rax, rax
+    jnz op_history
+    lea rsi, [toolbuf]
+    mov rdx, [toollen]
+    lea rdi, [t_reset]
+    call cmp_name
+    test rax, rax
+    jnz op_reset
+    lea rsi, [toolbuf]
+    mov rdx, [toollen]
+    lea rdi, [t_fread]
+    call cmp_name
+    test rax, rax
+    jnz op_fread
+    lea rsi, [toolbuf]
+    mov rdx, [toollen]
+    lea rdi, [t_fwrite]
+    call cmp_name
+    test rax, rax
+    jnz op_fwrite
+    lea rsi, [toolbuf]
+    mov rdx, [toollen]
+    lea rdi, [t_flist]
+    call cmp_name
+    test rax, rax
+    jnz op_flist
+    lea rsi, [toolbuf]
+    mov rdx, [toollen]
+    lea rdi, [t_mkentity]
+    call cmp_name
+    test rax, rax
+    jnz op_mkentity
+    lea rsi, [toolbuf]
+    mov rdx, [toollen]
+    lea rdi, [t_addobs]
+    call cmp_name
+    test rax, rax
+    jnz op_addobs
+    lea rsi, [toolbuf]
+    mov rdx, [toollen]
+    lea rdi, [t_search]
+    call cmp_name
+    test rax, rax
+    jnz op_search
+    lea rsi, [toolbuf]
+    mov rdx, [toollen]
+    lea rdi, [t_open]
+    call cmp_name
+    test rax, rax
+    jnz op_open
+    lea rsi, [toolbuf]
+    mov rdx, [toollen]
+    lea rdi, [t_mktask]
+    call cmp_name
+    test rax, rax
+    jnz op_mktask
+    lea rsi, [toolbuf]
+    mov rdx, [toollen]
+    lea rdi, [t_query]
+    call cmp_name
+    test rax, rax
+    jnz op_query
+    lea rsi, [toolbuf]
+    mov rdx, [toollen]
+    lea rdi, [t_updtask]
+    call cmp_name
+    test rax, rax
+    jnz op_updtask
+    lea rsi, [toolbuf]
+    mov rdx, [toollen]
+    lea rdi, [t_mkrel]
+    call cmp_name
+    test rax, rax
+    jnz op_mkrel
     lea rdi, [c_params]
     lea rsi, [m_notool]
     jmp err_id
@@ -1314,6 +1416,59 @@ oc_envelope:
     call out_byte
     jmp emit
 
+; valid_name(rsi, rdx=len): rax=0 ok, 1 bad. 1..64 [A-Za-z0-9._-], not ./...
+valid_name:
+    cmp rdx, 1
+    jb vn_bad
+    cmp rdx, 64
+    ja vn_bad
+    cmp rdx, 1
+    jne vn_n1
+    cmp byte [rsi], '.'
+    je vn_bad
+vn_n1:
+    cmp rdx, 2
+    jne vn_loop
+    cmp byte [rsi], '.'
+    jne vn_loop
+    cmp byte [rsi + 1], '.'
+    je vn_bad
+vn_loop:
+    test rdx, rdx
+    jz vn_ok
+    mov al, [rsi]
+    inc rsi
+    dec rdx
+    cmp al, 'A'
+    jb vn_sym
+    cmp al, 'Z'
+    jbe vn_loop
+    cmp al, 'a'
+    jb vn_bad
+    cmp al, 'z'
+    jbe vn_loop
+    jmp vn_bad
+vn_sym:
+    cmp al, '0'
+    jb vn_sym2
+    cmp al, '9'
+    jbe vn_loop
+    jmp vn_bad
+vn_sym2:
+    cmp al, '.'
+    je vn_loop
+    cmp al, '_'
+    je vn_loop
+    cmp al, '-'
+    je vn_loop
+    jmp vn_bad
+vn_ok:
+    xor eax, eax
+    ret
+vn_bad:
+    mov eax, 1
+    ret
+
 ; ascii_only(rsi, rdx=len): rax=0 ok, 1 bad. allows 9,10,13,32..126.
 ascii_only:
     test rdx, rdx
@@ -1581,11 +1736,20 @@ do_open:
     call magic_ok
     test rax, rax
     jnz do_closeerr
-    call scan_max
-    xor eax, eax
-    ret
+    lea rsi, [pagebuf + 60]       ; taskseq lives in header user-version
+    call be32_ld
+    mov [taskseq], rax
+    jmp do_ensure
 do_create:
     call db_create
+    test rax, rax
+    jnz do_closeerr
+do_ensure:
+    call ensure_tables           ; new tables for old DBs; fills f_root_*
+    test rax, rax
+    jnz do_closeerr
+    mov rdi, 2
+    call scan_max                ; conclusions max rowid
     test rax, rax
     jnz do_closeerr
     xor eax, eax
@@ -1659,6 +1823,15 @@ db_create:
     mov rax, 3054000
     lea rdi, [pagebuf + 96]
     call be32_st
+    lea rax, [m_conct]
+    mov [m_name], rax
+    mov qword [m_namelen], 11
+    mov qword [m_rootpg], 2
+    lea rax, [dbsql]
+    mov [m_sql], rax
+    mov rax, dbsql_len
+    mov [m_sqllen], rax
+    mov qword [m_rowid], 1
     call build_master_cell
     test rax, rax
     jnz dbc_err
@@ -1706,78 +1879,83 @@ db_create:
     jnz dbc_err
     mov qword [dbpages], 2
     mov qword [maxrowid], 0
+    mov qword [taskseq], 0
     xor eax, eax
     ret
 dbc_err:
     mov eax, 1
     ret
 
-; build_master_cell -> celltmp, [clen]. rax 0/1.
+; build_master_cell: master row for name [m_name]/[m_namelen], root [m_rootpg],
+; sql [m_sql]/[m_sqllen], rowid [m_rowid] -> celltmp, [clen]. rax 0/1.
 build_master_cell:
     push rbx
-    ; serials: 'table'(5)->23, name(11)->35, tbl(11)->35, rootpage 2->1, sql->13+2n
+    mov rax, [m_rootpg]
+    cmp rax, 127
+    ja bmc_err
     lea rdi, [recscratch]
-    mov rax, 23
+    mov rax, 23                  ; 'table'
     call varint_put
     mov [slen], rcx
-    lea rdi, [recscratch]
-    add rdi, rcx
-    mov rax, 35
-    call varint_put
-    add [slen], rcx
+    mov rax, [m_namelen]
+    lea rax, [rax + rax + 13]    ; name serial
     lea rdi, [recscratch]
     add rdi, [slen]
-    mov rax, 35
     call varint_put
     add [slen], rcx
+    mov rax, [m_namelen]         ; tbl_name = name
+    lea rax, [rax + rax + 13]
     lea rdi, [recscratch]
     add rdi, [slen]
-    mov rax, 1
     call varint_put
     add [slen], rcx
-    mov rax, dbsql_len
-    lea rbx, [rax + rax + 13]   ; serial for sql text
+    mov rax, 1                   ; rootpage int8
     lea rdi, [recscratch]
     add rdi, [slen]
-    mov rax, rbx
+    call varint_put
+    add [slen], rcx
+    mov rax, [m_sqllen]
+    lea rax, [rax + rax + 13]    ; sql serial
+    lea rdi, [recscratch]
+    add rdi, [slen]
     call varint_put
     add [slen], rcx
     ; record into recbuf: [hdrsize][serials][body]
     mov rax, [slen]
-    inc rax                       ; hdrsize H (= 1 + S, serials counted once)
+    inc rax
     mov [reclen], rax
     lea rdi, [recbuf]
-    call varint_put               ; emit H
+    call varint_put
     lea rsi, [recscratch]
     mov rcx, [slen]
-    rep movsb                     ; serials (already counted in H)
+    rep movsb
     lea rsi, [m_table]          ; 'table'
     mov ecx, 5
     add [reclen], rcx
     rep movsb
-    lea rsi, [m_conct]          ; 'conclusions'
-    mov ecx, 11
+    mov rsi, [m_name]
+    mov rcx, [m_namelen]
     add [reclen], rcx
     rep movsb
-    lea rsi, [m_conct]
-    mov ecx, 11
+    mov rsi, [m_name]
+    mov rcx, [m_namelen]
     add [reclen], rcx
     rep movsb
-    mov al, 2                   ; rootpage
+    mov rax, [m_rootpg]         ; rootpage byte
     stosb
     inc qword [reclen]
-    lea rsi, [dbsql]
-    mov rcx, dbsql_len
+    mov rsi, [m_sql]
+    mov rcx, [m_sqllen]
     add [reclen], rcx
     rep movsb
-    ; cell: [payload=reclen][rowid=1][record]
+    ; cell: [payload=reclen][rowid][record]
     lea rdi, [celltmp]
     mov rax, [reclen]
     call varint_put
     mov [clen], rcx
     lea rdi, [celltmp]
     add rdi, rcx
-    mov rax, 1
+    mov rax, [m_rowid]
     call varint_put
     add [clen], rcx
     lea rsi, [recbuf]
@@ -1788,6 +1966,10 @@ build_master_cell:
     rep movsb
     pop rbx
     xor eax, eax
+    ret
+bmc_err:
+    pop rbx
+    mov eax, 1
     ret
 
 ; hdr_touch: changecounter++, size=dbpages on page 1. rax 0/1.
@@ -1805,6 +1987,9 @@ hdr_touch:
     mov rax, [dbpages]
     lea rdi, [pagebuf + 28]
     call be32_st
+    mov rax, [taskseq]
+    lea rdi, [pagebuf + 60]
+    call be32_st
     mov edi, 1
     lea rsi, [pagebuf]
     call pg_write
@@ -1816,18 +2001,94 @@ ht_err:
     mov eax, 1
     ret
 
-; scan_max: max cell rowid over leaf pages -> [maxrowid].
+; walk_leaves(rdi=rootpg): childtab[] = table leaf pages (asc), [childn].
+; Interior children are leaves in our design (interior never splits).
+; rax 0 ok / 1 err.
+walk_leaves:
+    push rbx
+    push r12
+    mov [wroot], rdi
+    mov qword [childn], 0
+    lea rsi, [pagebuf]
+    call pg_read
+    test rax, rax
+    jnz wl_err
+    cmp byte [pagebuf], 0x0D
+    je wl_single
+    cmp byte [pagebuf], 0x05
+    jne wl_err
+    lea rsi, [pagebuf + 3]
+    call be16_ld
+    cmp rax, 1022
+    ja wl_err
+    mov rbx, rax                ; ndiv
+    xor r12d, r12d              ; i
+wl_cell:
+    cmp r12, rbx
+    jae wl_right
+    lea rsi, [pagebuf + 12]
+    mov rax, r12
+    shl rax, 1
+    add rsi, rax
+    call be16_ld                ; celloff
+    lea rsi, [pagebuf]
+    add rsi, rax
+    call be32_ld                ; left child
+    lea rsi, [childtab]
+    mov rcx, [childn]
+    shl rcx, 3
+    add rsi, rcx
+    mov [rsi], rax
+    inc qword [childn]
+    inc r12
+    jmp wl_cell
+wl_right:
+    lea rsi, [pagebuf + 8]
+    call be32_ld
+    lea rsi, [childtab]
+    mov rcx, [childn]
+    shl rcx, 3
+    add rsi, rcx
+    mov [rsi], rax
+    inc qword [childn]
+    pop r12
+    pop rbx
+    xor eax, eax
+    ret
+wl_single:
+    lea rsi, [childtab]
+    mov rax, [wroot]
+    mov [rsi], rax
+    mov qword [childn], 1
+    pop r12
+    pop rbx
+    xor eax, eax
+    ret
+wl_err:
+    pop r12
+    pop rbx
+    mov eax, 1
+    ret
+
+; scan_max(rdi=rootpg): max cell rowid over table leaves -> [maxrowid].
 scan_max:
     push rbx
     push r12
     push r13
+    push r14
+    call walk_leaves
+    test rax, rax
+    jnz sm_err
     mov qword [maxrowid], 0
-    mov r12, 2
+    xor r14d, r14d              ; ci
 sm_page:
-    mov rax, [dbpages]
-    cmp r12, rax
-    ja sm_done
-    mov rdi, r12
+    cmp r14, [childn]
+    jae sm_done
+    lea rsi, [childtab]
+    mov rax, r14
+    shl rax, 3
+    add rsi, rax
+    mov rdi, [rsi]
     lea rsi, [pagebuf]
     call pg_read
     test rax, rax
@@ -1837,7 +2098,7 @@ sm_page:
     lea rsi, [pagebuf + 3]
     call be16_ld
     mov rbx, rax                ; n
-    xor r13d, r13d              ; i (r13 survives varint_get)
+    xor r13d, r13d              ; i
 sm_cell:
     cmp r13, rbx
     jae sm_next
@@ -1851,11 +2112,11 @@ sm_cell:
     lea rdx, [pagebuf + 4096]
     call varint_get             ; plen
     test rcx, rcx
-    jz sm_next
+    jz sm_inci
     mov rsi, rcx
     call varint_get             ; rowid
     test rcx, rcx
-    jz sm_next
+    jz sm_inci
     cmp rax, [maxrowid]
     jbe sm_inci
     mov [maxrowid], rax
@@ -1863,17 +2124,26 @@ sm_inci:
     inc r13
     jmp sm_cell
 sm_next:
-    inc r12
+    inc r14
     jmp sm_page
 sm_done:
+    pop r14
     pop r13
     pop r12
     pop rbx
+    xor eax, eax
+    ret
+sm_err:
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    mov eax, 1
     ret
 
-; rightmost_leaf: descend to rightmost leaf. [curpg]=pgno, pagebuf set. rax 0/1.
+; rightmost_leaf(rdi=root): descend to rightmost leaf. [curpg]=pgno. rax 0/1.
 rightmost_leaf:
-    mov rdi, 2
+    ; rdi = root, no pushes needed (no preserved regs used)
 rl_loop:
     mov [curpg], rdi
     push rdi
@@ -1883,6 +2153,10 @@ rl_loop:
     test rax, rax
     jnz rl_err
     mov al, [pagebuf]
+    cmp qword [curpg], 1
+    jne rl_typed
+    mov al, [pagebuf + 100]   ; page-1 b-tree type (file header shift)
+rl_typed:
     cmp al, 0x0D
     je rl_found
     cmp al, 0x05
@@ -1993,16 +2267,45 @@ bd_noth:
     xor eax, eax
     ret
 
-; insert_row: build assumed done? No: builds cell, inserts at right edge
+; insert_row: builds conclusions cell, inserts at right edge of root 2.
 ; (uses [newrowid] + field bufs). rax 0 ok / 1 io / 2 full.
 insert_row:
     push rbx
     push r12
     call build_data_cell
-    call rightmost_leaf
+    mov qword [splitroot], 2
+    mov qword [pagebase], 0
+    call place_cell
     test rax, rax
     jnz ir_err
-    ; free in pagebuf leaf (base 0)
+    mov rax, [newrowid]
+    mov [maxrowid], rax
+    pop r12
+    pop rbx
+    xor eax, eax
+    ret
+ir_err:
+    pop r12
+    pop rbx
+    mov eax, 1
+    ret
+ir_split:
+    call split_leaf
+    pop r12
+    pop rbx
+    ret                           ; rax from split_leaf (0/1/2)
+
+; place_cell: insert celltmp/[clen] at right edge of [splitroot] table.
+; Data pages only (base 0). Cell rowid must exceed table max (append order).
+; rax 0 ok / 1 io / 2 full.
+place_cell:
+    push rbx
+    push r12
+    mov rdi, [splitroot]
+    call rightmost_leaf
+    test rax, rax
+    jnz pc_err
+    ; free in pagebuf leaf
     lea rsi, [pagebuf + 3]
     call be16_ld
     mov r12, rax                ; n
@@ -2016,7 +2319,7 @@ insert_row:
     mov rcx, [clen]
     add rcx, 2
     cmp rbx, rcx
-    jb ir_split
+    jb pc_split
     ; place at content-clen
     lea rsi, [pagebuf + 5]
     call be16_ld
@@ -2047,23 +2350,81 @@ insert_row:
     lea rsi, [pagebuf]
     call pg_write
     test rax, rax
-    jnz ir_err
-    mov rax, [newrowid]
-    mov [maxrowid], rax
+    jnz pc_err
     pop r12
     pop rbx
     xor eax, eax
     ret
-ir_err:
+pc_err:
     pop r12
     pop rbx
     mov eax, 1
     ret
-ir_split:
+pc_split:
     call split_leaf
     pop r12
     pop rbx
     ret                           ; rax from split_leaf (0/1/2)
+
+; master_place: append celltmp/[clen] to page-1 master leaf (explicit
+; +100 offsets). Master never splits (6 tiny rows). rax 0/1.
+master_place:
+    push rbx
+    mov edi, 1
+    lea rsi, [pagebuf]
+    call pg_read
+    test rax, rax
+    jnz mp_err
+    cmp byte [pagebuf + 100], 0x0D
+    jne mp_err
+    lea rsi, [pagebuf + 103]
+    call be16_ld
+    mov rbx, rax                ; n
+    lea rsi, [pagebuf + 105]
+    call be16_ld                ; content
+    mov rcx, rbx
+    shl rcx, 1
+    sub rax, rcx
+    sub rax, 108                ; free = content-(100+8+2n)
+    mov rcx, [clen]
+    add rcx, 2
+    cmp rax, rcx
+    jb mp_err
+    lea rsi, [pagebuf + 105]
+    call be16_ld
+    sub rax, [clen]
+    mov [wcontent], rax
+    lea rsi, [celltmp]
+    lea rdi, [pagebuf]
+    add rdi, rax
+    mov rcx, [clen]
+    rep movsb
+    lea rsi, [pagebuf + 108]
+    mov rax, rbx
+    shl rax, 1
+    add rsi, rax
+    mov rax, [wcontent]
+    mov rdi, rsi
+    call be16_st
+    lea rdi, [pagebuf + 103]
+    mov rax, rbx
+    inc rax
+    call be16_st
+    lea rdi, [pagebuf + 105]
+    mov rax, [wcontent]
+    call be16_st
+    mov edi, 1
+    lea rsi, [pagebuf]
+    call pg_write
+    test rax, rax
+    jnz mp_err
+    pop rbx
+    xor eax, eax
+    ret
+mp_err:
+    pop rbx
+    mov eax, 1
+    ret
 
 ; split_leaf: pagebuf=P full leaf, [curpg]=P, new cell in celltmp.
 ; Size-ordered division; new cell (max rowid) always lands in the right page.
@@ -2165,10 +2526,11 @@ sp_havek:
     test rcx, rcx
     jz sp_err
     mov [divkey], rax
-    cmp qword [curpg], 2
+    mov rax, [curpg]
+    cmp rax, [splitroot]
     je sp_rootcase
-    ; ---- case B: parent is root interior (page 2) ----
-    mov edi, 2
+    ; ---- case B: parent is the table root interior ----
+    mov rdi, [splitroot]
     lea rsi, [ipage]
     call pg_read
     test rax, rax
@@ -2247,14 +2609,14 @@ sp_havek:
     mov rax, [qpg]
     lea rdi, [ipage + 8]
     call be32_st
-    mov edi, 2
+    mov rdi, [splitroot]
     lea rsi, [ipage]
     call pg_write
     test rax, rax
     jnz sp_err
     jmp sp_ok
 sp_rootcase:
-    ; ---- case A: P==2 root leaf -> reorg ----
+    ; ---- case A: P==root leaf -> reorg (root keeps its page number) ----
     mov rax, [dbpages]
     inc rax
     mov [dbpages], rax          ; Lno
@@ -2321,8 +2683,6 @@ sp_rootcase:
     test rax, rax
     jnz sp_err
 sp_ok:
-    mov rax, [newrowid]
-    mov [maxrowid], rax
     pop r15
     pop r14
     pop r13
@@ -2462,7 +2822,911 @@ rf_done:
     pop rbx
     ret
 
-; scan_reason: find rsnbuf/rsnlen in leaf pages.
+; dec_int(serial in rax, value ptr in rsi): rax=value.
+; serials 0/8->0 (no bytes), 9->1 (no bytes), 1->u8, 2->u16be. else -1.
+dec_int:
+    test rax, rax
+    jz di_zero
+    cmp rax, 8
+    je di_zero
+    cmp rax, 9
+    je di_one
+    cmp rax, 1
+    je di_u8
+    cmp rax, 2
+    je di_u16
+    mov rax, -1
+    ret
+di_zero:
+    xor eax, eax
+    ret
+di_one:
+    mov eax, 1
+    ret
+di_u8:
+    movzx eax, byte [rsi]
+    ret
+di_u16:
+    jmp be16_ld
+
+; slen_of(serial in rax): rdx=TEXT byte length (0 for empty serial 0).
+; rax=0 ok / 1 bad (non-TEXT).
+slen_of:
+    test rax, rax
+    jz sl_zero
+    cmp rax, 13
+    jb sl_bad
+    test al, 1
+    jz sl_bad
+    sub rax, 13
+    shr rax, 1
+    mov rdx, rax
+    xor eax, eax
+    ret
+sl_zero:
+    xor edx, edx
+    xor eax, eax
+    ret
+sl_bad:
+    mov eax, 1
+    ret
+
+; find_table(rsi=name, rdx=namelen): rax=rootpg (0 missing, -1 corrupt),
+; rdx=master rowid. Updates [mmaxrowid]. Single pass.
+find_table:
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    mov [ftname], rsi
+    mov [ftlen], rdx
+    mov edi, 1
+    lea rsi, [pagebuf]
+    call pg_read
+    test rax, rax
+    jnz ft_err
+    cmp byte [pagebuf + 100], 0x0D   ; page-1 b-tree type (file header shift)
+    jne ft_err
+    lea rsi, [pagebuf + 103]    ; page-1 ncells (100-byte file header shift)
+    call be16_ld
+    mov rbx, rax
+    xor r12d, r12d
+ft_cell:
+    cmp r12, rbx
+    jae ft_missing
+    lea rsi, [pagebuf + 108]    ; page-1 ptr array (100-byte file header shift)
+    mov rax, r12
+    shl rax, 1
+    add rsi, rax
+    call be16_ld                ; coff
+    lea r15, [pagebuf]
+    add r15, rax
+    lea rdx, [pagebuf + 4096]
+    mov rsi, r15
+    call varint_get             ; plen
+    test rcx, rcx
+    jz ft_err
+    mov rsi, rcx
+    call varint_get             ; rowid
+    test rcx, rcx
+    jz ft_err
+    cmp rax, [mmaxrowid]
+    jbe ft_r1
+    mov [mmaxrowid], rax
+ft_r1:
+    mov [tmprow], rax
+    mov rsi, rcx
+    call varint_get             ; hdrsize
+    test rcx, rcx
+    jz ft_err
+    mov rsi, rcx
+    call varint_get             ; s0 type
+    test rcx, rcx
+    jz ft_err
+    mov r14, rax                ; s0
+    mov rsi, rcx
+    call varint_get             ; s1 name
+    test rcx, rcx
+    jz ft_err
+    mov [ts1], rax
+    mov rsi, rcx
+    call varint_get             ; s2 tbl
+    test rcx, rcx
+    jz ft_err
+    mov [ts2], rax
+    mov rsi, rcx
+    mov [ts3p], rsi             ; (reused: s3 value resolve below needs body math)
+    call varint_get             ; s3 rootpage
+    test rcx, rcx
+    jz ft_err
+    mov [ts3], rax
+    mov rsi, rcx
+    call varint_get             ; s4 sql
+    test rcx, rcx
+    jz ft_err
+    mov r11, rcx                ; body
+    ; col1 = body + len(s0)
+    mov rax, r14
+    cmp rax, 0
+    je ft_l0z
+    cmp rax, 13
+    jb ft_err
+    test al, 1
+    jz ft_err
+    sub rax, 13
+    shr rax, 1
+    jmp ft_l0x
+ft_l0z:
+    xor eax, eax
+ft_l0x:
+    add r11, rax                 ; r11 = col1 (name) value
+    ; col1 must be TEXT len==ftlen and match
+    mov rcx, [ts1]
+    cmp rcx, 13
+    jb ft_next
+    test cl, 1
+    jz ft_next
+    sub rcx, 13
+    shr rcx, 1
+    cmp rcx, [ftlen]
+    jne ft_next
+    mov rsi, r11
+    mov rdi, [ftname]
+    rep cmpsb
+    jne ft_next
+    ; match: col3 (rootpage) value = col1 + len(s1) + len(s2)
+    mov rax, [ts1]
+    call slen_of
+    test rax, rax
+    jnz ft_err
+    add r11, rdx
+    mov rax, [ts2]
+    call slen_of
+    test rax, rax
+    jnz ft_err
+    add r11, rdx                ; r11 = col3 value
+    mov rax, [ts3]
+    mov rsi, r11
+    call dec_int
+    cmp rax, -1
+    je ft_err
+    test rax, rax
+    jz ft_err
+    mov rdx, [tmprow]
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+ft_next:
+    inc r12
+    jmp ft_cell
+ft_missing:
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    xor eax, eax
+    xor edx, edx
+    ret
+ft_err:
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    mov eax, -1
+    ret
+; et_mk: m_* preset (name/sql); allocates root leaf, inserts master row.
+; rax=new root, 0=fail.
+et_mk:
+    mov rax, [dbpages]
+    inc rax
+    mov [dbpages], rax
+    mov [et_root], rax
+    lea rdi, [leafbuf]
+    mov ecx, 4096
+    xor eax, eax
+    rep stosb
+    mov byte [leafbuf], 0x0D
+    mov rax, 4096
+    lea rdi, [leafbuf + 5]
+    call be16_st
+    mov rdi, [et_root]
+    lea rsi, [leafbuf]
+    call pg_write
+    test rax, rax
+    jnz etm_err
+    mov rax, [mmaxrowid]
+    inc rax
+    mov [mmaxrowid], rax
+    mov [m_rowid], rax
+    mov rax, [et_root]
+    mov [m_rootpg], rax
+    call build_master_cell
+    test rax, rax
+    jnz etm_err
+    call master_place
+    test rax, rax
+    jnz etm_err
+    call hdr_touch
+    test rax, rax
+    jnz etm_err
+    mov rax, [et_root]
+    ret
+etm_err:
+    xor eax, eax
+    ret
+
+; ensure_tables: create missing memory tables; fills f_root_*.
+; conclusions with root 2 must exist (else foreign db -> err). rax 0/1.
+ensure_tables:
+    lea rsi, [m_conct]
+    mov edx, 11
+    call find_table
+    cmp rax, 2
+    jne et_err
+    ; facts
+    lea rsi, [t_facts_n]
+    mov edx, 5
+    call find_table
+    test rax, rax
+    js et_err
+    jnz et_ff
+    lea rax, [t_facts_n]
+    mov [m_name], rax
+    mov qword [m_namelen], 5
+    lea rax, [t_facts_sql]
+    mov [m_sql], rax
+    mov rax, t_facts_sqllen
+    mov [m_sqllen], rax
+    call et_mk
+    test rax, rax
+    jz et_err
+    mov [f_root_facts], rax
+    jmp et_en
+et_ff:
+    mov [f_root_facts], rax
+et_en:
+    ; entities
+    lea rsi, [t_ent_n]
+    mov edx, 8
+    call find_table
+    test rax, rax
+    js et_err
+    jnz et_ef
+    lea rax, [t_ent_n]
+    mov [m_name], rax
+    mov qword [m_namelen], 8
+    lea rax, [t_ent_sql]
+    mov [m_sql], rax
+    mov rax, t_ent_sqllen
+    mov [m_sqllen], rax
+    call et_mk
+    test rax, rax
+    jz et_err
+    mov [f_root_ent], rax
+    jmp et_ob
+et_ef:
+    mov [f_root_ent], rax
+et_ob:
+    ; observations
+    lea rsi, [t_obs_n]
+    mov edx, 12
+    call find_table
+    test rax, rax
+    js et_err
+    jnz et_of
+    lea rax, [t_obs_n]
+    mov [m_name], rax
+    mov qword [m_namelen], 12
+    lea rax, [t_obs_sql]
+    mov [m_sql], rax
+    mov rax, t_obs_sqllen
+    mov [m_sqllen], rax
+    call et_mk
+    test rax, rax
+    jz et_err
+    mov [f_root_obs], rax
+    jmp et_re
+et_of:
+    mov [f_root_obs], rax
+et_re:
+    ; relations
+    lea rsi, [t_rel_n]
+    mov edx, 9
+    call find_table
+    test rax, rax
+    js et_err
+    jnz et_rf
+    lea rax, [t_rel_n]
+    mov [m_name], rax
+    mov qword [m_namelen], 9
+    lea rax, [t_rel_sql]
+    mov [m_sql], rax
+    mov rax, t_rel_sqllen
+    mov [m_sqllen], rax
+    call et_mk
+    test rax, rax
+    jz et_err
+    mov [f_root_rel], rax
+    jmp et_ta
+et_rf:
+    mov [f_root_rel], rax
+et_ta:
+    ; tasks
+    lea rsi, [t_task_n]
+    mov edx, 5
+    call find_table
+    test rax, rax
+    js et_err
+    jnz et_tf
+    lea rax, [t_task_n]
+    mov [m_name], rax
+    mov qword [m_namelen], 5
+    lea rax, [t_task_sql]
+    mov [m_sql], rax
+    mov rax, t_task_sqllen
+    mov [m_sqllen], rax
+    call et_mk
+    test rax, rax
+    jz et_err
+    mov [f_root_tasks], rax
+    jmp et_ok
+et_tf:
+    mov [f_root_tasks], rax
+et_ok:
+    xor eax, eax
+    ret
+et_err:
+    mov eax, 1
+    ret
+
+; build_record_text: record from colp[0..ncols) + coll[] (all TEXT) with
+; rowid [newrowid] -> recbuf/[reclen], celltmp/[clen]. rax 0.
+build_record_text:
+    push rbx
+    lea rdi, [recscratch]
+    mov qword [slen], 0
+    xor ebx, ebx
+brt_col:
+    cmp rbx, [ncols]
+    jae brt_have
+    lea rsi, [coll]
+    mov rax, rbx
+    shl rax, 3
+    add rsi, rax
+    mov rax, [rsi]              ; len
+    test rax, rax
+    jz brt_s0
+    lea rax, [rax + rax + 13]
+    jmp brt_se
+brt_s0:
+    xor eax, eax
+brt_se:
+    lea rdi, [recscratch]
+    add rdi, [slen]
+    call varint_put
+    add [slen], rcx
+    inc rbx
+    jmp brt_col
+brt_have:
+    mov rax, [slen]
+    inc rax
+    mov [reclen], rax
+    lea rdi, [recbuf]
+    call varint_put
+    lea rsi, [recscratch]
+    mov rcx, [slen]
+    rep movsb
+    xor ebx, ebx
+brt_body:
+    cmp rbx, [ncols]
+    jae brt_cell
+    lea rsi, [colp]
+    mov rax, rbx
+    shl rax, 3
+    add rsi, rax
+    mov rsi, [rsi]
+    lea rax, [coll]
+    mov rcx, rbx
+    shl rcx, 3
+    add rax, rcx
+    mov rcx, [rax]
+    add [reclen], rcx
+    rep movsb
+    inc rbx
+    jmp brt_body
+brt_cell:
+    lea rdi, [celltmp]
+    mov rax, [reclen]
+    call varint_put
+    mov [clen], rcx
+    lea rdi, [celltmp]
+    add rdi, rcx
+    mov rax, [newrowid]
+    call varint_put
+    add [clen], rcx
+    lea rsi, [recbuf]
+    lea rdi, [celltmp]
+    add rdi, [clen]
+    mov rcx, [reclen]
+    add [clen], rcx
+    rep movsb
+    pop rbx
+    xor eax, eax
+    ret
+
+; sub_find(field ptr rsi, len rdx, key ptr rdi, keylen rcx): rax=1 hit / 0 miss.
+sub_find:
+    test rcx, rcx
+    jz sf_no
+    cmp rdx, rcx
+    jb sf_no
+    push rbx
+    push r12
+    push r13
+    mov r12, rsi
+    mov r13, rdx
+    sub r13, rcx                ; last start offset
+    xor ebx, ebx
+sf_loop:
+    cmp rbx, r13
+    ja sf_nom
+    push rcx
+    push rdi
+    mov rsi, r12
+    add rsi, rbx
+sf_cmp:
+    test rcx, rcx
+    jz sf_hitp
+    mov al, [rsi]
+    cmp al, [rdi]
+    jne sf_nextp
+    inc rsi
+    inc rdi
+    dec rcx
+    jmp sf_cmp
+sf_hitp:
+    pop rdi
+    pop rcx
+    pop r13
+    pop r12
+    pop rbx
+    mov eax, 1
+    ret
+sf_nextp:
+    pop rdi
+    pop rcx
+    inc rbx
+    jmp sf_loop
+sf_nom:
+    pop r13
+    pop r12
+    pop rbx
+sf_no:
+    xor eax, eax
+    ret
+
+; match_status(rsi, rdx=len): rax=0 ok / 1 bad.
+match_status:
+    push rsi
+    push rdx
+    lea rdi, [st_ns]
+    call cmp_name
+    test rax, rax
+    jnz ms_ok
+    mov rsi, [rsp + 8]
+    mov rdx, [rsp]
+    lea rdi, [st_ip]
+    call cmp_name
+    test rax, rax
+    jnz ms_ok
+    mov rsi, [rsp + 8]
+    mov rdx, [rsp]
+    lea rdi, [st_dn]
+    call cmp_name
+    test rax, rax
+    jnz ms_ok
+    mov rsi, [rsp + 8]
+    mov rdx, [rsp]
+    lea rdi, [st_ar]
+    call cmp_name
+    test rax, rax
+    jnz ms_ok
+    mov rsi, [rsp + 8]
+    mov rdx, [rsp]
+    lea rdi, [st_ca]
+    call cmp_name
+    test rax, rax
+    jnz ms_ok
+    pop rdx
+    pop rsi
+    mov eax, 1
+    ret
+ms_ok:
+    pop rdx
+    pop rsi
+    xor eax, eax
+    ret
+
+; match_priority(rsi, rdx=len): rax=0 ok / 1 bad.
+match_priority:
+    push rsi
+    push rdx
+    lea rdi, [pr_lo]
+    call cmp_name
+    test rax, rax
+    jnz ms_ok2
+    mov rsi, [rsp + 8]
+    mov rdx, [rsp]
+    lea rdi, [pr_me]
+    call cmp_name
+    test rax, rax
+    jnz ms_ok2
+    mov rsi, [rsp + 8]
+    mov rdx, [rsp]
+    lea rdi, [pr_hi]
+    call cmp_name
+    test rax, rax
+    jnz ms_ok2
+    mov rsi, [rsp + 8]
+    mov rdx, [rsp]
+    lea rdi, [pr_cr]
+    call cmp_name
+    test rax, rax
+    jnz ms_ok2
+    pop rdx
+    pop rsi
+    mov eax, 1
+    ret
+ms_ok2:
+    pop rdx
+    pop rsi
+    xor eax, eax
+    ret
+
+; parse_row(rsi=cell abs ptr): growid, gcols, gfo/gfl[0..5] (TEXT cols).
+; Non-TEXT or >6-col rows are skipped, not fatal. rax 0 ok / 1 skip / 2 corrupt.
+parse_row:
+    push rbx
+    push r12
+    lea rdx, [pagebuf + 4096]
+    call varint_get             ; plen
+    test rcx, rcx
+    jz pr_corrupt
+    mov rsi, rcx
+    call varint_get             ; rowid
+    test rcx, rcx
+    jz pr_corrupt
+    mov [growid], rax
+    mov rsi, rcx
+    call varint_get             ; hdrsize
+    test rcx, rcx
+    jz pr_corrupt
+    mov r12, rax
+    cmp r12, 128
+    jae pr_corrupt
+    mov rsi, rcx                ; sptr
+    lea rbx, [rsi]
+    add rbx, r12
+    dec rbx                     ; body = sptr + hval - 1
+    xor ecx, ecx                ; k
+pr_ser:
+    cmp rcx, 6
+    jae pr_serdone
+    cmp rsi, rbx
+    ja pr_serdone2
+    cmp rsi, rbx
+    je pr_serdone
+    lea rdx, [pagebuf + 4096]
+    push rcx
+    push rsi
+    call varint_get
+    mov r10, rax
+    mov r11, rcx
+    pop rsi
+    pop rcx
+    test r11, r11
+    jz pr_corrupt
+    lea rax, [stab]
+    mov rdx, rcx
+    shl rdx, 3
+    add rax, rdx
+    mov qword [rax], r10
+    mov rsi, r11
+    inc rcx
+    jmp pr_ser
+pr_serdone2:
+pr_serdone:
+    cmp rsi, rbx
+    jne pr_corrupt               ; serials must exactly fill header
+    mov [gcols], rcx
+    mov r12, rbx                ; body
+    xor ecx, ecx                ; j
+pr_fld:
+    cmp rcx, [gcols]
+    jae pr_ok
+    lea rax, [stab]
+    mov rdx, rcx
+    shl rdx, 3
+    add rax, rdx
+    mov rax, qword [rax]
+    test rax, rax
+    jz pr_f0
+    cmp rax, 13
+    jb pr_skip
+    test al, 1
+    jz pr_skip
+    sub rax, 13
+    shr rax, 1
+    jmp pr_f1
+pr_f0:
+    xor eax, eax
+pr_f1:
+    lea rdx, [gfo]
+    mov rdi, rcx
+    shl rdi, 3
+    add rdx, rdi
+    mov qword [rdx], r12
+    lea rdx, [gfl]
+    add rdx, rdi
+    mov qword [rdx], rax
+    add r12, rax
+    inc rcx
+    jmp pr_fld
+pr_ok:
+    pop r12
+    pop rbx
+    xor eax, eax
+    ret
+pr_skip:
+    pop r12
+    pop rbx
+    mov eax, 1
+    ret
+pr_corrupt:
+    pop r12
+    pop rbx
+    mov eax, 2
+    ret
+
+; ultoa(rax=value>=0, rdi=dest): rcx=len.
+ultoa:
+    push rbx
+    lea rbx, [numtmp + 32]
+    mov rcx, 10
+ul_loop:
+    xor edx, edx
+    div rcx
+    add dl, '0'
+    dec rbx
+    mov [rbx], dl
+    test rax, rax
+    jnz ul_loop
+    lea rax, [numtmp + 32]
+    sub rax, rbx              ; len
+    mov rcx, rax
+    mov rsi, rbx
+    rep movsb
+    mov rcx, rax
+    pop rbx
+    ret
+
+; dec_atoi(rsi=ptr, rdx=len): rax=value. Digits only, len 1..10, else rax=-1.
+dec_atoi:
+    test rdx, rdx
+    jz da_bad
+    cmp rdx, 10
+    ja da_bad
+    xor eax, eax
+da_loop:
+    test rdx, rdx
+    jz da_done
+    movzx ecx, byte [rsi]
+    inc rsi
+    dec rdx
+    cmp cl, '0'
+    jb da_bad
+    cmp cl, '9'
+    ja da_bad
+    sub cl, '0'
+    imul rax, rax, 10
+    movzx ecx, cl
+    add rax, rcx
+    jmp da_loop
+da_done:
+    ret
+da_bad:
+    mov rax, -1
+    ret
+
+; scan_key_latest: latest row (max rowid) in table walk with col0 ==
+; [mkey]/[mkeylen]. Fills growid, gcols, gfo/gfl[0..4] (TEXT cols).
+; rax 1 found / 0 missing / 2 hard-corrupt.
+scan_key_latest:
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    call walk_leaves              ; rdi=rootpg already set by caller
+    test rax, rax
+    jnz sk_err
+    mov r14, [childn]
+    test r14, r14
+    jz sk_none
+sk_page:
+    dec r14
+    js sk_none
+    lea rsi, [childtab]
+    mov rax, r14
+    shl rax, 3
+    add rsi, rax
+    mov rdi, [rsi]
+    lea rsi, [pagebuf]
+    call pg_read
+    test rax, rax
+    jnz sk_nextpg
+    cmp byte [pagebuf], 0x0D
+    jne sk_nextpg
+    lea rsi, [pagebuf + 3]
+    call be16_ld
+    mov rbx, rax
+    test rbx, rbx
+    jz sk_nextpg
+    dec rbx                       ; last cell index
+sk_cell:
+    lea rsi, [pagebuf + 8]
+    mov rax, rbx
+    shl rax, 1
+    add rsi, rax
+    call be16_ld                  ; coff
+    lea r15, [pagebuf]
+    add r15, rax
+    lea rdx, [pagebuf + 4096]
+    mov rsi, r15
+    call varint_get               ; plen
+    test rcx, rcx
+    jz sk_corrupt
+    mov rsi, rcx
+    call varint_get               ; rowid
+    test rcx, rcx
+    jz sk_corrupt
+    mov [tmprow], rax
+    mov rsi, rcx
+    call varint_get               ; hdrsize
+    test rcx, rcx
+    jz sk_corrupt
+    mov r12, rax                  ; hval
+    cmp r12, 128
+    jae sk_corrupt
+    mov rsi, rcx                  ; sptr
+    lea r13, [rsi]
+    add r13, r12
+    dec r13                       ; body = sptr + hval - 1
+    xor ecx, ecx                  ; k
+sk_ser:
+    cmp rcx, 5
+    jae sk_serdone
+    cmp rsi, r13
+    jae sk_serdone
+    lea rdx, [pagebuf + 4096]
+    push rcx
+    push rsi
+    call varint_get
+    mov r10, rax                  ; serial
+    mov r11, rcx                  ; next ptr (0=err)
+    pop rsi
+    pop rcx
+    test r11, r11
+    jz sk_corrupt
+    lea rax, [stab]
+    mov rdx, rcx
+    shl rdx, 3
+    add rax, rdx
+    mov [rax], r10
+    mov rsi, r11
+    inc rcx
+    jmp sk_ser
+sk_serdone:
+    cmp rsi, r13
+    jne sk_corrupt                ; serials must exactly fill header
+    mov [gcols], rcx
+    ; field offsets from body (TEXT-only tables)
+    mov r15, r13                  ; p = body
+    xor ecx, ecx                  ; j
+sk_fld:
+    cmp rcx, [gcols]
+    jae sk_fldend
+    lea rax, [stab]
+    mov rdx, rcx
+    shl rdx, 3
+    add rax, rdx
+    mov rax, [rax]                ; serial
+    test rax, rax
+    jz sk_f0
+    cmp rax, 13
+    jb sk_nextcell                ; non-TEXT: row unusable here
+    test al, 1
+    jz sk_nextcell
+    sub rax, 13
+    shr rax, 1
+    jmp sk_f1
+sk_f0:
+    xor eax, eax
+sk_f1:
+    lea rdx, [gfo]
+    mov rdi, rcx
+    shl rdi, 3
+    add rdx, rdi
+    mov [rdx], r15                ; gfo[j]
+    lea rdx, [gfl]
+    add rdx, rdi
+    mov [rdx], rax                ; gfl[j]
+    add r15, rax
+    inc rcx
+    jmp sk_fld
+sk_fldend:
+    ; bound col0 within page, then compare with key
+    mov rax, qword [gfo]
+    add rax, qword [gfl]
+    lea rdx, [pagebuf + 4096]
+    cmp rax, rdx
+    ja sk_nextcell
+    mov rax, qword [gfl]
+    cmp rax, [mkeylen]
+    jne sk_nextcell
+    mov rsi, qword [gfo]
+    mov rdi, [mkey]
+    mov rcx, rax
+    rep cmpsb
+    jne sk_nextcell
+    ; match: latest wins (descending walk) -> done
+    mov rax, [tmprow]
+    mov [growid], rax
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    mov eax, 1
+    ret
+sk_nextcell:
+    test rbx, rbx
+    jz sk_nextpg
+    dec rbx
+    jmp sk_cell
+sk_nextpg:
+    jmp sk_page
+sk_none:
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    xor eax, eax
+    ret
+sk_corrupt:
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    mov eax, 2
+    ret
+sk_err:
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    mov eax, 2
+    ret
+
 ; rax 0 notfound / 1 found / 2 corrupt. Found fills fpage/frowid/fo_*/fl_*/fvalid/fvoff.
 scan_reason:
     push rbx
@@ -2470,12 +3734,19 @@ scan_reason:
     push r13
     push r14
     push r15
-    mov r12, 2
+    mov rdi, 2
+    call walk_leaves
+    test rax, rax
+    jnz sr_corrupt
+    xor r12d, r12d              ; ci
 sr_page:
-    mov rax, [dbpages]
-    cmp r12, rax
-    ja sr_none
-    mov rdi, r12
+    cmp r12, [childn]
+    jae sr_none
+    lea rsi, [childtab]
+    mov rax, r12
+    shl rax, 3
+    add rsi, rax
+    mov rdi, [rsi]
     lea rsi, [pagebuf]
     call pg_read
     test rax, rax
@@ -2631,7 +3902,12 @@ sr_vok:
     lea rax, [pagebuf]
     sub rsi, rax
     mov [fvoff], rsi
-    mov [fpage], r12
+    lea rsi, [childtab]
+    mov rax, r12
+    shl rax, 3
+    add rsi, rax
+    mov rax, [rsi]
+    mov [fpage], rax
     mov rax, [tmprow]
     mov [frowid], rax
     pop r15
@@ -2679,6 +3955,2764 @@ fv_do:
     lea rsi, [pagebuf]
     call pg_write
     ret                           ; rax from pg_write (0/1)
+
+; op_history: {limit? default 10, max 64} -> last N thoughts, oldest first.
+op_history:
+    mov qword [hlimit], 10
+    mov rsi, [pp]
+    lea rdi, [k_args]
+    mov ecx, 11
+    call find_val
+    test rax, rax
+    jz oh_go
+    mov [ap], rax
+    mov rsi, [ap]
+    lea rdi, [k_limit]
+    mov ecx, 7
+    call find_val
+    test rax, rax
+    jz oh_go
+    mov rsi, rax
+    call parse_int
+    test rax, rax
+    jnz dc_params
+    mov rax, [numval]
+    cmp rax, 1
+    jb dc_params
+    cmp rax, 64
+    ja dc_params
+    mov [hlimit], rax
+oh_go:
+    mov rax, [hlimit]
+    cmp rax, [hcount]
+    jbe oh_nok
+    mov rax, [hcount]
+oh_nok:
+    cmp rax, 64
+    jbe oh_nok2
+    mov rax, 64
+oh_nok2:
+    mov [hlimit], rax
+    lea rax, [outbuf]
+    mov [outptr], rax
+    call out_reset
+    lea rsi, [j1]
+    call out_cstr
+    lea rsi, [idbuf]
+    mov rdx, [idlen]
+    call out_bytes
+    lea rsi, [jres]
+    call out_cstr
+    lea rsi, [jhisthead]
+    call out_cstr
+    mov rax, [hcount]
+    sub rax, [hlimit]
+    mov [hcur], rax
+    mov byte [hfirst], 1
+oh_entry:
+    mov rax, [hcur]
+    cmp rax, [hcount]
+    jae oh_tail
+    cmp qword [outlen], 60000
+    ja oh_tail
+    cmp byte [hfirst], 1
+    je oh_nocomma
+    mov al, ','
+    call out_byte
+    jmp oh_entry2
+oh_nocomma:
+    mov byte [hfirst], 0
+oh_entry2:
+    ; slot for thought #(hcur+1): idx = hcur & 63
+    mov rax, [hcur]
+    and rax, 63
+    mov rbx, rax
+    shl rbx, 11
+    mov rcx, rax
+    shl rcx, 6
+    add rbx, rcx
+    mov rcx, rax
+    shl rcx, 5
+    add rbx, rcx
+    lea rdi, [thslots]
+    add rdi, rbx
+    mov [hslot], rdi
+    lea rsi, [jr_num]
+    call out_cstr
+    mov rax, [hcur]
+    inc rax
+    call out_uint
+    lea rsi, [jr_total]
+    call out_cstr
+    mov rdi, [hslot]
+    mov rax, [rdi + 2064]
+    call out_uint
+    lea rsi, [jr_next]
+    call out_cstr
+    mov rdi, [hslot]
+    mov rax, [rdi + 2072]
+    test al, 1
+    jz oh_hfalse
+    lea rsi, [b_true]
+    call out_cstr
+    jmp oh_hthought
+oh_hfalse:
+    lea rsi, [b_false]
+    call out_cstr
+oh_hthought:
+    lea rsi, [jr_thought]
+    call out_cstr
+    mov rdi, [hslot]
+    lea rsi, [rdi]
+    mov rdx, [rdi + 2048]
+    call out_escaped
+    mov al, '"'
+    call out_byte
+    mov rdi, [hslot]
+    mov rax, [rdi + 2072]
+    test al, 2
+    jz oh_hnorev
+    lea rsi, [jr_isrev]
+    call out_cstr
+    mov rdi, [hslot]
+    test byte [rdi + 2072], 2
+    jz oh_hrevf
+    lea rsi, [b_true]
+    call out_cstr
+    jmp oh_hnorev2
+oh_hrevf:
+    lea rsi, [b_false]
+    call out_cstr
+oh_hnorev2:
+oh_hnorev:
+    mov rdi, [hslot]
+    mov rax, [rdi + 2080]
+    cmp rax, -1
+    je oh_hnorevt
+    mov [tmprow], rax
+    lea rsi, [jr_rev]
+    call out_cstr
+    mov rax, [tmprow]
+    call out_uint
+oh_hnorevt:
+    mov rdi, [hslot]
+    mov rax, [rdi + 2088]
+    cmp rax, -1
+    je oh_hnobr
+    mov [tmprow], rax
+    lea rsi, [jr_brfrom]
+    call out_cstr
+    mov rax, [tmprow]
+    call out_uint
+oh_hnobr:
+    mov rdi, [hslot]
+    cmp qword [rdi + 2096], 0
+    je oh_hnobid
+    lea rsi, [jr_bid]
+    call out_cstr
+    mov rdi, [hslot]
+    mov rdx, [rdi + 2096]
+    lea rsi, [rdi + 2104]
+    call out_escaped
+    mov al, '"'
+    call out_byte
+oh_hnobid:
+    mov rdi, [hslot]
+    mov rax, [rdi + 2072]
+    test al, 4
+    jz oh_hnomore
+    lea rsi, [jr_more]
+    call out_cstr
+    mov rdi, [hslot]
+    test byte [rdi + 2072], 8
+    jz oh_hmoref
+    lea rsi, [b_true]
+    call out_cstr
+    jmp oh_hnomore2
+oh_hmoref:
+    lea rsi, [b_false]
+    call out_cstr
+oh_hnomore2:
+oh_hnomore:
+    mov al, '}'
+    call out_byte
+    inc qword [hcur]
+    jmp oh_entry
+oh_tail:
+    lea rsi, [jhisttail]
+    call out_cstr
+    mov rax, [hcount]
+    call out_uint
+    mov al, '}'
+    call out_byte
+    mov al, '}'               ; close result + root
+    call out_byte
+    mov al, 10
+    call out_byte
+    jmp emit
+
+; op_reset: {confirm:true} -> clear history.
+op_reset:
+    mov rsi, [pp]
+    lea rdi, [k_args]
+    mov ecx, 11
+    call find_val
+    test rax, rax
+    jz dc_params
+    mov [ap], rax
+    mov rsi, [ap]
+    lea rdi, [k_confirm]
+    mov ecx, 9
+    call find_val
+    test rax, rax
+    jz dc_params
+    mov rsi, rax
+    call parse_bool
+    test rax, rax
+    jnz dc_params
+    cmp byte [boolval], 1
+    jne dc_params
+    mov qword [hcount], 0
+    lea rax, [outbuf]
+    mov [outptr], rax
+    call out_reset
+    lea rsi, [j1]
+    call out_cstr
+    lea rsi, [idbuf]
+    mov rdx, [idlen]
+    call out_bytes
+    lea rsi, [jres]
+    call out_cstr
+    lea rsi, [r_resetok]
+    call out_cstr
+    mov al, '}'
+    call out_byte
+    mov al, 10
+    call out_byte
+    jmp emit
+
+; ---- memory: facts (append-only versions, latest rowid wins) ----
+; op_fread {name}
+op_fread:
+    mov rsi, [pp]
+    lea rdi, [k_args]
+    mov ecx, 11
+    call find_val
+    test rax, rax
+    jz dc_params
+    mov [ap], rax
+    mov rsi, [ap]
+    lea rdi, [k_name]
+    mov ecx, 6
+    call find_val
+    test rax, rax
+    jz dc_params
+    mov rsi, rax
+    lea rdi, [rsnbuf]
+    mov ecx, 64
+    call parse_str
+    test rax, rax
+    jz dc_params
+    test rdx, rdx
+    jz dc_params
+    mov [rsnlen], rdx
+    lea rsi, [rsnbuf]
+    mov rdx, [rsnlen]
+    call valid_name
+    test rax, rax
+    jnz oc_badname
+    call db_open
+    test rax, rax
+    jnz oc_db
+    lea rsi, [rsnbuf]
+    mov rdx, [rsnlen]
+    mov [mkey], rsi
+    mov [mkeylen], rdx
+    mov rdi, [f_root_facts]
+    call scan_key_latest
+    cmp rax, 1
+    jne of_miss
+    call db_close
+    ; inner {"rowid":N,"name":"R","body":"B"}
+    lea rax, [jsontmp]
+    mov [outptr], rax
+    mov qword [outlen], 0
+    lea rsi, [jc_rowid]
+    call out_cstr
+    mov rax, [growid]
+    call out_uint
+    lea rsi, [jn_name]
+    call out_cstr
+    lea rsi, [rsnbuf]
+    mov rdx, [rsnlen]
+    call out_escaped
+    mov al, '"'
+    call out_byte
+    lea rsi, [jn_body]
+    call out_cstr
+    mov rsi, qword [gfo + 8]
+    mov rdx, qword [gfl + 8]
+    call out_escaped
+    mov al, '"'
+    call out_byte
+    mov al, '}'
+    call out_byte
+    jmp oc_envelope
+of_miss:
+    call db_close
+    cmp rax, 2
+    je oc_corrupt
+    lea rdi, [c_params]
+    lea rsi, [m_nofile]
+    jmp err_id
+oc_badname:
+    lea rdi, [c_params]
+    lea rsi, [m_badname]
+    jmp err_id
+
+; op_fwrite {name, text}
+op_fwrite:
+    mov rsi, [pp]
+    lea rdi, [k_args]
+    mov ecx, 11
+    call find_val
+    test rax, rax
+    jz dc_params
+    mov [ap], rax
+    mov rsi, [ap]
+    lea rdi, [k_name]
+    mov ecx, 6
+    call find_val
+    test rax, rax
+    jz dc_params
+    mov rsi, rax
+    lea rdi, [rsnbuf]
+    mov ecx, 64
+    call parse_str
+    test rax, rax
+    jz dc_params
+    test rdx, rdx
+    jz dc_params
+    mov [rsnlen], rdx
+    lea rsi, [rsnbuf]
+    mov rdx, [rsnlen]
+    call valid_name
+    test rax, rax
+    jnz oc_badname
+    mov rsi, [ap]
+    lea rdi, [k_text]
+    mov ecx, 6
+    call find_val
+    test rax, rax
+    jz dc_params
+    mov rsi, rax
+    lea rdi, [mbody]
+    mov ecx, 4096
+    call parse_str
+    test rax, rax
+    jz dc_params
+    mov [mbodylen], rdx
+    lea rsi, [mbody]
+    mov rdx, [mbodylen]
+    call ascii_only
+    test rax, rax
+    jnz oc_ascii
+    call db_open
+    test rax, rax
+    jnz oc_db
+    mov rdi, [f_root_facts]
+    call scan_max
+    test rax, rax
+    jnz ow_dbclose
+    mov rax, [maxrowid]
+    inc rax
+    mov [newrowid], rax
+    lea rax, [rsnbuf]
+    mov qword [colp], rax
+    mov rax, [rsnlen]
+    mov qword [coll], rax
+    lea rax, [mbody]
+    mov qword [colp + 8], rax
+    mov rax, [mbodylen]
+    mov qword [coll + 8], rax
+    mov qword [ncols], 2
+    call build_record_text
+    mov rax, [f_root_facts]
+    mov [splitroot], rax
+    call place_cell
+    test rax, rax
+    jnz ow_insfail
+    mov rax, [newrowid]
+    mov [maxrowid], rax
+    call hdr_touch
+    call db_close
+    lea rax, [jsontmp]
+    mov [outptr], rax
+    mov qword [outlen], 0
+    lea rsi, [jc_rowid]
+    call out_cstr
+    mov rax, [newrowid]
+    call out_uint
+    lea rsi, [jn_name]
+    call out_cstr
+    lea rsi, [rsnbuf]
+    mov rdx, [rsnlen]
+    call out_escaped
+    mov al, '"'
+    call out_byte
+    mov al, '}'
+    call out_byte
+    jmp oc_envelope
+ow_dbclose:
+    call db_close
+    lea rdi, [c_internal]
+    lea rsi, [m_nodb]
+    jmp err_id
+ow_insfail:
+    cmp rax, 2
+    je ow_full
+    call db_close
+    lea rdi, [c_internal]
+    lea rsi, [m_nodb]
+    jmp err_id
+ow_full:
+    call db_close
+    lea rdi, [c_internal]
+    lea rsi, [m_dbfull]
+    jmp err_id
+
+; op_flist {} -> newline-joined names, newest first, distinct (cap 128).
+op_flist:
+    call db_open
+    test rax, rax
+    jnz oc_db
+    mov rdi, [f_root_facts]
+    call walk_leaves
+    test rax, rax
+    jnz ow_dbclose
+    lea rax, [jsontmp]
+    mov [outptr], rax
+    mov qword [outlen], 0
+    mov qword [fseenn], 0
+    mov byte [hfirst], 1
+    mov rax, [childn]
+    test rax, rax
+    jz olf_tail
+    dec rax
+    mov [wn], rax                ; start at last page index
+ofl_page:
+    lea rsi, [childtab]
+    mov rax, [wn]
+    shl rax, 3
+    add rsi, rax
+    mov rdi, [rsi]
+    lea rsi, [pagebuf]
+    call pg_read
+    test rax, rax
+    jnz olf_nextpg
+    cmp byte [pagebuf], 0x0D
+    jne olf_nextpg
+    lea rsi, [pagebuf + 3]
+    call be16_ld
+    test rax, rax
+    jz olf_nextpg
+    mov rbx, rax
+    dec rbx                       ; last cell index
+ofl_cell:
+    lea rsi, [pagebuf + 8]
+    mov rax, rbx
+    shl rax, 1
+    add rsi, rax
+    call be16_ld                  ; coff
+    lea r15, [pagebuf]
+    add r15, rax
+    lea rdx, [pagebuf + 4096]
+    mov rsi, r15
+    call varint_get               ; plen
+    test rcx, rcx
+    jz olf_nextcell
+    mov rsi, rcx
+    call varint_get               ; rowid (skip value)
+    test rcx, rcx
+    jz olf_nextcell
+    mov rsi, rcx
+    call varint_get               ; hdrsize
+    test rcx, rcx
+    jz olf_nextcell
+    mov rsi, rcx
+    call varint_get               ; s0 = name serial
+    test rcx, rcx
+    jz olf_nextcell
+    mov r10, rax
+    cmp r10, 13
+    jb olf_nextcell
+    test r10b, 1
+    jz olf_nextcell
+    sub r10, 13
+    shr r10, 1                    ; namelen
+    cmp r10, 64
+    ja olf_nextcell
+    mov rsi, rcx
+    call varint_get               ; s1 = body serial (skip to body)
+    test rcx, rcx
+    jz olf_nextcell
+    mov r11, rcx                  ; body = col0 (name) value
+    ; bound check
+    mov rax, r11
+    add rax, r10
+    lea rdx, [pagebuf + 4096]
+    cmp rax, rdx
+    ja olf_nextcell
+    ; seen?
+    xor r12d, r12d
+ofl_seen:
+    cmp r12, [fseenn]
+    jae olf_add
+    lea rsi, [fseen]
+    mov rax, r12
+    imul rax, rax, 65
+    add rsi, rax
+    movzx eax, byte [rsi]
+    cmp rax, r10
+    jne olf_nextseen
+    lea rdi, [rsi + 1]
+    mov rsi, r11
+    mov rcx, r10
+    rep cmpsb
+    je olf_nextcell               ; dup: skip (newest already emitted)
+olf_nextseen:
+    inc r12
+    jmp ofl_seen
+olf_add:
+    cmp qword [fseenn], 128
+    jae olf_tail                  ; seen-set full: stop
+    cmp qword [outlen], 60000
+    ja olf_tail
+    cmp byte [hfirst], 1
+    je olf_first
+    mov al, '\'
+    call out_byte
+    mov al, 'n'
+    call out_byte
+    jmp olf_emit
+olf_first:
+    mov byte [hfirst], 0
+olf_emit:
+    mov rsi, r11
+    mov rdx, r10
+    call out_escaped
+    ; store in seen
+    lea rdi, [fseen]
+    mov rax, [fseenn]
+    imul rax, rax, 65
+    add rdi, rax
+    mov rax, r10
+    mov [rdi], al                 ; len byte
+    mov rsi, r11
+    lea rdi, [rdi + 1]
+    mov rcx, r10
+    rep movsb
+    inc qword [fseenn]
+olf_nextcell:
+    test rbx, rbx
+    jz olf_nextpg
+    dec rbx
+    jmp ofl_cell
+olf_nextpg:
+    cmp qword [wn], 0
+    je olf_tail
+    dec qword [wn]
+    jmp ofl_page
+olf_tail:
+    call db_close
+    lea rsi, [jcontent_end2]
+    call out_cstr
+    mov rax, [outlen]
+    mov [innerlen], rax
+    jmp oc_envelope
+
+; ---- memory: entities / observations / relations ----
+; insert_obs: obsbuf/oblen -> observations row for rsnbuf entity. rax 0/1/2.
+; Call with db open; updates [newrowid] chain via [obsseq].
+insert_obs:
+    mov rdi, [f_root_obs]
+    call scan_max
+    test rax, rax
+    jnz iob_err
+    mov rax, [maxrowid]
+    inc rax
+    mov [newrowid], rax
+    lea rax, [rsnbuf]
+    mov qword [colp], rax
+    mov rax, [rsnlen]
+    mov qword [coll], rax
+    lea rax, [obsbuf]
+    mov qword [colp + 8], rax
+    mov rax, [oblen]
+    mov qword [coll + 8], rax
+    mov qword [ncols], 2
+    call build_record_text
+    mov rax, [f_root_obs]
+    mov [splitroot], rax
+    call place_cell
+    test rax, rax
+    jnz iob_err
+    mov rax, [newrowid]
+    mov [maxrowid], rax
+    xor eax, eax
+    ret
+iob_err:
+    mov eax, 1
+    ret
+
+; op_mkentity {name, type?, project?, observations?[]}
+op_mkentity:
+    mov rsi, [pp]
+    lea rdi, [k_args]
+    mov ecx, 11
+    call find_val
+    test rax, rax
+    jz dc_params
+    mov [ap], rax
+    mov rsi, [ap]
+    lea rdi, [k_name]
+    mov ecx, 6
+    call find_val
+    test rax, rax
+    jz dc_params
+    mov rsi, rax
+    lea rdi, [rsnbuf]
+    mov ecx, 64
+    call parse_str
+    test rax, rax
+    jz dc_params
+    test rdx, rdx
+    jz dc_params
+    mov [rsnlen], rdx
+    lea rsi, [rsnbuf]
+    mov rdx, [rsnlen]
+    call valid_name
+    test rax, rax
+    jnz oc_badname
+    ; type? default ""
+    mov qword [typelen], 0
+    mov rsi, [ap]
+    lea rdi, [k_type]
+    mov ecx, 6
+    call find_val
+    test rax, rax
+    jz om_notype
+    mov rsi, rax
+    lea rdi, [typebuf]
+    mov ecx, 32
+    call parse_str
+    test rax, rax
+    jz dc_params
+    mov [typelen], rdx
+    lea rsi, [typebuf]
+    mov rdx, [typelen]
+    call ascii_only
+    test rax, rax
+    jnz oc_ascii
+om_notype:
+    ; project? default ""
+    mov qword [projlen], 0
+    mov rsi, [ap]
+    lea rdi, [k_project]
+    mov ecx, 9
+    call find_val
+    test rax, rax
+    jz om_noproj
+    mov rsi, rax
+    lea rdi, [projbuf]
+    mov ecx, 32
+    call parse_str
+    test rax, rax
+    jz dc_params
+    mov [projlen], rdx
+    lea rsi, [projbuf]
+    mov rdx, [projlen]
+    call ascii_only
+    test rax, rax
+    jnz oc_ascii
+om_noproj:
+    call db_open
+    test rax, rax
+    jnz oc_db
+    ; dup? -> return existing, created:false
+    lea rsi, [rsnbuf]
+    mov rdx, [rsnlen]
+    mov [mkey], rsi
+    mov [mkeylen], rdx
+    mov rdi, [f_root_ent]
+    call scan_key_latest
+    cmp rax, 1
+    je om_dup
+    cmp rax, 2
+    je om_corrupt
+    mov rdi, [f_root_ent]
+    call scan_max
+    test rax, rax
+    jnz om_dbclose
+    mov rax, [maxrowid]
+    inc rax
+    mov [newrowid], rax
+    lea rax, [rsnbuf]
+    mov qword [colp], rax
+    mov rax, [rsnlen]
+    mov qword [coll], rax
+    lea rax, [typebuf]
+    mov qword [colp + 8], rax
+    mov rax, [typelen]
+    mov qword [coll + 8], rax
+    lea rax, [projbuf]
+    mov qword [colp + 16], rax
+    mov rax, [projlen]
+    mov qword [coll + 16], rax
+    mov qword [ncols], 3
+    call build_record_text
+    mov rax, [f_root_ent]
+    mov [splitroot], rax
+    call place_cell
+    test rax, rax
+    jnz om_insfail
+    mov rax, [newrowid]
+    mov [maxrowid], rax
+    call hdr_touch
+    mov byte [mcreated], 1
+    jmp om_obs
+om_dup:
+    mov rax, [growid]
+    mov [newrowid], rax
+    mov byte [mcreated], 0
+    jmp om_obs
+om_obs:
+    ; observations[]? each ascii<=1024, cap 16
+    mov rsi, [ap]
+    lea rdi, [k_obs]
+    mov ecx, 14
+    call find_val
+    test rax, rax
+    jz om_done
+    cmp rax, [le]
+    jae dc_params_close
+    cmp byte [rax], '['
+    jne dc_params_close
+    inc rax
+    mov [obsarr], rax
+    xor ebx, ebx                ; count
+om_oloop:
+    cmp ebx, 16
+    jae om_done
+    mov rsi, [obsarr]
+    call skip_ws_comma
+    test rax, rax
+    jnz om_arrend
+    mov rsi, [obsarr]
+    cmp rsi, [le]
+    jae dc_params_close
+    cmp byte [rsi], ']'
+    je om_arrend
+    cmp byte [rsi], '"'
+    jne dc_params_close
+    lea rdi, [obsbuf]
+    mov ecx, 1024
+    call parse_str
+    test rax, rax
+    jz dc_params_close
+    mov [obsarr], rax
+    mov [oblen], rdx
+    lea rsi, [obsbuf]
+    mov rdx, [oblen]
+    call ascii_only
+    test rax, rax
+    jnz oc_ascii_close
+    call insert_obs
+    test rax, rax
+    jnz om_insfail
+    inc rbx
+    jmp om_oloop
+om_arrend:
+    test rbx, rbx               ; empty array ok (no-op)
+    jmp om_done2
+om_done:
+om_done2:
+    call hdr_touch
+    call db_close
+    lea rax, [jsontmp]
+    mov [outptr], rax
+    mov qword [outlen], 0
+    lea rsi, [jc_rowid]
+    call out_cstr
+    mov rax, [newrowid]
+    call out_uint
+    lea rsi, [jn_name]
+    call out_cstr
+    lea rsi, [rsnbuf]
+    mov rdx, [rsnlen]
+    call out_escaped
+    mov al, '"'
+    call out_byte
+    lea rsi, [jn_created]
+    call out_cstr
+    cmp byte [mcreated], 0
+    je om_cfalse
+    lea rsi, [b_true]
+    call out_cstr
+    jmp oc_inner_end
+om_cfalse:
+    lea rsi, [b_false]
+    call out_cstr
+    jmp oc_inner_end
+om_dbclose:
+    call db_close
+    lea rdi, [c_internal]
+    lea rsi, [m_nodb]
+    jmp err_id
+om_insfail:
+    cmp rax, 2
+    je om_full
+    call db_close
+    lea rdi, [c_internal]
+    lea rsi, [m_nodb]
+    jmp err_id
+om_full:
+    call db_close
+    lea rdi, [c_internal]
+    lea rsi, [m_dbfull]
+    jmp err_id
+om_corrupt:
+    call db_close
+    lea rdi, [c_internal]
+    lea rsi, [m_nodb]
+    jmp err_id
+dc_params_close:
+    call db_close
+    lea rdi, [c_params]
+    lea rsi, [m_params]
+    jmp err_id
+oc_ascii_close:
+    call db_close
+    lea rdi, [c_params]
+    lea rsi, [m_ascii]
+    jmp err_id
+
+; skip_ws_comma: rsi=ptr -> rax=0 ok (at value or ']'), rsi advanced; uses [le].
+skip_ws_comma:
+skw_loop:
+    cmp rsi, [le]
+    jae skw_end
+    mov al, [rsi]
+    cmp al, ' '
+    je skw_adv
+    cmp al, 9
+    je skw_adv
+    cmp al, 13
+    je skw_adv
+    cmp al, 10
+    je skw_adv
+    cmp al, ','
+    je skw_adv
+    mov [obsarr], rsi
+    xor eax, eax
+    ret
+skw_adv:
+    inc rsi
+    jmp skw_loop
+skw_end:
+    mov [obsarr], rsi
+    xor eax, eax
+    ret
+
+; op_addobs {name, observations[1..16]}
+op_addobs:
+    mov rsi, [pp]
+    lea rdi, [k_args]
+    mov ecx, 11
+    call find_val
+    test rax, rax
+    jz dc_params
+    mov [ap], rax
+    mov rsi, [ap]
+    lea rdi, [k_name]
+    mov ecx, 6
+    call find_val
+    test rax, rax
+    jz dc_params
+    mov rsi, rax
+    lea rdi, [rsnbuf]
+    mov ecx, 64
+    call parse_str
+    test rax, rax
+    jz dc_params
+    test rdx, rdx
+    jz dc_params
+    mov [rsnlen], rdx
+    lea rsi, [rsnbuf]
+    mov rdx, [rsnlen]
+    call valid_name
+    test rax, rax
+    jnz oc_badname
+    mov rsi, [ap]
+    lea rdi, [k_obs]
+    mov ecx, 14
+    call find_val
+    test rax, rax
+    jz dc_params
+    cmp rax, [le]
+    jae dc_params
+    cmp byte [rax], '['
+    jne dc_params
+    inc rax
+    mov [obsarr], rax
+    call db_open
+    test rax, rax
+    jnz oc_db
+    ; ensure entity (auto-create stub)
+    lea rsi, [rsnbuf]
+    mov rdx, [rsnlen]
+    mov [mkey], rsi
+    mov [mkeylen], rdx
+    mov rdi, [f_root_ent]
+    call scan_key_latest
+    cmp rax, 2
+    je om_corrupt
+    cmp rax, 1
+    je oa_have
+    ; stub entity
+    mov rdi, [f_root_ent]
+    call scan_max
+    test rax, rax
+    jnz om_dbclose
+    mov rax, [maxrowid]
+    inc rax
+    mov [newrowid], rax
+    lea rax, [rsnbuf]
+    mov qword [colp], rax
+    mov rax, [rsnlen]
+    mov qword [coll], rax
+    lea rax, [typebuf]
+    mov qword [colp + 8], rax
+    mov qword [coll + 8], 0
+    lea rax, [projbuf]
+    mov qword [colp + 16], rax
+    mov qword [coll + 16], 0
+    mov qword [ncols], 3
+    call build_record_text
+    mov rax, [f_root_ent]
+    mov [splitroot], rax
+    call place_cell
+    test rax, rax
+    jnz om_insfail
+    mov rax, [newrowid]
+    mov [maxrowid], rax
+oa_have:
+    xor ebx, ebx
+oa_loop:
+    cmp ebx, 16
+    jae oa_done
+    mov rsi, [obsarr]
+    call skip_ws_comma
+    mov rsi, [obsarr]
+    cmp rsi, [le]
+    jae oa_bad
+    cmp byte [rsi], ']'
+    je oa_end
+    cmp byte [rsi], '"'
+    jne oa_bad
+    lea rdi, [obsbuf]
+    mov ecx, 1024
+    call parse_str
+    test rax, rax
+    jz oa_bad
+    mov [obsarr], rax
+    mov [oblen], rdx
+    lea rsi, [obsbuf]
+    mov rdx, [oblen]
+    call ascii_only
+    test rax, rax
+    jnz oc_ascii_close
+    call insert_obs
+    test rax, rax
+    jnz om_insfail
+    inc rbx
+    jmp oa_loop
+oa_end:
+    test rbx, rbx
+    jz oa_bad                   ; observations required non-empty here
+    jmp oa_done2
+oa_bad:
+    call db_close
+    lea rdi, [c_params]
+    lea rsi, [m_params]
+    jmp err_id
+oa_done:
+oa_done2:
+    mov [obadded], rbx
+    call hdr_touch
+    call db_close
+    lea rax, [jsontmp]
+    mov [outptr], rax
+    mov qword [outlen], 0
+    lea rsi, [jc_rowid]
+    call out_cstr
+    mov rax, [newrowid]
+    call out_uint
+    lea rsi, [jn_name]
+    call out_cstr
+    lea rsi, [rsnbuf]
+    mov rdx, [rsnlen]
+    call out_escaped
+    mov al, '"'
+    call out_byte
+    lea rsi, [jn_added]
+    call out_cstr
+    mov rax, [obadded]
+    call out_uint
+    mov al, '}'
+    call out_byte
+    jmp oc_envelope
+
+; op_mkrel {from, to, type}
+op_mkrel:
+    mov rsi, [pp]
+    lea rdi, [k_args]
+    mov ecx, 11
+    call find_val
+    test rax, rax
+    jz dc_params
+    mov [ap], rax
+    mov rsi, [ap]
+    lea rdi, [k_from]
+    mov ecx, 6
+    call find_val
+    test rax, rax
+    jz dc_params
+    mov rsi, rax
+    lea rdi, [rsnbuf]
+    mov ecx, 64
+    call parse_str
+    test rax, rax
+    jz dc_params
+    test rdx, rdx
+    jz dc_params
+    mov [rsnlen], rdx
+    lea rsi, [rsnbuf]
+    mov rdx, [rsnlen]
+    call valid_name
+    test rax, rax
+    jnz oc_badname
+    mov rsi, [ap]
+    lea rdi, [k_to]
+    mov ecx, 4
+    call find_val
+    test rax, rax
+    jz dc_params
+    mov rsi, rax
+    lea rdi, [relbuf]
+    mov ecx, 64
+    call parse_str
+    test rax, rax
+    jz dc_params
+    test rdx, rdx
+    jz dc_params
+    mov [rllen], rdx
+    lea rsi, [relbuf]
+    mov rdx, [rllen]
+    call valid_name
+    test rax, rax
+    jnz oc_badname
+    mov rsi, [ap]
+    lea rdi, [k_type]
+    mov ecx, 6
+    call find_val
+    test rax, rax
+    jz dc_params
+    mov rsi, rax
+    lea rdi, [typebuf]
+    mov ecx, 32
+    call parse_str
+    test rax, rax
+    jz dc_params
+    test rdx, rdx
+    jz dc_params
+    mov [typelen], rdx
+    lea rsi, [typebuf]
+    mov rdx, [typelen]
+    call ascii_only
+    test rax, rax
+    jnz oc_ascii
+    call db_open
+    test rax, rax
+    jnz oc_db
+    ; dup triple? scan all rel rows for exact match
+    mov rdi, [f_root_rel]
+    call walk_leaves
+    test rax, rax
+    jnz om_dbclose
+    xor ebx, ebx                ; dup flag
+    mov r12, [childn]
+    xor r13d, r13d
+or_page:
+    cmp r13, r12
+    jae or_nodup
+    lea rsi, [childtab]
+    mov rax, r13
+    shl rax, 3
+    add rsi, rax
+    mov rdi, [rsi]
+    lea rsi, [pagebuf]
+    call pg_read
+    test rax, rax
+    jnz or_nextpg
+    cmp byte [pagebuf], 0x0D
+    jne or_nextpg
+    lea rsi, [pagebuf + 3]
+    call be16_ld
+    mov r14, rax
+    xor r15d, r15d
+or_cell:
+    cmp r15, r14
+    jae or_nextpg
+    ; parse 3 TEXT cols via generic walk into gfo/gfl
+    lea rsi, [pagebuf + 8]
+    mov rax, r15
+    shl rax, 1
+    add rsi, rax
+    call be16_ld
+    lea rdi, [pagebuf]
+    add rdi, rax                ; cell
+    lea rdx, [pagebuf + 4096]
+    mov rsi, rdi
+    call varint_get
+    test rcx, rcx
+    jz or_nextcell
+    mov rsi, rcx
+    call varint_get
+    test rcx, rcx
+    jz or_nextcell
+    mov [tmprow], rax
+    mov rsi, rcx
+    call varint_get             ; hdr
+    test rcx, rcx
+    jz or_nextcell
+    mov r12, rax
+    cmp r12, 128
+    jae or_nextcell
+    mov rsi, rcx
+    xor ecx, ecx                ; k
+or_ser:
+    cmp rcx, 3
+    jae or_serhave
+    lea rdx, [pagebuf + 4096]
+    push rcx
+    push rsi
+    call varint_get
+    mov r10, rax                ; serial
+    mov r11, rcx                ; next
+    pop rsi
+    pop rcx
+    test r11, r11
+    jz or_nextcell
+    lea rax, [stab]
+    mov rdx, rcx
+    shl rdx, 3
+    add rax, rdx
+    mov qword [rax], r10
+    mov rsi, r11
+    inc rcx
+    jmp or_ser
+or_serhave:
+    mov r11, rsi                ; body
+    xor ecx, ecx                ; j
+or_off:
+    cmp rcx, 3
+    jae or_cmp3
+    lea rax, [stab]
+    mov rdx, rcx
+    shl rdx, 3
+    add rax, rdx
+    mov rax, qword [rax]        ; serial
+    test rax, rax
+    jz or_o0
+    cmp rax, 13
+    jb or_nextcell
+    test al, 1
+    jz or_nextcell
+    sub rax, 13
+    shr rax, 1
+    jmp or_o1
+or_o0:
+    xor eax, eax
+or_o1:
+    lea rdx, [gfo]
+    mov rdi, rcx
+    shl rdi, 3
+    add rdx, rdi
+    mov qword [rdx], r11
+    lea rdx, [gfl]
+    add rdx, rdi
+    mov qword [rdx], rax
+    add r11, rax
+    inc rcx
+    jmp or_off
+or_cmp3:
+    ; bound last field, then compare 3 cols with from/to/type
+    mov rax, qword [gfo + 16]
+    add rax, qword [gfl + 16]
+    lea rdx, [pagebuf + 4096]
+    cmp rax, rdx
+    ja or_nextcell
+    mov rax, qword [gfl]
+    cmp rax, [rsnlen]
+    jne or_nextcell
+    mov rsi, qword [gfo]
+    lea rdi, [rsnbuf]
+    mov rcx, rax
+    rep cmpsb
+    jne or_nextcell
+    mov rax, qword [gfl + 8]
+    cmp rax, [rllen]
+    jne or_nextcell
+    mov rsi, qword [gfo + 8]
+    lea rdi, [relbuf]
+    mov rcx, rax
+    rep cmpsb
+    jne or_nextcell
+    mov rax, qword [gfl + 16]
+    cmp rax, [typelen]
+    jne or_nextcell
+    mov rsi, qword [gfo + 16]
+    lea rdi, [typebuf]
+    mov rcx, rax
+    rep cmpsb
+    jne or_nextcell
+    mov ebx, 1                  ; dup
+    mov rax, [tmprow]
+    mov [newrowid], rax         ; report existing rowid
+    jmp or_nodup
+or_nextcell:
+    inc r15
+    jmp or_cell
+or_nextpg:
+    inc r13
+    jmp or_page
+or_nodup:
+    test rbx, rbx
+    jnz or_dupret
+    mov rdi, [f_root_rel]
+    call scan_max
+    test rax, rax
+    jnz om_dbclose
+    mov rax, [maxrowid]
+    inc rax
+    mov [newrowid], rax
+    lea rax, [rsnbuf]
+    mov qword [colp], rax
+    mov rax, [rsnlen]
+    mov qword [coll], rax
+    lea rax, [relbuf]
+    mov qword [colp + 8], rax
+    mov rax, [rllen]
+    mov qword [coll + 8], rax
+    lea rax, [typebuf]
+    mov qword [colp + 16], rax
+    mov rax, [typelen]
+    mov qword [coll + 16], rax
+    mov qword [ncols], 3
+    call build_record_text
+    mov rax, [f_root_rel]
+    mov [splitroot], rax
+    call place_cell
+    test rax, rax
+    jnz om_insfail
+    mov rax, [newrowid]
+    mov [maxrowid], rax
+    call hdr_touch
+or_dupret:
+    call db_close
+    lea rax, [jsontmp]
+    mov [outptr], rax
+    mov qword [outlen], 0
+    lea rsi, [jc_rowid]
+    call out_cstr
+    mov rax, [newrowid]
+    call out_uint
+    lea rsi, [jn_from]
+    call out_cstr
+    lea rsi, [rsnbuf]
+    mov rdx, [rsnlen]
+    call out_escaped
+    mov al, '"'
+    call out_byte
+    lea rsi, [jn_to]
+    call out_cstr
+    lea rsi, [relbuf]
+    mov rdx, [rllen]
+    call out_escaped
+    mov al, '"'
+    call out_byte
+    lea rsi, [jn_type]
+    call out_cstr
+    lea rsi, [typebuf]
+    mov rdx, [typelen]
+    call out_escaped
+    mov al, '"'
+    call out_byte
+    mov al, '}'
+    call out_byte
+    jmp oc_envelope
+
+; search_table: LIKE [qbuf]/[qlen] over table [sroot], mode [smode]:
+; 0=entities (col0|col1), 1=observations (col1), 2=facts (col0|col1).
+; Appends {"kind","name","text"} entries while [scount]<[slim], budget ok.
+; rax 0 ok / 1 walk-fail.
+search_table:
+    push rbx
+    mov rdi, [sroot]
+    call walk_leaves
+    test rax, rax
+    jnz st_err
+    mov qword [stci], 0
+st_page:
+    mov rax, [stci]
+    cmp rax, [childn]
+    jae st_done
+    lea rsi, [childtab]
+    shl rax, 3
+    add rsi, rax
+    mov rdi, [rsi]
+    lea rsi, [pagebuf]
+    call pg_read
+    test rax, rax
+    jnz st_nextpg
+    cmp byte [pagebuf], 0x0D
+    jne st_nextpg
+    lea rsi, [pagebuf + 3]
+    call be16_ld
+    mov [stn], rax
+    mov qword [stcell], 0
+st_cell:
+    mov rax, [stcell]
+    cmp rax, [stn]
+    jae st_nextpg
+    lea rsi, [pagebuf + 8]
+    shl rax, 1
+    add rsi, rax
+    call be16_ld
+    lea rsi, [pagebuf]
+    add rsi, rax
+    call parse_row
+    test rax, rax
+    jnz st_nextcell
+    cmp qword [gcols], 2
+    jb st_nextcell
+    cmp qword [smode], 1
+    je st_m1
+    ; modes 0,2: col0 or col1
+    mov rsi, qword [gfo]
+    mov rdx, qword [gfl]
+    lea rdi, [qbuf]
+    mov rcx, [qlen]
+    call sub_find
+    test rax, rax
+    jnz st_hit
+    mov rsi, qword [gfo + 8]
+    mov rdx, qword [gfl + 8]
+    lea rdi, [qbuf]
+    mov rcx, [qlen]
+    call sub_find
+    test rax, rax
+    jz st_nextcell
+    jmp st_hit
+st_m1:
+    ; observations: col1 only
+    mov rsi, qword [gfo + 8]
+    mov rdx, qword [gfl + 8]
+    lea rdi, [qbuf]
+    mov rcx, [qlen]
+    call sub_find
+    test rax, rax
+    jz st_nextcell
+st_hit:
+    test rax, rax
+    jz st_nextcell
+    ; emit if budget
+    mov rax, [scount]
+    cmp rax, [slim]
+    jae st_done
+    cmp qword [outlen], 60000
+    ja st_done
+    cmp byte [hfirst], 1
+    je st_first
+    mov al, ','
+    call out_byte
+    jmp st_put
+st_first:
+    mov byte [hfirst], 0
+st_put:
+    lea rsi, [jn_kind]
+    call out_cstr
+    cmp qword [smode], 0
+    je st_kent
+    cmp qword [smode], 1
+    je st_kobs
+    lea rsi, [kd_fact]
+    call out_cstr
+    jmp st_kend
+st_kent:
+    lea rsi, [kd_ent]
+    call out_cstr
+    jmp st_kend
+st_kobs:
+    lea rsi, [kd_obs]
+    call out_cstr
+st_kend:
+    mov al, '"'
+    call out_byte
+    lea rsi, [jn_name]
+    call out_cstr
+    mov rsi, qword [gfo]
+    mov rdx, qword [gfl]
+    call out_escaped
+    mov al, '"'
+    call out_byte
+    lea rsi, [jn_text]
+    call out_cstr
+    cmp qword [smode], 0
+    je st_tent
+    mov rsi, qword [gfo + 8]
+    mov rdx, qword [gfl + 8]
+    call out_escaped
+    jmp st_tend
+st_tent:
+    mov rsi, qword [gfo + 8]
+    mov rdx, qword [gfl + 8]
+    call out_escaped
+st_tend:
+    mov al, '"'
+    call out_byte
+    mov al, '}'
+    call out_byte
+    inc qword [scount]
+st_nextcell:
+    inc qword [stcell]
+    jmp st_cell
+st_nextpg:
+    inc qword [stci]
+    jmp st_page
+st_done:
+    pop rbx
+    xor eax, eax
+    ret
+st_err:
+    pop rbx
+    mov eax, 1
+    ret
+
+; op_search {query, limit?}
+op_search:
+    mov rsi, [pp]
+    lea rdi, [k_args]
+    mov ecx, 11
+    call find_val
+    test rax, rax
+    jz dc_params
+    mov [ap], rax
+    mov rsi, [ap]
+    lea rdi, [k_query]
+    mov ecx, 7
+    call find_val
+    test rax, rax
+    jz dc_params
+    mov rsi, rax
+    lea rdi, [qbuf]
+    mov ecx, 64
+    call parse_str
+    test rax, rax
+    jz dc_params
+    test rdx, rdx
+    jz dc_params
+    mov [qlen], rdx
+    lea rsi, [qbuf]
+    mov rdx, [qlen]
+    call ascii_only
+    test rax, rax
+    jnz oc_ascii
+    mov qword [slim], 10
+    mov rsi, [ap]
+    lea rdi, [k_limit]
+    mov ecx, 7
+    call find_val
+    test rax, rax
+    jz os_nolim
+    mov rsi, rax
+    call parse_int
+    test rax, rax
+    jnz dc_params
+    mov rax, [numval]
+    cmp rax, 1
+    jb dc_params
+    cmp rax, 20
+    ja dc_params
+    mov [slim], rax
+os_nolim:
+    call db_open
+    test rax, rax
+    jnz oc_db
+    lea rax, [outbuf]
+    mov [outptr], rax
+    call out_reset
+    lea rsi, [j1]
+    call out_cstr
+    lea rsi, [idbuf]
+    mov rdx, [idlen]
+    call out_bytes
+    lea rsi, [jres]
+    call out_cstr
+    lea rsi, [jn_results]
+    call out_cstr
+    mov qword [scount], 0
+    mov byte [hfirst], 1
+    mov rax, [f_root_ent]
+    mov [sroot], rax
+    mov qword [smode], 0
+    call search_table
+    test rax, rax
+    jnz os_dbclose
+    mov rax, [f_root_obs]
+    mov [sroot], rax
+    mov qword [smode], 1
+    call search_table
+    test rax, rax
+    jnz os_dbclose
+    mov rax, [f_root_facts]
+    mov [sroot], rax
+    mov qword [smode], 2
+    call search_table
+    test rax, rax
+    jnz os_dbclose
+    call db_close
+    mov al, ']'
+    call out_byte
+    mov al, '}'
+    call out_byte
+    mov al, '}'
+    call out_byte
+    mov al, 10
+    call out_byte
+    jmp emit
+os_dbclose:
+    call db_close
+    lea rdi, [c_internal]
+    lea rsi, [m_nodb]
+    jmp err_id
+
+; op_open {names[1..16]}: entities + observations + relations, streamed.
+op_open:
+    mov rsi, [pp]
+    lea rdi, [k_args]
+    mov ecx, 11
+    call find_val
+    test rax, rax
+    jz dc_params
+    mov [ap], rax
+    mov rsi, [ap]
+    lea rdi, [k_names]
+    mov ecx, 7
+    call find_val
+    test rax, rax
+    jz dc_params
+    cmp rax, [le]
+    jae dc_params
+    cmp byte [rax], '['
+    jne dc_params
+    inc rax
+    mov [obsarr], rax
+    call db_open
+    test rax, rax
+    jnz oc_db
+    lea rax, [outbuf]
+    mov [outptr], rax
+    call out_reset
+    lea rsi, [j1]
+    call out_cstr
+    lea rsi, [idbuf]
+    mov rdx, [idlen]
+    call out_bytes
+    lea rsi, [jres]
+    call out_cstr
+    lea rsi, [jn_nodes]
+    call out_cstr
+    mov byte [hfirst], 1
+    xor ebx, ebx                ; names done
+oo_loop:
+    cmp ebx, 16
+    jae oo_many
+    mov rsi, [obsarr]
+    call skip_ws_comma
+    mov rsi, [obsarr]
+    cmp rsi, [le]
+    jae oo_bad
+    cmp byte [rsi], ']'
+    je oo_tail
+    cmp byte [rsi], '"'
+    jne oo_bad
+    lea rdi, [relbuf]
+    mov ecx, 64
+    call parse_str
+    test rax, rax
+    jz oo_bad
+    mov [obsarr], rax
+    mov [rllen], rdx
+    test rdx, rdx
+    jz oo_bad
+    lea rsi, [relbuf]
+    mov rdx, [rllen]
+    call valid_name
+    test rax, rax
+    jnz oo_bad
+    inc rbx
+    ; lookup entity (latest)
+    lea rsi, [relbuf]
+    mov rdx, [rllen]
+    mov [mkey], rsi
+    mov [mkeylen], rdx
+    mov rdi, [f_root_ent]
+    call scan_key_latest
+    cmp rax, 2
+    je oo_dbclose
+    cmp rax, 1
+    jne oo_missing
+    ; full entry
+    cmp qword [outlen], 60000
+    ja oo_tail
+    cmp byte [hfirst], 1
+    je oo_first
+    mov al, ','
+    call out_byte
+    jmp oo_head
+oo_first:
+    mov byte [hfirst], 0
+oo_head:
+    mov al, '{'
+    call out_byte
+    lea rsi, [jn_name + 1]      ; '"name":"' (skip leading comma)
+    call out_cstr
+    lea rsi, [relbuf]
+    mov rdx, [rllen]
+    call out_escaped
+    mov al, '"'
+    call out_byte
+    lea rsi, [jn_type]
+    call out_cstr
+    mov rsi, qword [gfo + 8]
+    mov rdx, qword [gfl + 8]
+    call out_escaped
+    mov al, '"'
+    call out_byte
+    lea rsi, [jn_project]
+    call out_cstr
+    mov rsi, qword [gfo + 16]
+    mov rdx, qword [gfl + 16]
+    call out_escaped
+    mov al, '"'
+    call out_byte
+    lea rsi, [jn_obs]
+    call out_cstr
+    mov byte [hfirst], 1        ; reuse as inner-array first flag
+    mov qword [obcount], 0
+    mov rdi, [f_root_obs]
+    call walk_leaves
+    test rax, rax
+    jnz oo_dbclose
+    mov qword [stci], 0
+oo_opage:
+    mov rax, [stci]
+    cmp rax, [childn]
+    jae oo_obsdone
+    lea rsi, [childtab]
+    shl rax, 3
+    add rsi, rax
+    mov rdi, [rsi]
+    lea rsi, [pagebuf]
+    call pg_read
+    test rax, rax
+    jnz oo_onextpg
+    cmp byte [pagebuf], 0x0D
+    jne oo_onextpg
+    lea rsi, [pagebuf + 3]
+    call be16_ld
+    mov [stn], rax
+    mov qword [stcell], 0
+oo_ocell:
+    mov rax, [stcell]
+    cmp rax, [stn]
+    jae oo_onextpg
+    cmp qword [obcount], 50
+    jae oo_obsdone
+    cmp qword [outlen], 60000
+    ja oo_obsdone
+    lea rsi, [pagebuf + 8]
+    shl rax, 1
+    add rsi, rax
+    call be16_ld
+    lea rsi, [pagebuf]
+    add rsi, rax
+    call parse_row
+    test rax, rax
+    jnz oo_ocellnext
+    cmp qword [gcols], 2
+    jb oo_ocellnext
+    mov rax, qword [gfl]
+    cmp rax, [rllen]
+    jne oo_ocellnext
+    mov rsi, qword [gfo]
+    lea rdi, [relbuf]
+    mov rcx, rax
+    rep cmpsb
+    jne oo_ocellnext
+    cmp byte [hfirst], 1
+    je oo_ofirst
+    mov al, ','
+    call out_byte
+    jmp oo_oemit
+oo_ofirst:
+    mov byte [hfirst], 0
+oo_oemit:
+    mov al, '"'
+    call out_byte
+    mov rsi, qword [gfo + 8]
+    mov rdx, qword [gfl + 8]
+    call out_escaped
+    mov al, '"'
+    call out_byte
+    inc qword [obcount]
+oo_ocellnext:
+    inc qword [stcell]
+    jmp oo_ocell
+oo_onextpg:
+    inc qword [stci]
+    jmp oo_opage
+oo_obsdone:
+    lea rsi, [jn_rels]
+    call out_cstr
+    mov byte [hfirst], 1
+    mov qword [relcount], 0
+    mov rdi, [f_root_rel]
+    call walk_leaves
+    test rax, rax
+    jnz oo_dbclose
+    mov qword [stci], 0
+oo_rpage:
+    mov rax, [stci]
+    cmp rax, [childn]
+    jae oo_relsdone
+    lea rsi, [childtab]
+    shl rax, 3
+    add rsi, rax
+    mov rdi, [rsi]
+    lea rsi, [pagebuf]
+    call pg_read
+    test rax, rax
+    jnz oo_rnextpg
+    cmp byte [pagebuf], 0x0D
+    jne oo_rnextpg
+    lea rsi, [pagebuf + 3]
+    call be16_ld
+    mov [stn], rax
+    mov qword [stcell], 0
+oo_rcell:
+    mov rax, [stcell]
+    cmp rax, [stn]
+    jae oo_rnextpg
+    cmp qword [relcount], 50
+    jae oo_relsdone
+    cmp qword [outlen], 60000
+    ja oo_relsdone
+    lea rsi, [pagebuf + 8]
+    shl rax, 1
+    add rsi, rax
+    call be16_ld
+    lea rsi, [pagebuf]
+    add rsi, rax
+    call parse_row
+    test rax, rax
+    jnz oo_rcellnext
+    cmp qword [gcols], 3
+    jb oo_rcellnext
+    ; col0==name or col1==name?
+    mov rax, qword [gfl]
+    cmp rax, [rllen]
+    jne oo_trycol1
+    mov rsi, qword [gfo]
+    lea rdi, [relbuf]
+    mov rcx, rax
+    rep cmpsb
+    je oo_rhit
+oo_trycol1:
+    mov rax, qword [gfl + 8]
+    cmp rax, [rllen]
+    jne oo_rcellnext
+    mov rsi, qword [gfo + 8]
+    lea rdi, [relbuf]
+    mov rcx, rax
+    rep cmpsb
+    jne oo_rcellnext
+oo_rhit:
+    cmp byte [hfirst], 1
+    je oo_rfirst
+    mov al, ','
+    call out_byte
+    jmp oo_remit
+oo_rfirst:
+    mov byte [hfirst], 0
+oo_remit:
+    mov al, '{'
+    call out_byte
+    lea rsi, [jn_from + 1]      ; '"from":"'
+    call out_cstr
+    mov rsi, qword [gfo]
+    mov rdx, qword [gfl]
+    call out_escaped
+    mov al, '"'
+    call out_byte
+    lea rsi, [jn_to]
+    call out_cstr
+    mov rsi, qword [gfo + 8]
+    mov rdx, qword [gfl + 8]
+    call out_escaped
+    mov al, '"'
+    call out_byte
+    lea rsi, [jn_type]
+    call out_cstr
+    mov rsi, qword [gfo + 16]
+    mov rdx, qword [gfl + 16]
+    call out_escaped
+    mov al, '"'
+    call out_byte
+    mov al, '}'
+    call out_byte
+    inc qword [relcount]
+oo_rcellnext:
+    inc qword [stcell]
+    jmp oo_rcell
+oo_rnextpg:
+    inc qword [stci]
+    jmp oo_rpage
+oo_relsdone:
+    mov al, ']'
+    call out_byte
+    mov al, '}'
+    call out_byte
+    jmp oo_loop
+oo_missing:
+    cmp qword [outlen], 60000
+    ja oo_tail
+    cmp byte [hfirst], 1
+    je oo_mfirst
+    mov al, ','
+    call out_byte
+    jmp oo_memit
+oo_mfirst:
+    mov byte [hfirst], 0
+oo_memit:
+    lea rsi, [jn_missing]
+    call out_cstr
+    lea rsi, [relbuf]
+    mov rdx, [rllen]
+    call out_escaped
+    lea rsi, [jn_miss2]
+    call out_cstr
+    jmp oo_loop
+oo_tail:
+    call db_close
+    mov al, ']'
+    call out_byte
+    mov al, '}'
+    call out_byte
+    mov al, '}'
+    call out_byte
+    mov al, 10
+    call out_byte
+    jmp emit
+oo_many:
+    call db_close
+    lea rdi, [c_params]
+    lea rsi, [m_big]
+    jmp err_id
+oo_bad:
+    call db_close
+    lea rdi, [c_params]
+    lea rsi, [m_params]
+    jmp err_id
+oo_dbclose:
+    call db_close
+    lea rdi, [c_internal]
+    lea rsi, [m_nodb]
+    jmp err_id
+
+; ---- memory: tasks (stable tid from header taskseq, append-version) ----
+; op_mktask {title, body?, status?, project?, priority?}
+op_mktask:
+    mov rsi, [pp]
+    lea rdi, [k_args]
+    mov ecx, 11
+    call find_val
+    test rax, rax
+    jz dc_params
+    mov [ap], rax
+    mov rsi, [ap]
+    lea rdi, [k_title]
+    mov ecx, 7
+    call find_val
+    test rax, rax
+    jz dc_params
+    mov rsi, rax
+    lea rdi, [titlebuf]
+    mov ecx, 128
+    call parse_str
+    test rax, rax
+    jz dc_params
+    test rdx, rdx
+    jz dc_params
+    mov [titlelen], rdx
+    lea rsi, [titlebuf]
+    mov rdx, [titlelen]
+    call ascii_only
+    test rax, rax
+    jnz oc_ascii
+    ; body? default ""
+    mov qword [taskblen], 0
+    mov rsi, [ap]
+    lea rdi, [k_body]
+    mov ecx, 6
+    call find_val
+    test rax, rax
+    jz omt_nobody
+    mov rsi, rax
+    lea rdi, [taskbuf]
+    mov ecx, 1024
+    call parse_str
+    test rax, rax
+    jz dc_params
+    mov [taskblen], rdx
+    lea rsi, [taskbuf]
+    mov rdx, [taskblen]
+    call ascii_only
+    test rax, rax
+    jnz oc_ascii
+omt_nobody:
+    ; status? default not_started
+    lea rsi, [st_ns]
+    lea rdi, [stbuf]
+    mov ecx, 11
+    rep movsb
+    mov qword [stlen], 11
+    mov rsi, [ap]
+    lea rdi, [k_status]
+    mov ecx, 8
+    call find_val
+    test rax, rax
+    jz omt_nostat
+    mov rsi, rax
+    lea rdi, [stbuf]
+    mov ecx, 16
+    call parse_str
+    test rax, rax
+    jz dc_params
+    test rdx, rdx
+    jz dc_params
+    mov [stlen], rdx
+    lea rsi, [stbuf]
+    mov rdx, [stlen]
+    call match_status
+    test rax, rax
+    jnz dc_params
+omt_nostat:
+    ; project? default ""
+    mov qword [projlen], 0
+    mov rsi, [ap]
+    lea rdi, [k_project]
+    mov ecx, 9
+    call find_val
+    test rax, rax
+    jz omt_noproj
+    mov rsi, rax
+    lea rdi, [projbuf]
+    mov ecx, 32
+    call parse_str
+    test rax, rax
+    jz dc_params
+    mov [projlen], rdx
+    lea rsi, [projbuf]
+    mov rdx, [projlen]
+    call ascii_only
+    test rax, rax
+    jnz oc_ascii
+omt_noproj:
+    ; priority? default medium
+    lea rsi, [pr_me]
+    lea rdi, [pribuf]
+    mov ecx, 6
+    rep movsb
+    mov qword [prilen], 6
+    mov rsi, [ap]
+    lea rdi, [k_priority]
+    mov ecx, 10
+    call find_val
+    test rax, rax
+    jz omt_nopri
+    mov rsi, rax
+    lea rdi, [pribuf]
+    mov ecx, 16
+    call parse_str
+    test rax, rax
+    jz dc_params
+    test rdx, rdx
+    jz dc_params
+    mov [prilen], rdx
+    lea rsi, [pribuf]
+    mov rdx, [prilen]
+    call match_priority
+    test rax, rax
+    jnz dc_params
+omt_nopri:
+    call db_open
+    test rax, rax
+    jnz oc_db
+    mov rax, [taskseq]
+    inc rax
+    mov [taskseq], rax
+    mov [qtid], rax
+    lea rdi, [relbuf]
+    call ultoa
+    mov [rllen], rcx
+    mov rdi, [f_root_tasks]
+    call scan_max
+    test rax, rax
+    jnz om_dbclose
+    mov rax, [maxrowid]
+    inc rax
+    mov [newrowid], rax
+    lea rax, [titlebuf]
+    mov qword [colp], rax
+    mov rax, [titlelen]
+    mov qword [coll], rax
+    lea rax, [taskbuf]
+    mov qword [colp + 8], rax
+    mov rax, [taskblen]
+    mov qword [coll + 8], rax
+    lea rax, [stbuf]
+    mov qword [colp + 16], rax
+    mov rax, [stlen]
+    mov qword [coll + 16], rax
+    lea rax, [projbuf]
+    mov qword [colp + 24], rax
+    mov rax, [projlen]
+    mov qword [coll + 24], rax
+    lea rax, [pribuf]
+    mov qword [colp + 32], rax
+    mov rax, [prilen]
+    mov qword [coll + 32], rax
+    lea rax, [relbuf]
+    mov qword [colp + 40], rax
+    mov rax, [rllen]
+    mov qword [coll + 40], rax
+    mov qword [ncols], 6
+    call build_record_text
+    mov rax, [f_root_tasks]
+    mov [splitroot], rax
+    call place_cell
+    test rax, rax
+    jnz om_insfail
+    mov rax, [newrowid]
+    mov [maxrowid], rax
+    call hdr_touch
+    call db_close
+    ; inner {"id":T,"title":"..","status":".."}
+    lea rax, [jsontmp]
+    mov [outptr], rax
+    mov qword [outlen], 0
+    lea rsi, [jn_id]
+    call out_cstr
+    mov rax, [qtid]
+    call out_uint
+    lea rsi, [jn_title]
+    call out_cstr
+    lea rsi, [titlebuf]
+    mov rdx, [titlelen]
+    call out_escaped
+    mov al, '"'
+    call out_byte
+    lea rsi, [jn_status]
+    call out_cstr
+    lea rsi, [stbuf]
+    mov rdx, [stlen]
+    call out_escaped
+    mov al, '"'
+    call out_byte
+    mov al, '}'
+    call out_byte
+    jmp oc_envelope
+
+; op_query {status?, project?, search?, limit?} newest-first.
+op_query:
+    mov rsi, [pp]
+    lea rdi, [k_args]
+    mov ecx, 11
+    call find_val
+    test rax, rax
+    jz dc_params
+    mov [ap], rax
+    mov qword [tmask], 0
+    mov rsi, [ap]
+    lea rdi, [k_status]
+    mov ecx, 8
+    call find_val
+    test rax, rax
+    jz oq_nostat
+    mov rsi, rax
+    lea rdi, [stbuf]
+    mov ecx, 16
+    call parse_str
+    test rax, rax
+    jz dc_params
+    test rdx, rdx
+    jz dc_params
+    mov [stlen], rdx
+    lea rsi, [stbuf]
+    mov rdx, [stlen]
+    call match_status
+    test rax, rax
+    jnz dc_params
+    or qword [tmask], 1
+oq_nostat:
+    mov rsi, [ap]
+    lea rdi, [k_project]
+    mov ecx, 9
+    call find_val
+    test rax, rax
+    jz oq_noproj
+    mov rsi, rax
+    lea rdi, [projbuf]
+    mov ecx, 32
+    call parse_str
+    test rax, rax
+    jz dc_params
+    mov [projlen], rdx
+    lea rsi, [projbuf]
+    mov rdx, [projlen]
+    call ascii_only
+    test rax, rax
+    jnz oc_ascii
+    or qword [tmask], 2
+oq_noproj:
+    mov rsi, [ap]
+    lea rdi, [k_search]
+    mov ecx, 8
+    call find_val
+    test rax, rax
+    jz oq_nosearch
+    mov rsi, rax
+    lea rdi, [qbuf]
+    mov ecx, 64
+    call parse_str
+    test rax, rax
+    jz dc_params
+    test rdx, rdx
+    jz dc_params
+    mov [qlen], rdx
+    lea rsi, [qbuf]
+    mov rdx, [qlen]
+    call ascii_only
+    test rax, rax
+    jnz oc_ascii
+    or qword [tmask], 4
+oq_nosearch:
+    mov qword [slim], 20
+    mov rsi, [ap]
+    lea rdi, [k_limit]
+    mov ecx, 7
+    call find_val
+    test rax, rax
+    jz oq_nolim
+    mov rsi, rax
+    call parse_int
+    test rax, rax
+    jnz dc_params
+    mov rax, [numval]
+    cmp rax, 1
+    jb dc_params
+    cmp rax, 50
+    ja dc_params
+    mov [slim], rax
+oq_nolim:
+    call db_open
+    test rax, rax
+    jnz oc_db
+    lea rax, [outbuf]
+    mov [outptr], rax
+    call out_reset
+    lea rsi, [j1]
+    call out_cstr
+    lea rsi, [idbuf]
+    mov rdx, [idlen]
+    call out_bytes
+    lea rsi, [jres]
+    call out_cstr
+    lea rsi, [jn_tasks]
+    call out_cstr
+    mov qword [scount], 0
+    mov qword [tseenn], 0
+    mov byte [hfirst], 1
+    mov rdi, [f_root_tasks]
+    call walk_leaves
+    test rax, rax
+    jnz os_dbclose
+    mov rax, [childn]
+    test rax, rax
+    jz oq_tail
+    dec rax
+    mov [stci], rax              ; start at last page index
+oq_page:
+    lea rsi, [childtab]
+    mov rax, [stci]
+    shl rax, 3
+    add rsi, rax
+    mov rdi, [rsi]
+    lea rsi, [pagebuf]
+    call pg_read
+    test rax, rax
+    jnz oq_nextpg
+    cmp byte [pagebuf], 0x0D
+    jne oq_nextpg
+    lea rsi, [pagebuf + 3]
+    call be16_ld
+    test rax, rax
+    jz oq_nextpg
+    mov [stn], rax
+    dec rax
+    mov [stcell], rax
+oq_cell:
+    lea rsi, [pagebuf + 8]
+    mov rax, [stcell]
+    shl rax, 1
+    add rsi, rax
+    call be16_ld
+    lea rsi, [pagebuf]
+    add rsi, rax
+    call parse_row
+    test rax, rax
+    jnz oq_nextcell
+    cmp qword [gcols], 6
+    jb oq_nextcell
+    ; tid integer?
+    mov rsi, qword [gfo + 40]
+    mov rdx, qword [gfl + 40]
+    call dec_atoi
+    cmp rax, -1
+    je oq_nextcell
+    mov [qtid], rax
+    ; dedupe by tid in tseetab
+    xor ecx, ecx
+oq_seen:
+    cmp rcx, [tseenn]
+    jae oq_new
+    lea rdx, [tseetab]
+    mov rsi, rcx
+    shl rsi, 3
+    add rdx, rsi
+    cmp qword [rdx], rax
+    je oq_nextcell
+    inc rcx
+    jmp oq_seen
+oq_new:
+    cmp qword [tseenn], 512
+    jae oq_tail
+    lea rsi, [tseetab]
+    mov rcx, [tseenn]
+    shl rcx, 3
+    add rsi, rcx
+    mov rcx, [qtid]
+    mov qword [rsi], rcx
+    inc qword [tseenn]
+    jmp oq_filter
+oq_filter:
+    ; status filter?
+    test qword [tmask], 1
+    jz oq_fproj
+    mov rax, qword [gfl + 16]
+    cmp rax, [stlen]
+    jne oq_nextcell
+    mov rsi, qword [gfo + 16]
+    lea rdi, [stbuf]
+    mov rcx, rax
+    rep cmpsb
+    jne oq_nextcell
+oq_fproj:
+    test qword [tmask], 2
+    jz oq_fsearch
+    mov rax, qword [gfl + 24]
+    cmp rax, [projlen]
+    jne oq_nextcell
+    mov rsi, qword [gfo + 24]
+    lea rdi, [projbuf]
+    mov rcx, rax
+    rep cmpsb
+    jne oq_nextcell
+oq_fsearch:
+    test qword [tmask], 4
+    jz oq_emitq
+    mov rsi, qword [gfo]
+    mov rdx, qword [gfl]
+    lea rdi, [qbuf]
+    mov rcx, [qlen]
+    call sub_find
+    test rax, rax
+    jnz oq_emitq
+    mov rsi, qword [gfo + 8]
+    mov rdx, qword [gfl + 8]
+    lea rdi, [qbuf]
+    mov rcx, [qlen]
+    call sub_find
+    test rax, rax
+    jz oq_nextcell
+oq_emitq:
+    mov rax, [scount]
+    cmp rax, [slim]
+    jae oq_tail
+    cmp qword [outlen], 60000
+    ja oq_tail
+    cmp byte [hfirst], 1
+    je oq_qfirst
+    mov al, ','
+    call out_byte
+    jmp oq_qput
+oq_qfirst:
+    mov byte [hfirst], 0
+oq_qput:
+    mov al, '{'
+    call out_byte
+    lea rsi, [jn_id + 1]        ; '"id":'
+    call out_cstr
+    mov rsi, qword [gfo + 40]
+    mov rdx, qword [gfl + 40]
+    call out_escaped_rawnum
+    lea rsi, [jn_title]
+    call out_cstr
+    mov rsi, qword [gfo]
+    mov rdx, qword [gfl]
+    call out_escaped
+    mov al, '"'
+    call out_byte
+    lea rsi, [jn_status]
+    call out_cstr
+    mov rsi, qword [gfo + 16]
+    mov rdx, qword [gfl + 16]
+    call out_escaped
+    mov al, '"'
+    call out_byte
+    lea rsi, [jn_project]
+    call out_cstr
+    mov rsi, qword [gfo + 24]
+    mov rdx, qword [gfl + 24]
+    call out_escaped
+    mov al, '"'
+    call out_byte
+    lea rsi, [jn_priority]
+    call out_cstr
+    mov rsi, qword [gfo + 32]
+    mov rdx, qword [gfl + 32]
+    call out_escaped
+    mov al, '"'
+    call out_byte
+    lea rsi, [jn_body]
+    call out_cstr
+    mov rsi, qword [gfo + 8]
+    mov rdx, qword [gfl + 8]
+    call out_escaped
+    mov al, '"'
+    call out_byte
+    mov al, '}'
+    call out_byte
+    inc qword [scount]
+oq_nextcell:
+    cmp qword [stcell], 0
+    je oq_nextpg
+    dec qword [stcell]
+    jmp oq_cell
+oq_nextpg:
+    cmp qword [stci], 0
+    je oq_tail
+    dec qword [stci]
+    jmp oq_page
+oq_tail:
+    call db_close
+    mov al, ']'
+    call out_byte
+    mov al, '}'
+    call out_byte
+    mov al, '}'
+    call out_byte
+    mov al, 10
+    call out_byte
+    jmp emit
+
+; out_escaped_rawnum(rsi=digits, rdx=len): raw copy (validated digits).
+out_escaped_rawnum:
+    test rdx, rdx
+    jz oer_ret
+    mov rcx, rdx
+    mov rax, [outlen]
+    mov rdi, [outptr]
+    add rdi, rax
+    add rax, rcx
+    mov [outlen], rax
+    rep movsb
+oer_ret:
+    ret
+
+; op_updtask {id, title?, body?, status?, project?, priority?}
+op_updtask:
+    mov rsi, [pp]
+    lea rdi, [k_args]
+    mov ecx, 11
+    call find_val
+    test rax, rax
+    jz dc_params
+    mov [ap], rax
+    mov rsi, [ap]
+    lea rdi, [k_id]
+    mov ecx, 4
+    call find_val
+    test rax, rax
+    jz dc_params
+    mov rsi, rax
+    call parse_int
+    test rax, rax
+    jnz dc_params
+    mov rax, [numval]
+    cmp rax, 1
+    jb dc_params
+    mov [qtid], rax
+    mov qword [tmask], 0
+    mov rsi, [ap]
+    lea rdi, [k_title]
+    mov ecx, 7
+    call find_val
+    test rax, rax
+    jz ou_notitle
+    mov rsi, rax
+    lea rdi, [titlebuf]
+    mov ecx, 128
+    call parse_str
+    test rax, rax
+    jz dc_params
+    test rdx, rdx
+    jz dc_params
+    mov [titlelen], rdx
+    lea rsi, [titlebuf]
+    mov rdx, [titlelen]
+    call ascii_only
+    test rax, rax
+    jnz oc_ascii
+    or qword [tmask], 1
+ou_notitle:
+    mov rsi, [ap]
+    lea rdi, [k_body]
+    mov ecx, 6
+    call find_val
+    test rax, rax
+    jz ou_nobody
+    mov rsi, rax
+    lea rdi, [taskbuf]
+    mov ecx, 1024
+    call parse_str
+    test rax, rax
+    jz dc_params
+    mov [taskblen], rdx
+    lea rsi, [taskbuf]
+    mov rdx, [taskblen]
+    call ascii_only
+    test rax, rax
+    jnz oc_ascii
+    or qword [tmask], 2
+ou_nobody:
+    mov rsi, [ap]
+    lea rdi, [k_status]
+    mov ecx, 8
+    call find_val
+    test rax, rax
+    jz ou_nostat
+    mov rsi, rax
+    lea rdi, [stbuf]
+    mov ecx, 16
+    call parse_str
+    test rax, rax
+    jz dc_params
+    test rdx, rdx
+    jz dc_params
+    mov [stlen], rdx
+    lea rsi, [stbuf]
+    mov rdx, [stlen]
+    call match_status
+    test rax, rax
+    jnz dc_params
+    or qword [tmask], 4
+ou_nostat:
+    mov rsi, [ap]
+    lea rdi, [k_project]
+    mov ecx, 9
+    call find_val
+    test rax, rax
+    jz ou_noproj
+    mov rsi, rax
+    lea rdi, [projbuf]
+    mov ecx, 32
+    call parse_str
+    test rax, rax
+    jz dc_params
+    mov [projlen], rdx
+    lea rsi, [projbuf]
+    mov rdx, [projlen]
+    call ascii_only
+    test rax, rax
+    jnz oc_ascii
+    or qword [tmask], 8
+ou_noproj:
+    mov rsi, [ap]
+    lea rdi, [k_priority]
+    mov ecx, 10
+    call find_val
+    test rax, rax
+    jz ou_nopri
+    mov rsi, rax
+    lea rdi, [pribuf]
+    mov ecx, 16
+    call parse_str
+    test rax, rax
+    jz dc_params
+    test rdx, rdx
+    jz dc_params
+    mov [prilen], rdx
+    lea rsi, [pribuf]
+    mov rdx, [prilen]
+    call match_priority
+    test rax, rax
+    jnz dc_params
+    or qword [tmask], 16
+ou_nopri:
+    test qword [tmask], 31
+    jz dc_params
+    call db_open
+    test rax, rax
+    jnz oc_db
+    ; find latest row with tid==qtid (newest-first walk)
+    mov rdi, [f_root_tasks]
+    call walk_leaves
+    test rax, rax
+    jnz om_dbclose
+    mov rax, [childn]
+    test rax, rax
+    jz ou_miss
+    dec rax
+    mov [stci], rax              ; start at last page index
+ou_page:
+    lea rsi, [childtab]
+    mov rax, [stci]
+    shl rax, 3
+    add rsi, rax
+    mov rdi, [rsi]
+    lea rsi, [pagebuf]
+    call pg_read
+    test rax, rax
+    jnz ou_nextpg
+    cmp byte [pagebuf], 0x0D
+    jne ou_nextpg
+    lea rsi, [pagebuf + 3]
+    call be16_ld
+    test rax, rax
+    jz ou_nextpg
+    mov [stn], rax
+    dec rax
+    mov [stcell], rax
+ou_cell:
+    lea rsi, [pagebuf + 8]
+    mov rax, [stcell]
+    shl rax, 1
+    add rsi, rax
+    call be16_ld
+    lea rsi, [pagebuf]
+    add rsi, rax
+    call parse_row
+    test rax, rax
+    jnz ou_nextcell
+    cmp qword [gcols], 6
+    jb ou_nextcell
+    mov rsi, qword [gfo + 40]
+    mov rdx, qword [gfl + 40]
+    call dec_atoi
+    cmp rax, [qtid]
+    jne ou_nextcell
+    jmp ou_found
+ou_nextcell:
+    cmp qword [stcell], 0
+    je ou_nextpg
+    dec qword [stcell]
+    jmp ou_cell
+ou_nextpg:
+    cmp qword [stci], 0
+    je ou_miss
+    dec qword [stci]
+    jmp ou_page
+ou_miss:
+    call db_close
+    lea rdi, [c_params]
+    lea rsi, [m_nofile]
+    jmp err_id
+ou_found:
+    ; snapshot current row into bufs for absent fields (pagebuf churns next)
+    test qword [tmask], 1
+    jnz ou_s1
+    mov rax, qword [gfl]
+    cmp rax, 128
+    ja ou_corrupt
+    mov rsi, qword [gfo]
+    lea rdi, [titlebuf]
+    mov rcx, rax
+    rep movsb
+    mov [titlelen], rax
+ou_s1:
+    test qword [tmask], 2
+    jnz ou_s2
+    mov rax, qword [gfl + 8]
+    cmp rax, 1024
+    ja ou_corrupt
+    mov rsi, qword [gfo + 8]
+    lea rdi, [taskbuf]
+    mov rcx, rax
+    rep movsb
+    mov [taskblen], rax
+ou_s2:
+    test qword [tmask], 4
+    jnz ou_s3
+    mov rax, qword [gfl + 16]
+    cmp rax, 16
+    ja ou_corrupt
+    mov rsi, qword [gfo + 16]
+    lea rdi, [stbuf]
+    mov rcx, rax
+    rep movsb
+    mov [stlen], rax
+ou_s3:
+    test qword [tmask], 8
+    jnz ou_s4
+    mov rax, qword [gfl + 24]
+    cmp rax, 32
+    ja ou_corrupt
+    mov rsi, qword [gfo + 24]
+    lea rdi, [projbuf]
+    mov rcx, rax
+    rep movsb
+    mov [projlen], rax
+ou_s4:
+    test qword [tmask], 16
+    jnz ou_s5
+    mov rax, qword [gfl + 32]
+    cmp rax, 16
+    ja ou_corrupt
+    mov rsi, qword [gfo + 32]
+    lea rdi, [pribuf]
+    mov rcx, rax
+    rep movsb
+    mov [prilen], rax
+ou_s5:
+    mov rax, qword [gfl + 40]
+    cmp rax, 64
+    ja ou_corrupt
+    mov rsi, qword [gfo + 40]
+    lea rdi, [relbuf]
+    mov rcx, rax
+    rep movsb
+    mov [rllen], rax
+    ; colp/coll all from bufs now (pagebuf-independent)
+    lea rax, [titlebuf]
+    mov qword [colp], rax
+    mov rax, [titlelen]
+    mov qword [coll], rax
+    lea rax, [taskbuf]
+    mov qword [colp + 8], rax
+    mov rax, [taskblen]
+    mov qword [coll + 8], rax
+    lea rax, [stbuf]
+    mov qword [colp + 16], rax
+    mov rax, [stlen]
+    mov qword [coll + 16], rax
+    lea rax, [projbuf]
+    mov qword [colp + 24], rax
+    mov rax, [projlen]
+    mov qword [coll + 24], rax
+    lea rax, [pribuf]
+    mov qword [colp + 32], rax
+    mov rax, [prilen]
+    mov qword [coll + 32], rax
+    lea rax, [relbuf]
+    mov qword [colp + 40], rax
+    mov rax, [rllen]
+    mov qword [coll + 40], rax
+    mov qword [ncols], 6
+    ; response inner from bufs, then persist
+    lea rax, [jsontmp]
+    mov [outptr], rax
+    mov qword [outlen], 0
+    lea rsi, [jn_id]
+    call out_cstr
+    lea rsi, [relbuf]
+    mov rdx, [rllen]
+    call out_escaped_rawnum
+    lea rsi, [jn_title]
+    call out_cstr
+    lea rsi, [titlebuf]
+    mov rdx, [titlelen]
+    call out_escaped
+    mov al, '"'
+    call out_byte
+    lea rsi, [jn_status]
+    call out_cstr
+    lea rsi, [stbuf]
+    mov rdx, [stlen]
+    call out_escaped
+    mov al, '"'
+    call out_byte
+    mov al, '}'
+    call out_byte
+    mov rax, [outlen]
+    mov [innerlen], rax
+    ; now persist the new version
+    mov rdi, [f_root_tasks]
+    call scan_max
+    test rax, rax
+    jnz om_dbclose
+    mov rax, [maxrowid]
+    inc rax
+    mov [newrowid], rax
+    call build_record_text
+    mov rax, [f_root_tasks]
+    mov [splitroot], rax
+    call place_cell
+    test rax, rax
+    jnz om_insfail
+    mov rax, [newrowid]
+    mov [maxrowid], rax
+    call hdr_touch
+    call db_close
+    jmp oc_envelope
+ou_corrupt:
+    call db_close
+    lea rdi, [c_internal]
+    lea rsi, [m_nodb]
+    jmp err_id
 
 ; op_think
 op_think:
@@ -2731,7 +6765,9 @@ op_think:
     jnz dc_params
     mov rax, [numval]
     mov [v_num], rax
-    ; totalThoughts (required int)
+    cmp qword [v_num], 1
+    jb dc_params
+    ; totalThoughts (required int >= 1)
     mov rsi, [ap]
     lea rdi, [k_thtotal]
     mov ecx, 15
@@ -2744,6 +6780,8 @@ op_think:
     jnz dc_params
     mov rax, [numval]
     mov [v_total], rax
+    cmp qword [v_total], 1
+    jb dc_params
     ; optionals, defaults absent
     mov qword [gotmask], 0
     mov qword [v_isrev], 0
@@ -2827,6 +6865,28 @@ ot_nobid:
     mov [v_more], al
     or qword [gotmask], 16
 ot_store:
+    ; validate workflow references against recorded history
+    test qword [gotmask], 2   ; revisesThought in 1..hcount?
+    jz ot_vbr
+    mov rax, [v_rev]
+    cmp rax, 1
+    jb ot_unknown
+    cmp rax, [hcount]
+    ja ot_unknown
+ot_vbr:
+    test qword [gotmask], 4   ; branchFromThought in 1..hcount?
+    jz ot_vok
+    mov rax, [v_brfrom]
+    cmp rax, 1
+    jb ot_unknown
+    cmp rax, [hcount]
+    ja ot_unknown
+    jmp ot_vok
+ot_unknown:
+    lea rdi, [c_params]
+    lea rsi, [m_unknown]
+    jmp err_id
+ot_vok:
     ; slot = hcount % 64 ; each slot 2144 bytes
     mov rax, [hcount]
     and rax, 63
@@ -2853,13 +6913,17 @@ ot_store:
     mov [rdi + 2064], rax
     mov al, [v_next]
     movzx rax, al
-    mov [rdi + 2072], rax     ; flags low bit = nextNeeded
+    mov [rdi + 2072], rax     ; bit0 = nextNeeded
     movzx rax, byte [v_isrev]
     shl rax, 1
-    or [rdi + 2072], rax
-    movzx rax, byte [v_more]
-    shl rax, 2
-    or [rdi + 2072], rax
+    or [rdi + 2072], rax      ; bit1 = isRevision
+    test qword [gotmask], 16
+    jz st_nomask
+    or qword [rdi + 2072], 4  ; bit2 = needsMore provided
+    cmp byte [v_more], 0
+    je st_nomask
+    or qword [rdi + 2072], 8  ; bit3 = needsMore value
+st_nomask:
     mov rax, [v_rev]
     mov [rdi + 2080], rax
     mov rax, [v_brfrom]
@@ -2999,9 +7063,25 @@ jr_rev db ',"revisesThought":', 0
 jr_brfrom db ',"branchFromThought":', 0
 jr_bid db ',"branchId":"', 0
 jr_more db ',"needsMoreThoughts":', 0
+jr_thought db ',"thought":"', 0
+jhisthead db '{"history":[', 0
+jhisttail db '],"historyLength":', 0
+r_resetok db '{"reset":true,"thoughtHistoryLength":0}', 0
 
 b_true db 'true', 0
 b_false db 'false', 0
+st_ns db 'not_started', 0
+st_ip db 'in_progress', 0
+st_dn db 'done', 0
+st_ar db 'archived', 0
+st_ca db 'cancelled', 0
+pr_lo db 'low', 0
+pr_me db 'medium', 0
+pr_hi db 'high', 0
+pr_cr db 'critical', 0
+kd_ent db 'entity', 0
+kd_obs db 'observation', 0
+kd_fact db 'fact', 0
 
 k_method db '"method"', 0
 k_id db '"id"', 0
@@ -3020,6 +7100,22 @@ k_more db '"needsMoreThoughts"', 0
 k_reason db '"reason"', 0
 k_conc db '"conclusion"', 0
 k_valid db '"valid"', 0
+k_limit db '"limit"', 0
+k_confirm db '"confirm"', 0
+k_text db '"text"', 0
+k_title db '"title"', 0
+k_body db '"body"', 0
+k_status db '"status"', 0
+k_project db '"project"', 0
+k_priority db '"priority"', 0
+k_type db '"type"', 0
+k_obs db '"observations"', 0
+k_query db '"query"', 0
+k_names db '"names"', 0
+k_search db '"search"', 0
+k_from db '"from"', 0
+k_to db '"to"', 0
+k_entity db '"entity"', 0
 
 m_init db 'initialize', 0
 m_disc db 'server/discover', 0
@@ -3029,6 +7125,19 @@ m_call db 'tools/call', 0
 m_notif db 'notifications/', 0
 t_think db 'sequential_thinking', 0
 t_conc db 'conclusion', 0
+t_hist db 'thought_history', 0
+t_reset db 'thought_reset', 0
+t_fread db 'read_fact', 0
+t_fwrite db 'write_fact', 0
+t_flist db 'list_facts', 0
+t_mkentity db 'create_entities', 0
+t_addobs db 'add_observations', 0
+t_search db 'search_nodes', 0
+t_open db 'open_nodes', 0
+t_mktask db 'create_task_or_note', 0
+t_query db 'query_tasks', 0
+t_updtask db 'update_task', 0
+t_mkrel db 'create_relations', 0
 
 c_parse db '-32700', 0
 c_invalid db '-32600', 0
@@ -3042,6 +7151,8 @@ m_badid db 'bad id', 0
 m_nomethod db 'method not found', 0
 m_params db 'bad params', 0
 m_notool db 'unknown tool', 0
+m_unknown db 'unknown thought', 0
+m_badname db 'bad name', 0
 m_exists db 'already recorded', 0
 m_nodb db 'db error', 0
 m_dbfull db 'db full', 0
@@ -3053,6 +7164,21 @@ dbexe db '/proc/self/exe', 0
 dbfile db 'tinythink.db', 0
 m_table db 'table', 0
 m_conct db 'conclusions', 0
+t_facts_n db 'facts', 0
+t_facts_sql db 'CREATE TABLE facts(name TEXT, body TEXT)', 0
+t_facts_sqllen = $ - t_facts_sql - 1
+t_ent_n db 'entities', 0
+t_ent_sql db 'CREATE TABLE entities(name TEXT, type TEXT, project TEXT)', 0
+t_ent_sqllen = $ - t_ent_sql - 1
+t_obs_n db 'observations', 0
+t_obs_sql db 'CREATE TABLE observations(entity TEXT, body TEXT)', 0
+t_obs_sqllen = $ - t_obs_sql - 1
+t_rel_n db 'relations', 0
+t_rel_sql db 'CREATE TABLE relations(src TEXT, dst TEXT, type TEXT)', 0
+t_rel_sqllen = $ - t_rel_sql - 1
+t_task_n db 'tasks', 0
+t_task_sql db 'CREATE TABLE tasks(title TEXT, body TEXT, status TEXT, project TEXT, priority TEXT)', 0
+t_task_sqllen = $ - t_task_sql - 1
 
 dbmagic db 'SQLite format 3', 0
 dbsql db 'CREATE TABLE conclusions(reason TEXT, thought TEXT, conclusion TEXT, valid INTEGER)', 0
@@ -3060,6 +7186,28 @@ dbsql_len = $ - dbsql - 1
 
 jc_rowid db '{"rowid":', 0
 jc_reason db ',"reason":"', 0
+jn_name db ',"name":"', 0
+jn_body db ',"body":"', 0
+jn_title db ',"title":"', 0
+jn_status db ',"status":"', 0
+jn_project db ',"project":"', 0
+jn_priority db ',"priority":"', 0
+jn_type db ',"type":"', 0
+jn_id db '{"id":', 0
+jn_kind db '{"kind":"', 0
+jn_text db ',"text":"', 0
+jn_entity db ',"entity":"', 0
+jn_from db ',"from":"', 0
+jn_to db ',"to":"', 0
+jn_created db ',"created":', 0
+jn_added db ',"added":', 0
+jn_obs db ',"observations":[', 0
+jn_rels db '],"relations":[', 0
+jn_missing db '{"name":"', 0
+jn_miss2 db '","missing":true}', 0
+jn_results db '{"results":[', 0
+jn_tasks db '{"tasks":[', 0
+jn_nodes db '{"nodes":[', 0
 jc_thought db ',"thought":"', 0
 jc_conc db ',"conclusion":"', 0
 jc_valid db ',"valid":', 0
@@ -3084,7 +7232,69 @@ r_toolsarr db '[{"name":"sequential_thinking"'
        db ',"description":"Record, read or invalidate a conclusion in tinythink.db."'
        db ',"inputSchema":{"type":"object","properties":{"reason":{"type":"string"}'
        db ',"thought":{"type":"string"},"conclusion":{"type":"string"}'
-       db ',"valid":{"type":"boolean"}},"required":["reason"]}}]', 0
+       db ',"valid":{"type":"boolean"}},"required":["reason"]}}'
+       db ',{"name":"thought_history"'
+       db ',"description":"Read recent thoughts from this connection history."'
+       db ',"inputSchema":{"type":"object","properties":{"limit":{"type":"integer"}}}'
+       db ',"required":[]}'
+       db ',{"name":"thought_reset"'
+       db ',"description":"Clear this connection thought history."'
+       db ',"inputSchema":{"type":"object","properties":{"confirm":{"type":"boolean"}}}'
+       db ',"required":["confirm"]}'
+       db ',{"name":"read_fact"'
+       db ',"description":"Read a fact by name from tinythink.db."'
+       db ',"inputSchema":{"type":"object","properties":{"name":{"type":"string"}}}'
+       db ',"required":["name"]}'
+       db ',{"name":"write_fact"'
+       db ',"description":"Write a fact (new version) to tinythink.db."'
+       db ',"inputSchema":{"type":"object","properties":{"name":{"type":"string"}'
+       db ',"text":{"type":"string"}},"required":["name","text"]}}'
+       db ',{"name":"list_facts"'
+       db ',"description":"List fact names in tinythink.db."'
+       db ',"inputSchema":{"type":"object","properties":{}}}'
+       db ',{"name":"create_entities"'
+       db ',"description":"Create an entity, optionally with observations."'
+       db ',"inputSchema":{"type":"object","properties":{"name":{"type":"string"}'
+       db ',"type":{"type":"string"},"project":{"type":"string"}'
+       db ',"observations":{"type":"array","items":{"type":"string"}}}'
+       db ',"required":["name"]}}'
+       db ',{"name":"add_observations"'
+       db ',"description":"Append observations to an entity (auto-creates it)."'
+       db ',"inputSchema":{"type":"object","properties":{"name":{"type":"string"}'
+       db ',"observations":{"type":"array","items":{"type":"string"}}}'
+       db ',"required":["name","observations"]}}'
+       db ',{"name":"search_nodes"'
+       db ',"description":"Substring search over entities, observations, facts."'
+       db ',"inputSchema":{"type":"object","properties":{"query":{"type":"string"}'
+       db ',"limit":{"type":"integer"}},"required":["query"]}}'
+       db ',{"name":"open_nodes"'
+       db ',"description":"Open entities with observations and relations."'
+       db ',"inputSchema":{"type":"object","properties":{"names":{"type":"array"'
+       db ',"items":{"type":"string"}}},"required":["names"]}}'
+       db ',{"name":"create_task_or_note"'
+       db ',"description":"Create a task in tinythink.db."'
+       db ',"inputSchema":{"type":"object","properties":{"title":{"type":"string"}'
+       db ',"body":{"type":"string"},"status":{"type":"string"}'
+       db ',"project":{"type":"string"},"priority":{"type":"string"}}}'
+       db ',"required":["title"]}'
+       db ',{"name":"query_tasks"'
+       db ',"description":"Query tasks newest-first with optional filters."'
+       db ',"inputSchema":{"type":"object","properties":{"status":{"type":"string"}'
+       db ',"project":{"type":"string"},"search":{"type":"string"}'
+       db ',"limit":{"type":"integer"}}}'
+       db ',"required":[]}'
+       db ',{"name":"update_task"'
+       db ',"description":"Update task fields (records a new version)."'
+       db ',"inputSchema":{"type":"object","properties":{"id":{"type":"integer"}'
+       db ',"title":{"type":"string"},"body":{"type":"string"}'
+       db ',"status":{"type":"string"},"project":{"type":"string"}'
+       db ',"priority":{"type":"string"}}}'
+       db ',"required":["id"]}'
+       db ',{"name":"create_relations"'
+       db ',"description":"Link two entities with a typed relation."'
+       db ',"inputSchema":{"type":"object","properties":{"from":{"type":"string"}'
+       db ',"to":{"type":"string"},"type":{"type":"string"}}}'
+       db ',"required":["from","to","type"]}]', 0
 
 lp dq 0
 ll dq 0
@@ -3138,6 +7348,65 @@ qpg dq 0
 tmprow dq 0
 tmpvoff dq 0
 rfsize dq 0
+sroot dq 0
+smode dq 0
+scount dq 0
+stci dq 0
+stn dq 0
+stcell dq 0
+obsarr dq 0
+obadded dq 0
+mcreated db 0
+typelen dq 0
+projlen dq 0
+taskseq dq 0
+mbodylen dq 0
+titlelen dq 0
+taskblen dq 0
+stlen dq 0
+prilen dq 0
+qlen dq 0
+rllen dq 0
+oblen dq 0
+slim dq 0
+qtid dq 0
+tmask dq 0
+m_name dq 0
+m_namelen dq 0
+m_rootpg dq 0
+m_sql dq 0
+m_sqllen dq 0
+m_rowid dq 0
+mmaxrowid dq 0
+ftname dq 0
+ftlen dq 0
+ts1 dq 0
+ts2 dq 0
+ts3 dq 0
+ts3p dq 0
+wroot dq 0
+childn dq 0
+et_root dq 0
+obcount dq 0
+relcount dq 0
+fseenn dq 0
+tseenn dq 0
+mkey dq 0
+mkeylen dq 0
+growid dq 0
+gcols dq 0
+ncols dq 0
+hlimit dq 0
+hcur dq 0
+hslot dq 0
+splitroot dq 2
+pagebase dq 0
+f_root_facts dq 0
+f_root_ent dq 0
+f_root_obs dq 0
+f_root_rel dq 0
+f_root_tasks dq 0
+hfirst db 0
 v_num dq 0
 v_total dq 0
 v_rev dq 0
@@ -3153,7 +7422,7 @@ fvalid db 0
 
 inbuf rb 4096
 line rb 8192
-outbuf rb 16384
+outbuf rb 65536
 jsontmp rb 4096
 thtmp rb 2048
 bidtmp rb 40
@@ -3175,4 +7444,22 @@ ccbuf rb 512
 dbstat rb 144
 sizetab rb 4096
 offstab rb 4096
+childtab rb 8192
+stab rb 48
+gfo rb 48
+gfl rb 48
+colp rb 48
+coll rb 48
+mbody rb 4096
+typebuf rb 32
+projbuf rb 32
+titlebuf rb 128
+taskbuf rb 1024
+stbuf rb 16
+pribuf rb 16
+qbuf rb 64
+relbuf rb 64
+obsbuf rb 1024
+fseen rb 8320
+tseetab rb 4096
 thslots rb 137216
