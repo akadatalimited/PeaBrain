@@ -1,6 +1,6 @@
 # tinythink
 
-Persistent agent memory in ~1 MB: a pure-FASM x86-64 MCP server backed by
+Persistent agent memory in ~53 KB: a pure-FASM x86-64 MCP server backed by
 a genuine on-disk SQLite database. No libc, no interpreter, no runtime —
 raw syscalls only. It speaks MCP stdio JSON-RPC and stores thoughts,
 facts, entities, relations, and tasks in `tinythink.db` next to the binary.
@@ -145,12 +145,10 @@ all normal for a FASM `format ELF64 dynamic` binary that only issues
 syscalls. ASLR is effective (two live instances map their code at
 distinct randomized bases) since all addressing is RIP-relative.
 
-Size split (~1 MB total): ~44 KB code, ~963 KB file-backed writable
-data, ~157 KB BSS. Almost all of the file-backed part is zero-filled
-reservations (`rb`): FASM emits leading `rb` blocks as file zeros, and
-only trailing `rb` becomes NOBITS (verified with a minimal probe:
-1 MB `rb` before an 8-byte `dq` → 1 MB file; after → 193 bytes).
-Moving the giant tables (`childtab`, `utab`, `thslots`, caches) after
-the last initialized datum would shrink the binary to ~100 KB with an
-identical runtime footprint — the clearest size-reduction target, left
-as future work since 1 MB is operationally irrelevant.
+Size split (~53 KB on disk, ~1.1 MB resident): ~44 KB code, ~11 KB
+file-backed writable data, ~1.1 MB BSS. The binary used to be ~1 MB
+because FASM emits leading `rb` blocks as file zeros and only trailing
+`rb` becomes NOBITS (verified with a minimal probe: 1 MB `rb` before an
+8-byte `dq` → 1 MB file; after → 193 bytes). Moving the giant tables
+(`childtab`, `utab`, `thslots`, caches) after the last initialized datum
+shrunk it 19x with a byte-identical runtime footprint.
