@@ -146,5 +146,27 @@ model scale (65 params) the GPU buys nothing; revisit at millions of
 embedding dims. model_status reports CPU backend + GPU-unavailable reason.
 NO GPU CLAIM MADE (no kernel executed, per the rule). Stage 6 stays shut.
 
+Stage 6a (recon, read-only touchpoint proven — operator-ordered revisit):
+Driver is the OPEN flavor (NVIDIA UNIX Open Kernel Module 610.57.04), so
+the ioctl ABI is published MIT source, not guesswork. renderD128+card0
+are both nvidia-drm (modeset-only; DRM compute route dead as expected).
+NVRM route viable: NV_IOCTL_MAGIC 'F', BASE 200, CARD_INFO 200, struct
+nv_ioctl_card_info 72B (kernel-open/common/inc/nv-ioctl.h @ tag
+610.57.04, cross-checked x3 mirrors), cmd _IOWR = 0xC04846C8.
+model/gpu_probe.asm (869B, pure FASM raw syscalls, no libcuda, no .so)
+proves it: vendor=10de device=2504 (GA106 RTX 3060) valid=1, exit 0,
+byte-matching an independent C proof. Read-only escape only.
+Road ahead (staged, each a standalone prototype like Stages 1-4):
+  6b: RM client/device/subdevice alloc via NV_ESC_IOCTL_XFER_CMD
+      (needs src/common/sdk/nvidia/inc RM control headers, same tag).
+  6c: device memory alloc + CPU map (NV01_MEMORY_LOCAL_USER) within a
+      VRAM budget (default cap 2-4GB of 12GB, configurable; CPU stays
+      default, GPU strictly opt-in, reported in model_status).
+  6d: channel/GPFIFO + SASS pushbuffer (kernels via on-system ptxas),
+      fences; INT8/VNNI lessons reused for quant upload.
+  Honest costing: 6b-6d reimplement a slice of the CUDA driver; the
+probe above is the last cheap step. No kernel executed yet; gpu stays
+"unavailable" in model_status until a stage actually computes.
+
 BACKEND PRIORITY: proven-GPU(explicit opt-in) > VNNI-quant > AVX2/FMA FP32 >
 reference. model_status always reports selected backend + why others lost.
