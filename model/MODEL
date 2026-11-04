@@ -1,0 +1,50 @@
+PeaBrain trainable model — design record (branch feat/model-arena).
+Companion to BUILD (MCP engine). Stages: 1 arena+save/load, 2 AVX2/FMA
+FP32 engine, 3 backprop+validation, 4 VNNI/INT8(+INT4/FP16) inference,
+5 GPU feasibility probe, 6 GPU only if proven. Prototype lives in model/
+standalone; MCP tools (model_init/train/predict/save/load/status) wire up
+only after Stage 3 is green. Live tinythink.db is never touched by tests.
+
+ARENA: mmap 4GiB MAP_PRIVATE|MAP_ANONYMOUS|MAP_NORESERVE (reserve address
+space, commit on demand). Internal align = max(request,4096) so mincore
+accounting is exact per region. Bump allocator + 64-entry region table
+{tag,off,size,align}; mark/reset for load rollback. allocated = acur
+high-water; committed = mincore residency sum over regions.
+
+PBMD v1 (LE): hdr 64B {magic 'PBMD', ver=1, arch=1(x86-64/AVX2+FMA base),
+flags, count, rsv, step u64, payload_bytes u64, table_crc FNV64, payload_crc
+FNV64, rsv} + count*32B table {tag,aren_off,size,data_crc FNV64} + payload
+(regions concatenated in table order). Validate: magic/ver/arch, count<=64,
+file_size == 64+count*32+payload_bytes, table_crc, per-region data_crc,
+payload_crc — in that order, before touching live regions.
+SAVE: tmp sibling (O_CREAT|O_EXCL), two passes (CRC then write), looped
+writes, fsync file, renameat over target, fsync dir. Any failure unlinks tmp;
+a valid checkpoint is never replaced by a partial one.
+LOAD: fstat size check, stream regions into staging allocs from a saved mark,
+verify each CRC; any failure rolls back to the mark — current model survives.
+Reject: bad magic/version/arch/count, short file, CRC mismatch, alloc fail.
+
+ENGINE (Stage 2): row-major FP32. AVX2/FMA primary (vbroadcastss + vfmadd231ps
+outer-product micro-kernel, 8-wide), scalar reference kernel, agreement test
+vs independent reference within 1e-5 relative. Runtime CPUID: AVX2/FMA
+required for fast path (else reference + warn in model_status); AVX_VNNI
+(VEX vpdpbusd) for Stage 4 INT8; AVX-512 masses detect-and-skip (absent here).
+Same PBMD format for all backends (quant params ride in step/meta later).
+
+TRAINING (Stage 3): MLP fwd (matmul+bias+act), MSE loss, backprop, SGD.
+Prove: unknown linear map first, then f(x,y)=3x^2-2y+1. Metrics: train loss
++ held-out validation error must both fall (no memorisation). Save/resume:
+step counter + weights round-trip exactly; predictions identical post-load.
+
+QUANT (Stage 4): INT8 symmetric per-tensor scale (+INT4 nibble packing and
+FP16 storage evaluated where they win); inference-only, training stays FP32;
+tolerance documented vs FP32. VNNI vpdpbusd sdot; scalar dequant reference.
+
+GPU (Stage 5+6): RTX3060 sm_86, 12GB. No libcuda, no shared libs, no ioctl
+guessing, no register poking without validated protocol. Probe /dev/nvidia*
+presence + driver version safely, document the ABI gap, conclude honestly.
+No GPU claim until a real kernel returns verified results. Fallback is always
+automatic; mid-train GPU failure rolls back before CPU resume.
+
+BACKEND PRIORITY: proven-GPU(explicit opt-in) > VNNI-quant > AVX2/FMA FP32 >
+reference. model_status always reports selected backend + why others lost.
