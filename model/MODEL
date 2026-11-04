@@ -85,6 +85,38 @@ QUANT (Stage 4): INT8 symmetric per-tensor scale (+INT4 nibble packing and
 FP16 storage evaluated where they win); inference-only, training stays FP32;
 tolerance documented vs FP32. VNNI vpdpbusd sdot; scalar dequant reference.
 
+STAGE 4 RESULTS (2026-11-04, ALL PASS, exit 0; model/quant.asm standalone):
+Scheme (affine, documented in quant.asm header): X_q uint8 asymmetric
+(sx,zx), W_q int8 symmetric (sw, zp=0), int32 accumulate (no overflow:
+K<=256 -> 8.3M << 2^31), Y = sx*sw*(acc - zx*colsum) + b_fp32, colsum
+precomputed; K padded to x4 (pad A=zx, W=0: exactly 0). Hidden A1
+requantised (calibrated sa/za); biases stay FP32. Test net 2->16->1
+leaky-ReLU with He-scale weights (the representative PeaBrain-init case),
+64 inputs; scales/zp printed (sx=0.015661/zx=127, sa=0.010967/za=3).
+- VNNI acc == scalar acc BIT-EXACT (1024B A1q + 64 preds, 0 mismatches).
+  Methodology: both paths share lane_out/out2_finish (identical FP op
+  order), so exactness holds by construction; padding verified (pad=0).
+- INT8 vs independent FP32-scalar reference: maxabs 0.0124, meanabs
+  0.0048. Tolerance 0.05 (4x measured; every real bug seen produced
+  >=0.18). A wild-+-2-weight stress net measured 0.18 (documented, not
+  asserted: per-tensor INT8 on wide ranges is honest there).
+- 256^3 bench: scalar-INT8 == VNNI-INT8 bit-exact (65536 dwords, 0
+  mismatches); scalar 12-15ms vs VNNI 1ms (12-15x) vs FP32-AVX2 2ms
+  (VNNI-INT8 2x our best FP32). B packed once into 4x8 blocks (standard).
+- Backend: CPUID AVX_VNNI = leaf7/subleaf1 EAX b4 (VEX); scalar fallback
+  still proves the quant math. AVX-512 masses detect-and-skip (absent).
+- VEX ENCODING GOTCHA (recorded so nobody repeats it): FASM 1.73 emits
+  EVEX vpdpbusd (62...), which #UDs on this AVX-VNNI-only CPU. Hand-encoded
+  VEX.128.66.0F38 C4 E3->E2 79 50 D1 (map byte is 0xE2=0F38, NOT 0xE3=0F3A;
+  first attempt faulted). Macro vdpbd (fixed dest=xmm2,src=xmm0,src=xmm1);
+  verified live (1+4+9+16=30 test).
+- Bugs caught: (1) FP32-ref W1 row-1 stride 32*4 vs 16*4 (read b1f as
+  weights); (2) lane_out reused rdx (A1q row) for corr1buf base, writing
+  quant bytes into the correction table and leaving A1q zero (both INT8
+  paths agreed vacuously; FP32-vs-INT8 caught it); (3) qb2v pointer-vs-
+  value (stored b2f address, added pointer bits); (4) FNV is a hash.
+- Live tinythink.db never touched (model/ + /tmp only). No GPU (Stage 5).
+
 GPU (Stage 5+6): RTX3060 sm_86, 12GB. No libcuda, no shared libs, no ioctl
 guessing, no register poking without validated protocol. Probe /dev/nvidia*
 presence + driver version safely, document the ABI gap, conclude honestly.
