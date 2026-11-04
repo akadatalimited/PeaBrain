@@ -86,9 +86,11 @@ update_task {id, title?, body?, status?, project?, priority?}: records
 
 Simplified vs full knowledge-graph semantics: no FTS/BM25 ranking
 (substring match), no visibility/projects graph, no debate/bridge
-machinery. Documented limits: cells <= ~1100B, table interiors never
-split (~600 leaves each), output budgets cap large listings, seen-sets
-cap distinct scans (facts 128, tasks 512).
+machinery. Documented limits: cells <= ~1100B, interiors split at any
+depth (right-edge appends; root keeps its number, no master rewrite),
+output budgets cap large listings, seen-sets cap distinct scans
+(facts 128, tasks 512). Validated: 100K-row volume, depth 3, zero
+orphans, pragma integrity_check clean throughout.
 
 SQLite subset (genuine on-disk format: pragma integrity_check passes,
 opens in real sqlite3, bidirectional, old DBs gain new tables on open):

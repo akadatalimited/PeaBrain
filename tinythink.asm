@@ -2876,6 +2876,12 @@ pg_write:
     pop rdi
     test rax, rax
     jnz pgw_err
+    cmp byte [rsi], 0x05
+    jne pg_wgo
+    call chk_interior           ; never commit a corrupt interior
+    test rax, rax
+    jnz pgw_err
+pg_wgo:
     mov r10, rbx
     dec r10
     shl r10, 12
@@ -2895,6 +2901,76 @@ pgw_ok:
     xor eax, eax
     ret
 pgw_err:
+    pop rbx
+    mov eax, 1
+    ret
+
+; chk_interior(rsi=page): rax 0 ok / 1 bad. Validates every divider child
+; (1..dbpages+2) and key encoding. Guards every interior commit.
+; Preserves rbx,rbp,r12-r15,rsi,rdi.
+chk_interior:
+    push rbx
+    push r12
+    push r13
+    push r14
+    push rsi
+    mov rbx, rsi
+    lea rsi, [rbx + 3]
+    call be16_ld
+    cmp rax, 1022
+    ja ci_bad
+    mov r12, rax
+    xor r13d, r13d
+    mov r14, [dbpages]
+    add r14, 2
+ci_cell:
+    cmp r13, r12
+    jae ci_right
+    lea rsi, [rbx + 12]
+    mov rax, r13
+    shl rax, 1
+    add rsi, rax
+    call be16_ld
+    cmp rax, 4092
+    ja ci_bad
+    lea rsi, [rbx]
+    add rsi, rax
+    mov eax, [rsi]                  ; child BE32 pre-check bytes present
+    lea rdx, [rbx + 4096]
+    sub rdx, rsi
+    cmp rdx, 5
+    jb ci_bad
+    call be32_ld
+    test rax, rax
+    jz ci_bad
+    cmp rax, r14
+    ja ci_bad
+    add rsi, 4
+    lea rdx, [rbx + 4096]
+    call varint_get
+    test rcx, rcx
+    jz ci_bad
+    inc r13
+    jmp ci_cell
+ci_right:
+    lea rsi, [rbx + 8]
+    call be32_ld
+    test rax, rax
+    jz ci_bad
+    cmp rax, r14
+    ja ci_bad
+    pop rsi
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    xor eax, eax
+    ret
+ci_bad:
+    pop rsi
+    pop r14
+    pop r13
+    pop r12
     pop rbx
     mov eax, 1
     ret
@@ -3932,74 +4008,123 @@ ht_err:
 walk_leaves:
     push rbx
     push r12
+    push r13
     mov [wroot], rdi
     mov qword [childn], 0
-    lea rsi, [pagebuf]
-    call pg_read
+    xor ecx, ecx                  ; depth 0
+    call wl_descend
     test rax, rax
-    jnz wl_err
-    cmp byte [pagebuf], 0x0D
-    je wl_single
-    cmp byte [pagebuf], 0x05
-    jne wl_err
-    lea rsi, [pagebuf + 3]
+    jnz wl_toperr
+    pop r13
+    pop r12
+    pop rbx
+    xor eax, eax
+    ret
+wl_toperr:
+    pop r13
+    pop r12
+    pop rbx
+    mov eax, 1
+    ret
+; wl_descend(rdi=pgno, rcx=depth): append subtree leaves to childtab.
+; Level buffers: 0 pagebuf, 1 leafbuf, 2 ipage (depth 3 covers ~1e9 leaves).
+wl_descend:
+    cmp rcx, 3
+    jae wl_derr2
+    push rbx
+    push r12
+    push r13
+    push r14
+    mov r14, rdi                ; pg
+    mov r13, rcx                ; depth
+    lea rsi, [pagebuf]
+    cmp rcx, 0
+    je wl_dbuf
+    lea rsi, [leafbuf]
+    cmp rcx, 1
+    je wl_dbuf
+    lea rsi, [ipage]
+wl_dbuf:
+    mov rdi, r14
+    call pg_read_nc             ; probe ok; walks must not evict hot set
+    test rax, rax
+    jnz wl_derr
+    cmp byte [rsi], 0x0D
+    je wl_dleaf
+    cmp byte [rsi], 0x05
+    jne wl_derr
+    mov rbx, rsi                ; level buffer base
+    lea rsi, [rbx + 3]
     call be16_ld
     cmp rax, 1022
-    ja wl_err
-    mov rbx, rax                ; ndiv
-    xor r12d, r12d              ; i
-wl_cell:
-    cmp r12, rbx
-    jae wl_right
-    lea rsi, [pagebuf + 12]
-    mov rax, r12
+    ja wl_derr
+    mov r12, rax                ; ndiv
+    xor r14d, r14d              ; i
+wl_dcell:
+    cmp r14, r12
+    jae wl_dright
+    lea rsi, [rbx + 12]
+    mov rax, r14
     shl rax, 1
     add rsi, rax
     call be16_ld                ; celloff
-    lea rsi, [pagebuf]
+    lea rsi, [rbx]
     add rsi, rax
     call be32_ld                ; left child
     cmp rax, 1
-    jb wl_err
+    jb wl_derr
     cmp rax, [dbpages]
-    ja wl_err                   ; beyond header size: torn write, fail closed
-    lea rsi, [childtab]
-    mov rcx, [childn]
-    shl rcx, 3
-    add rsi, rcx
-    mov [rsi], rax
-    inc qword [childn]
-    inc r12
-    jmp wl_cell
-wl_right:
-    lea rsi, [pagebuf + 8]
-    call be32_ld
+    ja wl_derr
+    mov rdi, rax
+    mov rcx, r13
+    inc rcx
+    call wl_descend              ; recurse (own level buffer)
+    test rax, rax
+    jnz wl_derr
+    inc r14
+    jmp wl_dcell
+wl_dright:
+    lea rsi, [rbx + 8]
+    call be32_ld                ; rightmost
     cmp rax, 1
-    jb wl_err
+    jb wl_derr
     cmp rax, [dbpages]
-    ja wl_err
-    lea rsi, [childtab]
-    mov rcx, [childn]
-    shl rcx, 3
-    add rsi, rcx
-    mov [rsi], rax
+    ja wl_derr
+    mov rdi, rax
+    mov rcx, r13
+    inc rcx
+    call wl_descend
+    test rax, rax
+    jnz wl_derr
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    xor eax, eax
+    ret
+wl_dleaf:
+    lea rdx, [childtab]
+    mov rax, [childn]
+    cmp rax, 65536
+    jae wl_derr
+    shl rax, 3
+    add rdx, rax
+    mov [rdx], r14
     inc qword [childn]
+    pop r14
+    pop r13
     pop r12
     pop rbx
     xor eax, eax
     ret
-wl_single:
-    lea rsi, [childtab]
-    mov rax, [wroot]
-    mov [rsi], rax
-    mov qword [childn], 1
+wl_derr:
+    pop r14
+    pop r13
     pop r12
     pop rbx
-    xor eax, eax
+    mov eax, 1
     ret
-wl_err:
-    pop r12
-    pop rbx
+wl_derr2:
     mov eax, 1
     ret
 
@@ -4076,9 +4201,19 @@ sm_err:
 
 ; rightmost_leaf(rdi=root): descend to rightmost leaf. [curpg]=pgno. rax 0/1.
 rightmost_leaf:
-    ; rdi = root, no pushes needed (no preserved regs used)
+    ; rdi = root, records descent pages in dstack[0..ddepth) for split
+    ; propagation. No pushes needed (no preserved regs used).
+    mov qword [ddepth], 0
 rl_loop:
     mov [curpg], rdi
+    mov rax, [ddepth]
+    cmp rax, 16
+    jae rl_err
+    lea rdx, [dstack]
+    shl rax, 3
+    add rdx, rax
+    mov [rdx], rdi
+    inc qword [ddepth]
     push rdi
     lea rsi, [pagebuf]
     call pg_read
@@ -4658,34 +4793,10 @@ sp_havek:
     mov rax, [curpg]
     cmp rax, [splitroot]
     je sp_rootcase
-    ; ---- case B: parent is the table root interior ----
-    mov rdi, [splitroot]
-    lea rsi, [ipage]
-    call pg_read
-    test rax, rax
-    jnz sp_err
-    ; divider size check first (no writes yet on full)
-    mov rax, [divkey]
-    lea rdi, [recscratch]
-    call varint_put             ; rcx = vlen
-    mov [vlen], rcx
-    lea rsi, [ipage + 3]
-    call be16_ld                ; n2
-    mov r14, rax
-    lea rsi, [ipage + 5]
-    call be16_ld                ; content2
-    sub rax, 12
-    mov rcx, r14
-    shl rcx, 1
-    sub rax, rcx                ; free2
-    mov rcx, [vlen]
-    add rcx, 6                  ; 4 child + vlen + 2 ptr
-    cmp rax, rcx
-    jb sp_full                  ; interior full: clean abort, nothing written
+    ; ---- general: split leaf P, propagate divider up the right edge ----
     mov rax, [dbpages]
     inc rax
-    mov [dbpages], rax          ; Qno
-    mov [qpg], rax
+    mov [qpg], rax                ; Q number (adopt after first write)
     ; trim P to k cells (image still intact for build_right below)
     mov rax, [splitk]
     lea rdi, [pagebuf + 3]
@@ -4698,61 +4809,35 @@ sp_havek:
     call pg_write
     test rax, rax
     jnz sp_err
+    mov rax, [qpg]
+    mov [dbpages], rax            ; adopt (jorig kept original size)
     mov rdi, [qpg]
     lea rsi, [leafbuf]
     call pg_write
     test rax, rax
     jnz sp_err
-    ; append divider (child=P, key) to interior, rightmost=Q
-    lea rsi, [ipage + 5]
-    call be16_ld                ; content2
-    mov rcx, [vlen]
-    add rcx, 4
-    sub rax, rcx                ; celloff
-    mov [wcontent], rax
-    lea rdi, [ipage]
-    add rdi, rax
-    mov rax, [curpg]
-    call be32_st
-    lea rdi, [ipage]
-    add rdi, [wcontent]
-    add rdi, 4
-    mov rax, [divkey]
-    call varint_put
-    lea rsi, [ipage + 12]     ; interior ptrs start at +12
-    mov rax, r14
-    shl rax, 1
-    add rsi, rax
-    mov rax, [wcontent]
-    mov rdi, rsi
-    call be16_st
-    lea rsi, [ipage + 3]
-    mov rax, r14
-    inc rax
-    mov rdi, rsi
-    call be16_st
-    lea rsi, [ipage + 5]
-    mov rax, [wcontent]
-    mov rdi, rsi
-    call be16_st
-    mov rax, [qpg]
-    lea rdi, [ipage + 8]
-    call be32_st
-    mov rdi, [splitroot]
-    lea rsi, [ipage]
-    call pg_write
+    ; propagate divider (C=P, K=divkey, Q=qpg) from parent level
+    mov rdi, [curpg]
+    mov rsi, [divkey]
+    mov rdx, [qpg]
+    mov rax, [ddepth]
+    sub rax, 2
+    js sp_err                     ; P==root handled above; never here
+    mov rcx, rax
+    call propagate
     test rax, rax
-    jnz sp_err
+    jnz sp_properr
     jmp sp_ok
+sp_properr:
+    cmp rax, 2
+    je sp_full
+    jmp sp_err
 sp_rootcase:
     ; ---- case A: P==root leaf -> reorg (root keeps its page number) ----
     mov rax, [dbpages]
     inc rax
-    mov [dbpages], rax          ; Lno
     mov [lpg], rax
-    mov rax, [dbpages]
     inc rax
-    mov [dbpages], rax          ; Qno
     mov [qpg], rax
     ; L = P trimmed to k (image intact for build_right below)
     mov rax, [splitk]
@@ -4766,6 +4851,8 @@ sp_rootcase:
     call pg_write
     test rax, rax
     jnz sp_err
+    mov rax, [qpg]
+    mov [dbpages], rax          ; adopt (jorig kept original size)
     mov rdi, [qpg]
     lea rsi, [leafbuf]
     call pg_write
@@ -4828,6 +4915,583 @@ sp_err:
     mov eax, 1
     ret
 sp_full:
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    mov eax, 2
+    ret
+
+; div_ok: rax 0 if divider sane (1 <= C=rbx <= dbpages+1, 1 <= K=r12 < 2^62).
+; Silent corruption becomes an explicit full. Preserves rbx,r12.
+div_ok:
+    mov rax, rbx
+    test rax, rax
+    jz div_bad
+    mov rcx, [dbpages]
+    inc rcx
+    cmp rax, rcx
+    ja div_bad
+    mov rax, r12
+    test rax, rax
+    jz div_bad
+    mov rcx, rax
+    shr rcx, 62
+    jnz div_bad
+    xor eax, eax
+    ret
+div_bad:
+    mov eax, 1
+    ret
+
+; enc_div(rdi=dst, eax=child, r8=key): append encoded divider cell.
+; rcx = total len. Clobbers rax,rcx,rdx,rdi.
+enc_div:
+    call be32_st
+    add rdi, 4
+    mov rax, r8
+    call varint_put
+    add rcx, 4
+    ret
+
+; ib_put(rsi=src, rdx=len): append divider cell to leafbuf image (ptr +12).
+ib_put:
+    mov rax, [wcontent]
+    sub rax, rdx
+    mov [wcontent], rax
+    lea rdi, [leafbuf]
+    add rdi, rax
+    mov rcx, rdx
+    rep movsb
+    lea rsi, [leafbuf + 12]
+    mov rax, [wn]
+    shl rax, 1
+    add rsi, rax
+    mov rax, [wcontent]
+    mov rdi, rsi
+    call be16_st
+    inc qword [wn]
+    ret
+
+; propagate(rdi=C, rsi=K, rdx=Q, rcx=level idx): insert divider into
+; dstack[idx], splitting upward as needed. Root splits reorganize in place
+; (root keeps its number: no master rewrite, f_root_* never move).
+; rax 0 ok / 1 io / 2 full. Preserves rbx,rbp,r12-r15.
+propagate:
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    mov rbx, rdi                ; C: left page of incoming divider
+    mov r12, rsi                ; K: incoming key
+    mov r13, rdx                ; Q: right page
+    mov r14, rcx                ; idx
+pr_loop:
+    lea rax, [dstack]
+    mov rdx, r14
+    shl rdx, 3
+    add rax, rdx
+    mov rdi, [rax]
+    mov [ppg], rdi
+    lea rsi, [ipage]
+    call pg_read
+    test rax, rax
+    jnz pr_err
+    cmp byte [ipage], 0x05
+    jne pr_err
+    mov rax, r12
+    lea rdi, [recscratch]
+    call varint_put
+    mov [vlen], rcx
+    lea rsi, [ipage + 3]
+    call be16_ld
+    cmp rax, 1022
+    ja pr_err
+    mov r15, rax                ; n
+    lea rsi, [ipage + 5]
+    call be16_ld
+    sub rax, 12
+    mov rcx, r15
+    shl rcx, 1
+    sub rax, rcx                ; free
+    mov rcx, [vlen]
+    add rcx, 6
+    cmp rax, rcx
+    jae pr_append
+    ; ---- split this interior (n>=2 required) ----
+    cmp r15, 2
+    jb pr_full
+    xor r10d, r10d              ; i
+    xor r11, r11                ; total
+pr_sz:
+    cmp r10, r15
+    jae pr_sized
+    lea rsi, [ipage + 12]
+    mov rax, r10
+    shl rax, 1
+    add rsi, rax
+    call be16_ld                ; coff
+    mov r8, rax
+    lea rax, [offstab]
+    mov rdx, r10
+    shl rdx, 3
+    add rax, rdx
+    mov [rax], r8
+    lea rsi, [ipage]
+    add rsi, r8
+    add rsi, 4
+    push rsi                  ; key pos (varint_get clobbers r8/r9)
+    lea rdx, [ipage + 4096]
+    call varint_get
+    pop rdx                   ; key pos (balance before branch)
+    test rcx, rcx
+    jz pr_err
+    mov rax, rcx
+    sub rax, rdx
+    add rax, 4                  ; celllen = keylen + 4
+    lea rdx, [sizetab]
+    mov rcx, r10
+    shl rcx, 3
+    add rdx, rcx
+    mov [rdx], rax
+    add r11, rax
+    inc r10
+    jmp pr_sz
+pr_sized:
+    mov rax, r11
+    shr rax, 1
+    mov [halfsz], rax
+    xor r10d, r10d
+    xor r11d, r11d
+pr_div:
+    cmp r10, r15
+    jae pr_divdone
+    lea rsi, [sizetab]
+    mov rax, r10
+    shl rax, 3
+    add rsi, rax
+    mov rcx, [rsi]
+    mov rax, r11
+    add rax, rcx
+    cmp rax, [halfsz]
+    ja pr_divdone
+    add r11, rcx
+    inc r10
+    jmp pr_div
+pr_divdone:
+    cmp r10, 0
+    jne pr_klo
+    mov r10d, 1
+pr_klo:
+    cmp r10, r15
+    jb pr_khi
+    mov r10, r15
+    dec r10
+pr_khi:
+    mov [splitk], r10
+    ; promoted key = key of cell[k]
+    lea rsi, [offstab]
+    mov rax, r10
+    shl rax, 3
+    add rsi, rax
+    lea rax, [ipage]
+    add rax, [rsi]
+    add rax, 4
+    mov rsi, rax
+    lea rdx, [ipage + 4096]
+    call varint_get
+    test rcx, rcx
+    jz pr_err
+    mov [divkey], rax
+    cmp r14, 0
+    je pr_rootreorg
+    ; ---- non-root: G keeps number w/ left k, G2 new w/ right + incoming ----
+    mov rax, [dbpages]
+    inc rax
+    mov [qpg], rax                ; G2 number (adopt after first write)
+    ; build G2 FIRST from pristine ipage (below). The G trim carves a
+    ; freeblock into the content area where right-part cells still live,
+    ; so trimming before the copy destroys bytes G2 must copy (the last
+    ; cell sits exactly at content-start). G2 build touches only leafbuf,
+    ; [wcontent]/[wn] and r8: r10(k), r15(n), rbx/r12/r13 survive it.
+    ; build G2 in leafbuf: header + cells[k+1..n) + incoming + rightmost=Q
+    mov byte [leafbuf], 0x05
+    xor eax, eax
+    lea rdi, [leafbuf + 1]
+    call be16_st
+    lea rdi, [leafbuf + 3]
+    call be16_st
+    mov rax, 4096
+    lea rdi, [leafbuf + 5]
+    call be16_st
+    mov byte [leafbuf + 7], 0
+    mov qword [wcontent], 4096
+    mov qword [wn], 0
+    mov r8, r10
+    inc r8
+pr_g2:
+    cmp r8, r15
+    jae pr_g2in
+    lea rsi, [offstab]
+    mov rax, r8
+    shl rax, 3
+    add rsi, rax
+    lea rax, [ipage]
+    add rax, [rsi]
+    mov rsi, rax
+    lea rax, [sizetab]
+    mov rdx, r8
+    shl rdx, 3
+    add rax, rdx
+    mov rdx, [rax]
+    call ib_put
+    inc r8
+    jmp pr_g2
+pr_g2in:
+    ; fit check for incoming divider in R2 half
+    mov rax, [wcontent]
+    sub rax, 12
+    mov rdx, [wn]
+    shl rdx, 1
+    sub rax, rdx
+    mov rdx, [vlen]
+    add rdx, 6
+    cmp rax, rdx
+    jb pr_full
+    mov rcx, [vlen]
+    add rcx, 4
+    sub [wcontent], rcx
+    call div_ok                   ; never commit a wild divider
+    test rax, rax
+    jnz pr_full
+    lea rdi, [leafbuf]
+    add rdi, [wcontent]
+    mov eax, ebx
+    mov r8, r12
+    call enc_div
+    lea rsi, [leafbuf + 12]
+    mov rax, [wn]
+    shl rax, 1
+    add rsi, rax
+    mov rax, [wcontent]
+    mov rdi, rsi
+    call be16_st
+    inc qword [wn]
+    mov rax, [wcontent]
+    lea rdi, [leafbuf + 5]
+    call be16_st
+    mov rax, [wn]
+    lea rdi, [leafbuf + 3]
+    call be16_st
+    mov rax, r13
+    lea rdi, [leafbuf + 8]
+    call be32_st
+    ; trim G (after G2 build above): reset freehead/frag (interiors stay
+    ; dense: SQLite rejects interior freeblocks), then header.
+    call reg_free_ip
+    mov rax, r10
+    lea rdi, [ipage + 3]
+    call be16_st
+    mov r11, 4096
+    xor r8d, r8d
+pr_min:
+    cmp r8, r10
+    jae pr_mindone
+    lea rsi, [offstab]
+    mov rax, r8
+    shl rax, 3
+    add rsi, rax
+    mov rax, [rsi]
+    cmp rax, r11
+    jae pr_minnext
+    mov r11, rax
+pr_minnext:
+    inc r8
+    jmp pr_min
+pr_mindone:
+    mov rax, r11
+    lea rdi, [ipage + 5]
+    call be16_st
+    lea rsi, [offstab]
+    mov rax, r10
+    shl rax, 3
+    add rsi, rax
+    lea rax, [ipage]
+    add rax, [rsi]
+    mov rsi, rax
+    call be32_ld
+    lea rdi, [ipage + 8]
+    call be32_st
+    mov rdi, [ppg]
+    lea rsi, [ipage]
+    call pg_write
+    test rax, rax
+    jnz pr_err
+    mov rdi, [qpg]
+    lea rsi, [leafbuf]
+    call pg_write
+    test rax, rax
+    jnz pr_err
+    mov rax, [qpg]
+    mov [dbpages], rax
+    mov rbx, [ppg]                ; C = G (kept number)
+    mov r12, [divkey]             ; K = promoted
+    mov r13, [qpg]                ; Q = G2
+    dec r14
+    jmp pr_loop
+pr_rootreorg:
+    ; root keeps its number: L new (left), G slim (1 divider), R2 new (right)
+    mov rax, [dbpages]
+    inc rax
+    mov [lpg], rax                ; L number
+    inc rax
+    mov [qpg], rax                ; R2 number (adopt after first write)
+    ; L build in leafbuf: header + cells[0..k) + rightmost=leftchild(d_k)
+    mov byte [leafbuf], 0x05
+    xor eax, eax
+    lea rdi, [leafbuf + 1]
+    call be16_st
+    lea rdi, [leafbuf + 3]
+    call be16_st
+    mov rax, 4096
+    lea rdi, [leafbuf + 5]
+    call be16_st
+    mov byte [leafbuf + 7], 0
+    mov qword [wcontent], 4096
+    mov qword [wn], 0
+    xor r8d, r8d
+pr_rl:
+    cmp r8, r10
+    jae pr_rldone
+    lea rsi, [offstab]
+    mov rax, r8
+    shl rax, 3
+    add rsi, rax
+    lea rax, [ipage]
+    add rax, [rsi]
+    mov rsi, rax
+    lea rax, [sizetab]
+    mov rdx, r8
+    shl rdx, 3
+    add rax, rdx
+    mov rdx, [rax]
+    call ib_put
+    inc r8
+    jmp pr_rl
+pr_rldone:
+    lea rsi, [offstab]
+    mov rax, r10
+    shl rax, 3
+    add rsi, rax
+    lea rax, [ipage]
+    add rax, [rsi]
+    mov rsi, rax
+    call be32_ld                  ; leftchild(d_k)
+    lea rdi, [leafbuf + 8]
+    call be32_st
+    mov rax, [wn]
+    lea rdi, [leafbuf + 3]
+    call be16_st
+    mov rax, [wcontent]
+    lea rdi, [leafbuf + 5]
+    call be16_st
+    mov rdi, [lpg]
+    lea rsi, [leafbuf]
+    call pg_write
+    test rax, rax
+    jnz pr_err
+    mov rax, [qpg]
+    mov [dbpages], rax            ; adopt (jorig kept original)
+    ; R2 build in leafbuf: header + cells[k+1..n) + incoming + rightmost=Q
+    mov byte [leafbuf], 0x05
+    xor eax, eax
+    lea rdi, [leafbuf + 1]
+    call be16_st
+    lea rdi, [leafbuf + 3]
+    call be16_st
+    mov rax, 4096
+    lea rdi, [leafbuf + 5]
+    call be16_st
+    mov byte [leafbuf + 7], 0
+    mov qword [wcontent], 4096
+    mov qword [wn], 0
+    mov r8, [splitk]              ; k reload: pg_write above clobbered r10
+    inc r8
+pr_rr:
+    cmp r8, r15
+    jae pr_rrin
+    lea rsi, [offstab]
+    mov rax, r8
+    shl rax, 3
+    add rsi, rax
+    lea rax, [ipage]
+    add rax, [rsi]
+    mov rsi, rax
+    lea rax, [sizetab]
+    mov rdx, r8
+    shl rdx, 3
+    add rax, rdx
+    mov rdx, [rax]
+    call ib_put
+    inc r8
+    jmp pr_rr
+pr_rrin:
+    mov rax, [wcontent]
+    sub rax, 12
+    mov rdx, [wn]
+    shl rdx, 1
+    sub rax, rdx
+    mov rdx, [vlen]
+    add rdx, 6
+    cmp rax, rdx
+    jb pr_full
+    mov rcx, [vlen]
+    add rcx, 4
+    sub [wcontent], rcx
+    call div_ok                   ; never commit a wild divider
+    test rax, rax
+    jnz pr_full
+    lea rdi, [leafbuf]
+    add rdi, [wcontent]
+    mov eax, ebx
+    mov r8, r12
+    call enc_div
+    lea rsi, [leafbuf + 12]
+    mov rax, [wn]
+    shl rax, 1
+    add rsi, rax
+    mov rax, [wcontent]
+    mov rdi, rsi
+    call be16_st
+    inc qword [wn]
+    mov rax, [wcontent]
+    lea rdi, [leafbuf + 5]
+    call be16_st
+    mov rax, [wn]
+    lea rdi, [leafbuf + 3]
+    call be16_st
+    mov rax, r13
+    lea rdi, [leafbuf + 8]
+    call be32_st
+    mov rdi, [qpg]
+    lea rsi, [leafbuf]
+    call pg_write                 ; R2 (missing this drowned the file by one)
+    test rax, rax
+    jnz pr_err
+    ; G slim in ipage: single divider (L, divkey) + rightmost=R2
+    mov byte [ipage], 0x05
+    xor eax, eax
+    lea rdi, [ipage + 1]
+    call be16_st
+    mov rax, 1
+    lea rdi, [ipage + 3]
+    call be16_st
+    mov byte [ipage + 7], 0
+    mov rax, [divkey]
+    lea rdi, [recscratch]
+    call varint_put
+    mov [vlen], rcx
+    mov rax, 4096
+    sub rax, 4
+    sub rax, rcx
+    mov [wcontent], rax           ; slim celloff (also content: single cell)
+    lea rdi, [ipage]
+    add rdi, rax
+    mov rbx, [lpg]
+    mov r12, [divkey]
+    call div_ok                   ; never commit a wild divider
+    test rax, rax
+    jnz pr_full
+    mov eax, dword [lpg]
+    call be32_st
+    lea rdi, [ipage]
+    add rdi, [wcontent]
+    add rdi, 4
+    mov rax, [divkey]
+    call varint_put
+    lea rsi, [ipage + 12]
+    mov rax, [wcontent]
+    mov rdi, rsi
+    call be16_st
+    mov rax, [wcontent]
+    lea rdi, [ipage + 5]
+    call be16_st
+    mov rax, [qpg]
+    lea rdi, [ipage + 8]
+    call be32_st
+    mov rdi, [ppg]
+    lea rsi, [ipage]
+    call pg_write
+    test rax, rax
+    jnz pr_err
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    xor eax, eax
+    ret
+pr_append:
+    lea rsi, [ipage + 5]
+    call be16_ld
+    mov rcx, [vlen]
+    add rcx, 4
+    sub rax, rcx
+    mov [wcontent], rax
+    lea rdi, [ipage]
+    add rdi, rax
+    call div_ok                   ; never commit a wild divider
+    test rax, rax
+    jnz pr_full
+    mov eax, ebx
+    call be32_st
+    lea rdi, [ipage]
+    add rdi, [wcontent]
+    add rdi, 4
+    mov rax, r12
+    call varint_put
+    lea rsi, [ipage + 12]
+    mov rax, r15
+    shl rax, 1
+    add rsi, rax
+    mov rax, [wcontent]
+    mov rdi, rsi
+    call be16_st
+    lea rsi, [ipage + 3]
+    mov rax, r15
+    inc rax
+    mov rdi, rsi
+    call be16_st
+    lea rsi, [ipage + 5]
+    mov rax, [wcontent]
+    mov rdi, rsi
+    call be16_st
+    mov rax, r13
+    lea rdi, [ipage + 8]
+    call be32_st
+    mov rdi, [ppg]
+    lea rsi, [ipage]
+    call pg_write
+    test rax, rax
+    jnz pr_err
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    xor eax, eax
+    ret
+pr_err:
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    mov eax, 1
+    ret
+pr_full:
     pop r15
     pop r14
     pop r13
@@ -4949,6 +5613,22 @@ rf_haved:
 rf_done:
     pop r12
     pop rbx
+    ret
+
+; reg_free_ip: interior trims stay DENSE. Proven by transplant test on a
+; real SQLite DB (3.54.0): any freeblock on an interior page, however
+; well-formed, fails `pragma integrity_check` with "free space corruption"
+; (real SQLite never emits interior freeblocks; its balancer rebuilds
+; dense). So unlike the leaf carve (reg_free), we register NO block here:
+; just reset freehead=0, fragments=0. The freed gap stays unlisted, which
+; SQLite accepts (V1 probe). Must run BEFORE the header trim writes ndiv.
+; Preserves everything except rax/rcx/rdi.
+reg_free_ip:
+    xor eax, eax
+    lea rdi, [ipage + 1]
+    call be16_st                ; freehead = 0
+    lea rdi, [ipage + 7]
+    mov [rdi], al               ; fragments = 0
     ret
 
 ; dec_int(serial in rax, value ptr in rsi): rax=value.
@@ -7965,6 +8645,16 @@ op_delete:
     je om_dbclose
     lea rsi, [rsnbuf]
     mov rdx, [rsnlen]
+    mov [mkey], rsi
+    mov [mkeylen], rdx
+    mov rdi, [f_root_facts]
+    call scan_key_latest          ; must have a version to bury
+    cmp rax, 2
+    je om_dbclose
+    cmp rax, 1
+    jne od_nothing
+    lea rsi, [rsnbuf]
+    mov rdx, [rsnlen]
     call tomb_insert
     test rax, rax
     jnz om_dbclose
@@ -7986,6 +8676,11 @@ op_delete:
     mov al, '}'
     call out_byte
     jmp oc_envelope
+od_nothing:
+    call db_close
+    lea rdi, [c_params]
+    lea rsi, [m_nofile]
+    jmp err_id
 od_dup:
     call db_close
     lea rax, [jsontmp]
@@ -10708,9 +11403,12 @@ rsnbuf rb 64
 thbuf rb 512
 ccbuf rb 512
 dbstat rb 144
-sizetab rb 4096
-offstab rb 4096
-childtab rb 8192
+sizetab rb 8192
+offstab rb 8192
+childtab rb 524288
+dstack rb 128
+ddepth dq 0
+ppg dq 0
 sob rb 128
 ktab rb 768
 stab rb 48
