@@ -92,6 +92,30 @@ Value cap: no single TEXT value over 1024 bytes (fact bodies included).
 Max cell ~1.2KB < page/3, so both split halves always fit; oversize
 cells are refused ("too large"), never written.
 
+Security posture (see TT-01..TT-05 review cycle):
+- TT-01 file privacy: the database is created 0600 and any existing
+  database is fchmod'd to 0600 and ownership-checked (must be ours)
+  on every open; violators fail the whole operation closed.
+- TT-02 argument integrity: JSON keys resolve by structural scope
+  (top-level vs immediate-object, string/escape/brace aware), and any
+  duplicate key within one object rejects the whole request. Nested
+  decoys and key-like string contents can no longer override arguments.
+  The parser is still intentionally narrow (documented key order,
+  bounded sizes) and must not face untrusted clients directly.
+- TT-03 crash consistency: header (size/counter/taskseq) is written
+  last, page counts come from the header (never beyond the file), and
+  tree walks refuse out-of-range pages. A killed process leaves the
+  last consistent view (verified by repeated SIGKILL + integrity_check).
+  Power-loss torn pages would still need a real journal (deferred).
+- TT-04 hardening: ET_DYN (PIE, ASLR slides verified) + PT_GNU_STACK
+  with no exec permission + separated R E / RW segments. No W+X.
+- TT-05 conformance: every tools/call result uses the MCP content
+  envelope (verified per tool).
+
+Value cap: no single TEXT value over 1024 bytes (fact bodies included).
+Max cell ~1.2KB < page/3, so both split halves always fit; oversize
+cells are refused ("too large"), never written.
+
 x86-64-v3 use (explicit 32B lanes, unaligned ops, scalar tails,
 vzeroupper hygiene; VEC_ZERO128 macro): 4K page zeroing, ascii
 validation bulk lanes, JSON-escape clean-block copies, substring

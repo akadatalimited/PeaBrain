@@ -37,7 +37,7 @@
 ; first-byte filters. Build the scalar A/B reference with:
 ;   fasm -dUSE_SCALAR=1 tinythink.asm tinythink-scalar
 
-format ELF64 executable 3
+format ELF64 dynamic 3
 entry start
 
 ; ---- x86-64-v3 macro discipline ----
@@ -398,70 +398,440 @@ emit:
 
 ; ---------------- parsers ----------------
 ; find_val(rsi=start, rdi=key, rcx=keylen): rax=ptr after colon+ws, 0=no.
-find_val:
+; reject_dups: structural walk of [lp]..[le]. Records (openoff,keyptr,keylen)
+; for every "key": pattern (string-aware, escape-aware). Same (object,key)
+; twice, or structural malformation, is rejected.
+; rax 0 clean / 1 duplicate key / 2 malformed. Preserves rbx,rbp,r12-r15.
+reject_dups:
     push rbx
     push r12
     push r13
-    mov r12, rsi
-    mov r13, rdi
-    mov r10, rcx
-fv_scan:
-    mov rax, [le]
-    sub rax, r12
-    cmp rax, r10
-    jb fv_no
-    mov r8, r12
-    mov r9, r13
-    mov rax, r10
-fv_cmp:
-    test rax, rax
-    jz fv_hit
-    mov cl, [r8]
-    mov dl, [r9]
-    cmp cl, dl
-    jne fv_next
-    inc r8
-    inc r9
-    dec rax
-    jmp fv_cmp
-fv_hit:
-    mov r12, r8
-fv_colon:
-    cmp r12, [le]
-    jae fv_no
-    cmp byte [r12], ':'
-    je fv_ws0
-    inc r12
-    jmp fv_colon
-fv_ws0:
-    inc r12
-fv_ws:
-    cmp r12, [le]
-    jae fv_no
+    push r14
+    push r15
+    mov r12, [lp]                 ; cur
+    mov rbx, [le]                 ; end
+    xor r15d, r15d                ; depth
+    xor r14d, r14d                ; key count
+rd_loop:
+    cmp r12, rbx
+    jae rd_end
     mov al, [r12]
-    cmp al, ' '
-    je fv_wsn
-    cmp al, 9
-    je fv_wsn
-    cmp al, 13
-    je fv_wsn
-    cmp al, 10
-    je fv_wsn
-    mov rax, r12
+    cmp al, '{'
+    je rd_open
+    cmp al, '['
+    je rd_open
+    cmp al, '}'
+    je rd_close
+    cmp al, ']'
+    je rd_close
+    cmp al, '"'
+    je rd_str
+    inc r12
+    jmp rd_loop
+rd_open:
+    cmp r15, 16
+    jae rd_malformed
+    lea rax, [sob]
+    mov rcx, r15
+    shl rcx, 3
+    add rax, rcx
+    mov [rax], r12                ; sob[depth] = brace offset
+    inc r15
+    inc r12
+    jmp rd_loop
+rd_close:
+    test r15, r15
+    jz rd_malformed
+    dec r15
+    inc r12
+    jmp rd_loop
+rd_str:
+    mov rsi, r12
+    inc rsi
+rd_sq:
+    cmp rsi, rbx
+    jae rd_malformed              ; unterminated string
+    mov al, [rsi]
+    cmp al, '\'
+    je rd_sesc
+    cmp al, '"'
+    je rd_send
+    inc rsi
+    jmp rd_sq
+rd_sesc:
+    inc rsi
+    cmp rsi, rbx
+    jae rd_malformed
+    inc rsi
+    jmp rd_sq
+rd_send:
+    ; key iff depth>=1 and optional ws + ':' follows
+    test r15, r15
+    jz rd_after
+    mov rax, rsi
+    inc rax
+rd_sw:
+    cmp rax, rbx
+    jae rd_after
+    mov cl, [rax]
+    cmp cl, ' '
+    je rd_swa
+    cmp cl, 9
+    je rd_swa
+    cmp cl, 13
+    je rd_swa
+    cmp cl, 10
+    je rd_swa
+    cmp cl, ':'
+    jne rd_after
+    ; record (sob[depth-1], keyptr=r12+1, keylen=rsi-r12-1)
+    cmp r14, 32
+    jae rd_malformed
+    lea rax, [sob]
+    mov rcx, r15
+    dec rcx
+    shl rcx, 3
+    add rax, rcx
+    mov rcx, [rax]                ; openoff
+    lea rax, [ktab]
+    mov rdx, r14
+    imul rdx, rdx, 24
+    add rax, rdx
+    mov [rax], rcx                ; +0 openoff
+    lea rcx, [r12 + 1]
+    mov [rax + 8], rcx            ; +8 keyptr
+    mov rcx, rsi
+    sub rcx, r12
+    dec rcx                       ; keylen
+    mov [rax + 16], rcx           ; +16 keylen
+    ; pairwise dup check vs previous entries (r10=openoff, r11=keylen)
+    mov r10, [rax]
+    mov r11, [rax + 16]
+    xor ecx, ecx
+rd_dup:
+    cmp rcx, r14
+    jae rd_dupdone
+    lea rax, [ktab]
+    mov rdx, rcx
+    imul rdx, rdx, 24
+    add rax, rdx
+    mov rdx, [rax]
+    cmp rdx, r10
+    jne rd_dupnext
+    mov rdx, [rax + 16]
+    cmp rdx, r11
+    jne rd_dupnext
+    push rcx
+    push rsi
+    push rdi
+    mov rsi, [rax + 8]
+    lea rdi, [r12 + 1]
+    mov rcx, r11
+    rep cmpsb
+    pop rdi
+    pop rsi
+    pop rcx
+    je rd_dupfound
+rd_dupnext:
+    inc rcx
+    jmp rd_dup
+rd_dupdone:
+    inc r14
+    jmp rd_after
+rd_dupfound:
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    mov eax, 1
+    ret
+rd_swa:
+    inc rax
+    jmp rd_sw
+rd_after:
+    mov r12, rsi
+    inc r12
+    jmp rd_loop
+rd_end:
+    test r15, r15                 ; balanced?
+    jnz rd_malformed
+    xor eax, eax
+    pop r15
+    pop r14
     pop r13
     pop r12
     pop rbx
     ret
-fv_wsn:
-    inc r12
-    jmp fv_ws
-fv_next:
-    inc r12
-    jmp fv_scan
-fv_no:
-    xor eax, eax
+rd_malformed:
+    pop r15
+    pop r14
     pop r13
     pop r12
+    pop rbx
+    mov eax, 2
+    ret
+
+; find_val(rsi=start, rdi=key, rcx=keylen): rax = value ptr after colon+ws,
+; 0 = none. Keys include both quotes (e.g. '"thought"').
+; Scope contract (TT-02): start==[lp] matches top-level keys only (depth 1);
+; otherwise start must be '{' and only its immediate children match.
+; Brace depth plus string/escape tracking: nested decoys and key-like text
+; inside strings never match. Same-object duplicates are rejected up front
+; by reject_dups, so first-in-scope is the only in-scope match.
+find_val:
+    push rbx
+    push r10
+    push r12
+    push r13
+    push r14
+    push r15
+    cmp rsi, [lp]
+    je fv_top
+    ; scoped object scan
+    mov r10, [le]
+    cmp rsi, r10
+    jae fv_no
+    cmp byte [rsi], '{'
+    jne fv_no
+    mov r12, rsi
+    inc r12                       ; enter object
+    mov r13, rdi                  ; key
+    mov r14, rcx                  ; keylen
+    mov rbx, 1                    ; reldepth: 1 = immediate children
+    jmp fv_sloop
+fv_sloop:
+    cmp r12, r10
+    jae fv_no
+    mov al, [r12]
+    cmp al, '{'
+    je fv_sopen
+    cmp al, '['
+    je fv_sopen
+    cmp al, '}'
+    je fv_sclose
+    cmp al, ']'
+    je fv_sclose
+    cmp al, '"'
+    je fv_sstr
+    inc r12
+    jmp fv_sloop
+fv_sopen:
+    inc rbx
+    inc r12
+    jmp fv_sloop
+fv_sclose:
+    dec rbx
+    jz fv_no                      ; back to 0: end of our object
+    inc r12
+    jmp fv_sloop
+fv_sstr:
+    ; string end -> r9 (escape-aware)
+    mov r9, r12
+    inc r9
+fv_sq:
+    cmp r9, r10
+    jae fv_no
+    mov al, [r9]
+    cmp al, '\'
+    je fv_sesc
+    cmp al, '"'
+    je fv_send
+    inc r9
+    jmp fv_sq
+fv_sesc:
+    inc r9
+    cmp r9, r10
+    jae fv_no
+    inc r9
+    jmp fv_sq
+fv_send:
+    cmp rbx, 1
+    jne fv_safter
+    ; candidate: full key compare + closing quote is part of key
+    mov rax, r10
+    sub rax, r12
+    cmp rax, r14
+    jb fv_no
+    mov r8, r12
+    push r13
+    mov rdi, r13
+    mov rsi, r8
+    mov rcx, r14
+    rep cmpsb
+    pop r13
+    jne fv_safter2
+    ; after key: optional ws, then ':'
+    mov r8, r12
+    add r8, r14
+fv_sws:
+    cmp r8, r10
+    jae fv_no
+    mov al, [r8]
+    cmp al, ' '
+    je fv_swsn
+    cmp al, 9
+    je fv_swsn
+    cmp al, 13
+    je fv_swsn
+    cmp al, 10
+    je fv_swsn
+    cmp al, ':'
+    jne fv_safter
+    inc r8
+fv_sws2:
+    cmp r8, r10
+    jae fv_no
+    mov al, [r8]
+    cmp al, ' '
+    je fv_sws2n
+    cmp al, 9
+    je fv_sws2n
+    cmp al, 13
+    je fv_sws2n
+    cmp al, 10
+    je fv_sws2n
+    mov rax, r8
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop r10
+    pop rbx
+    ret
+fv_swsn:
+    inc r8
+    jmp fv_sws
+fv_sws2n:
+    inc r8
+    jmp fv_sws2
+fv_safter2:
+fv_safter:
+    mov r12, r9
+    inc r12
+    jmp fv_sloop
+fv_top:
+    ; top-level scan from line start, depth from 0, match at depth 1
+    mov r10, [le]
+    mov r12, rsi
+    mov r13, rdi
+    mov r14, rcx
+    xor ebx, ebx
+fv_tloop:
+    cmp r12, r10
+    jae fv_no
+    mov al, [r12]
+    cmp al, '{'
+    je fv_topen
+    cmp al, '['
+    je fv_topen
+    cmp al, '}'
+    je fv_tclose
+    cmp al, ']'
+    je fv_tclose
+    cmp al, '"'
+    je fv_tstr
+    inc r12
+    jmp fv_tloop
+fv_topen:
+    inc rbx
+    inc r12
+    jmp fv_tloop
+fv_tclose:
+    test rbx, rbx
+    jz fv_tnextc
+    dec rbx
+fv_tnextc:
+    inc r12
+    jmp fv_tloop
+fv_tstr:
+    mov r9, r12
+    inc r9
+fv_tsq:
+    cmp r9, r10
+    jae fv_no
+    mov al, [r9]
+    cmp al, '\'
+    je fv_tsesc
+    cmp al, '"'
+    je fv_tsend
+    inc r9
+    jmp fv_tsq
+fv_tsesc:
+    inc r9
+    cmp r9, r10
+    jae fv_no
+    inc r9
+    jmp fv_tsq
+fv_tsend:
+    cmp rbx, 1
+    jne fv_tafter
+    mov rax, r10
+    sub rax, r12
+    cmp rax, r14
+    jb fv_no
+    mov r8, r12
+    push r13
+    mov rdi, r13
+    mov rsi, r8
+    mov rcx, r14
+    rep cmpsb
+    pop r13
+    jne fv_tafter
+    mov r8, r12
+    add r8, r14
+fv_tws:
+    cmp r8, r10
+    jae fv_no
+    mov al, [r8]
+    cmp al, ' '
+    je fv_twsn
+    cmp al, 9
+    je fv_twsn
+    cmp al, 13
+    je fv_twsn
+    cmp al, 10
+    je fv_twsn
+    cmp al, ':'
+    jne fv_tafter
+    inc r8
+fv_tws2:
+    cmp r8, r10
+    jae fv_no
+    mov al, [r8]
+    cmp al, ' '
+    je fv_tws2n
+    cmp al, 9
+    je fv_tws2n
+    cmp al, 13
+    je fv_tws2n
+    cmp al, 10
+    je fv_tws2n
+    mov rax, r8
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop r10
+    pop rbx
+    ret
+fv_twsn:
+    inc r8
+    jmp fv_tws
+fv_tws2n:
+    inc r8
+    jmp fv_tws2
+fv_tafter:
+    mov r12, r9
+    inc r12
+    jmp fv_tloop
+fv_no:
+    xor eax, eax
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop r10
     pop rbx
     ret
 
@@ -865,6 +1235,11 @@ hl_ns:
     mov [ll], rdx
     add rsi, rdx
     mov [le], rsi
+    call reject_dups               ; TT-02: duplicate keys / malformed
+    cmp eax, 1
+    je hl_dup
+    test eax, eax
+    jnz hl_parse
     mov rsi, [lp]
     lea rdi, [k_method]
     mov ecx, 8
@@ -1016,6 +1391,11 @@ hl_badid:
 hl_parse:
     lea rdi, [c_parse]
     lea rsi, [m_parse]
+    call err_null
+    jmp hl_ret
+hl_dup:
+    lea rdi, [c_params]
+    lea rsi, [m_dup]
     call err_null
 hl_ret:
     pop r15
@@ -1846,10 +2226,11 @@ db_open:
     cmp rax, 0
     jle do_cwd
     mov rcx, rax
+    lea r10, [exebuf]             ; base in reg: PIE-safe (no label+index)
 do_sl:
     dec rcx
     js do_cwd
-    cmp byte [exebuf + rcx], '/'
+    cmp byte [r10 + rcx], '/'
     jne do_sl
     inc rcx
     cmp rcx, 1024
@@ -1875,11 +2256,17 @@ do_open:
     mov eax, 2
     lea rdi, [dbpath]
     mov esi, 66                 ; O_RDWR|O_CREAT
-    mov edx, 420
+    mov edx, 384                ; 0600: private store (TT-01)
     syscall
     test rax, rax
     js do_err
     mov [dbfd], rax
+    mov eax, 91                 ; fchmod(fd, 0600): existing files too
+    mov rdi, [dbfd]
+    mov esi, 384
+    syscall
+    test rax, rax
+    js do_closeerr
     mov eax, 73                 ; flock LOCK_EX
     mov rdi, [dbfd]
     mov esi, 2
@@ -1892,6 +2279,16 @@ do_open:
     syscall
     test rax, rax
     js do_closeerr
+    mov eax, dword [dbstat + 24]
+    and eax, 0xFFF              ; permission bits must be exactly 0600
+    cmp eax, 384
+    jne do_closeerr
+    mov eax, 102                ; getuid; file must be ours
+    syscall
+    mov ecx, eax
+    mov eax, dword [dbstat + 28]
+    cmp eax, ecx
+    jne do_closeerr
     mov rax, qword [dbstat + 48]
     test rax, rax
     jz do_create
@@ -1910,6 +2307,18 @@ do_open:
     call magic_ok
     test rax, rax
     jnz do_closeerr
+    ; page count from the HEADER (never beyond the file): a crash between
+    ; data writes and the header update leaves a consistent old view.
+    lea rsi, [pagebuf + 28]
+    call be32_ld
+    cmp rax, 2
+    jb do_closeerr
+    mov r8, rax
+    mov rax, qword [dbstat + 48]
+    shr rax, 12                   ; file pages (multiple-of-4096 checked)
+    cmp r8, rax
+    ja do_closeerr                ; header beyond file: corrupt
+    mov [dbpages], r8
     lea rsi, [pagebuf + 60]       ; taskseq lives in header user-version
     call be32_ld
     mov [taskseq], rax
@@ -2228,6 +2637,10 @@ wl_cell:
     lea rsi, [pagebuf]
     add rsi, rax
     call be32_ld                ; left child
+    cmp rax, 1
+    jb wl_err
+    cmp rax, [dbpages]
+    ja wl_err                   ; beyond header size: torn write, fail closed
     lea rsi, [childtab]
     mov rcx, [childn]
     shl rcx, 3
@@ -2239,6 +2652,10 @@ wl_cell:
 wl_right:
     lea rsi, [pagebuf + 8]
     call be32_ld
+    cmp rax, 1
+    jb wl_err
+    cmp rax, [dbpages]
+    ja wl_err
     lea rsi, [childtab]
     mov rcx, [childn]
     shl rcx, 3
@@ -7273,6 +7690,8 @@ ot_inner_end:
     call out_byte
     jmp emit
 
+segment gnustack
+
 segment readable writeable
 
 jnull db 'null', 0
@@ -7393,6 +7812,7 @@ m_params db 'bad params', 0
 m_notool db 'unknown tool', 0
 m_unknown db 'unknown thought', 0
 m_badname db 'bad name', 0
+m_dup db 'duplicate key', 0
 m_exists db 'already recorded', 0
 m_nodb db 'db error', 0
 m_dbfull db 'db full', 0
@@ -7685,6 +8105,8 @@ dbstat rb 144
 sizetab rb 4096
 offstab rb 4096
 childtab rb 8192
+sob rb 128
+ktab rb 768
 stab rb 48
 gfo rb 48
 gfl rb 48
