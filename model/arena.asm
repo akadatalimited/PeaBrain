@@ -420,7 +420,7 @@ close_fd:
     ret
 
 ; ---- model_save: rsi=target path (NUL-term) -> rax=0 ok, -1 fail ----
-; tmp sibling = target + ".tmp.<pid>". two CRC passes, fsync, rename, dirsync.
+; tmp sibling = target + ".tmp.<pid>". two hash passes, fsync, rename, dirsync.
 model_save:
     push rbx
     push r12
@@ -469,7 +469,7 @@ model_save:
     jmp .pcp
 .pcpdone:
     mov byte [rbx], 0
-    ; PASS 1: per-region data CRCs -> crcbuf, then payload CRC
+    ; PASS 1: per-region data hashes -> crcbuf, then payload hash
     xor r12d, r12d
     mov r13, [nreg]
     test r13, r13

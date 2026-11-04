@@ -17,12 +17,12 @@ FNV64, rsv} + count*32B table {tag,aren_off,size,data_crc FNV64} + payload
 (regions concatenated in table order). Validate: magic/ver/arch, count<=64,
 file_size == 64+count*32+payload_bytes, table_crc, per-region data_crc,
 payload_crc — in that order, before touching live regions.
-SAVE: tmp sibling (O_CREAT|O_EXCL), two passes (CRC then write), looped
+SAVE: tmp sibling (O_CREAT|O_EXCL), two passes (hash then write), looped
 writes, fsync file, renameat over target, fsync dir. Any failure unlinks tmp;
 a valid checkpoint is never replaced by a partial one.
 LOAD: fstat size check, stream regions into staging allocs from a saved mark,
-verify each CRC; any failure rolls back to the mark — current model survives.
-Reject: bad magic/version/arch/count, short file, CRC mismatch, alloc fail.
+verify each hash; any failure rolls back to the mark — current model survives.
+Reject: bad magic/version/arch/count, short file, hash mismatch, alloc fail.
 
 ENGINE (Stage 2): row-major FP32. AVX2/FMA primary (vbroadcastss + vfmadd231ps
 outer-product micro-kernel, 8-wide), scalar reference kernel, agreement test
