@@ -1623,6 +1623,18 @@ do_call:
     call cmp_name
     test rax, rax
     jnz op_health
+    lea rsi, [toolbuf]
+    mov rdx, [toollen]
+    lea rdi, [t_feedback]
+    call cmp_name
+    test rax, rax
+    jnz op_feedback
+    lea rsi, [toolbuf]
+    mov rdx, [toollen]
+    lea rdi, [t_explain]
+    call cmp_name
+    test rax, rax
+    jnz op_explain
     lea rdi, [c_params]
     lea rsi, [m_notool]
     jmp err_id
@@ -1652,7 +1664,7 @@ op_conclusion:
     jz dc_params
     mov rsi, rax
     lea rdi, [rsnbuf]
-    mov ecx, 64
+    mov ecx, 128
     call parse_str
     test rax, rax
     jz dc_params
@@ -1926,10 +1938,13 @@ oc_envelope:
     jmp emit
 
 ; valid_name(rsi, rdx=len): rax=0 ok, 1 bad. 1..64 [A-Za-z0-9._-], not ./...
+; valid_name(rsi, rdx=len): rax=0 ok / 1 bad.
+; Machine identifiers: [A-Za-z0-9._@:+#~-]{1,128} (hyphen last).
+; Rejects single "." and "..". No spaces, no slashes, no JSON syntax.
 valid_name:
     cmp rdx, 1
     jb vn_bad
-    cmp rdx, 64
+    cmp rdx, 128
     ja vn_bad
     cmp rdx, 1
     jne vn_n1
@@ -1949,7 +1964,7 @@ vn_loop:
     inc rsi
     dec rdx
     cmp al, 'A'
-    jb vn_sym
+    jb vn_lo
     cmp al, 'Z'
     jbe vn_loop
     cmp al, '_'
@@ -1958,19 +1973,27 @@ vn_loop:
     jb vn_bad
     cmp al, 'z'
     jbe vn_loop
+    cmp al, '~'
+    je vn_loop
     jmp vn_bad
-vn_sym:
+vn_lo:
     cmp al, '0'
-    jb vn_sym2
+    jb vn_sym
     cmp al, '9'
     jbe vn_loop
-    jmp vn_bad
-vn_sym2:
-    cmp al, '.'
+    cmp al, ':'
     je vn_loop
-    cmp al, '_'
+    cmp al, '@'
+    je vn_loop
+    jmp vn_bad
+vn_sym:
+    cmp al, '#'
+    je vn_loop
+    cmp al, '+'
     je vn_loop
     cmp al, '-'
+    je vn_loop
+    cmp al, '.'
     je vn_loop
     jmp vn_bad
 vn_ok:
@@ -2327,206 +2350,818 @@ cache_flush:
     pop rax
     ret
 
-; Usage table: 8192 slots of (key, hits, flushed). key = rowid | kind<<56.
-; Saturating hits, min-evict on full. Powers usage-ranked search.
-; Both preserve rbx,rbp,r12-r15; clobber rax,rcx,rdx,rsi,rdi,r8-r11.
-use_bump:
-    push rbx
-    push rcx
+; ---- Learnable usage ranking: 262144 slots, 88-bit stable identity ----
+; USLOT_BITS is the single growth point: to grow again, change it (and the
+; utab reservation). Nothing else encodes capacity.
+USLOT_BITS = 18
+USLOTS = 262144
+USLOT_MASK = 262143
+USLOT_SZ = 32
+UPROBE_N = 16
+; Slot (32B): +0 key u64 (kind<<56 | id56) | +8 h2 u32 (second hash) |
+; +12 access u32 sat | +16 pos u32 sat | +20 neg u32 sat | +24 last u32
+; tick | +28 conf u16 | +30 dirty u8 | +31 zero u8.
+; Identity: facts/entities/tasks hash a stable NAME (FNV-1a-64, low 56
+; bits); observations (immutable rows) use their rowid. A hot hit needs
+; key AND h2 (88 bits); the usage table keeps the original names and the
+; loader string-distinguishes collisions instead of merging.
+; Score u64 (overflow-impossible: clamped inputs, floored at zero):
+;   net_ok ? min(access,ACAP)*WA : 0
+;   + min(pos,PCAP)*WP + min(conf,CCAP)*WC
+;   + max(0,RWIN-(now-last))*WR - min(neg*WN,NSUB)
+; net_ok = (pos >= neg): a memory judged net-misleading gets NO credit
+; for being read. Popularity never asserts truth: the score ranks
+; retrieval only, and conf counts corroboration (repeat versions).
+U_WA = 1
+U_WP = 8
+U_WN = 8
+U_WR = 1
+U_WC = 2
+U_ACAP = 16777216
+U_PCAP = 16777216
+U_CCAP = 65535
+U_RWIN = 1024
+U_NSUB = 4294967296
+UQ_N = 8192
+UQ_MASK = 8191
+UQ_ENT_SZ = 136
+; Pending-name queue: hot slots hold hashes, but flush must persist NAMES.
+; Entries (slot u32 | kind u8 | len u8 | pad | name[64]) record
+; (slot,name) at slot-create; flush drains the ring. Overflow drops the oldest, clears
+; its dirty bit, and counts udropped: bounded, documented loss only under
+; adversarial read-only floods with no flush between.
+;
+; fnv1a64(rsi=ptr, rdx=len): rax = hash. Clobbers rax,rcx,rsi,rdx.
+fnv1a64:
+    mov rax, 14695981039346656037
+    test rdx, rdx
+    jz fh_done
+fh_loop:
+    movzx ecx, byte [rsi]
+    xor rax, rcx
+    mov rcx, 1099511628211
+    imul rax, rcx
+    inc rsi
+    dec rdx
+    jnz fh_loop
+fh_done:
+    ret
+; fnv1a32s(rsi=ptr, rdx=len): eax = 32-bit hash via the FNV-1 (multiply
+; first) variant: a genuinely different stream from fnv1a64, used as h2.
+; Clobbers eax,ecx,rsi,rdx.
+fnv1a32s:
+    mov eax, 2166136261
+    test rdx, rdx
+    jz fh32_done
+fh32_loop:
+    movzx ecx, byte [rsi]
+    imul eax, eax, 16777619
+    xor eax, ecx
+    inc rsi
+    dec rdx
+    jnz fh32_loop
+fh32_done:
+    ret
+; ukey_name(rdi=kind, rsi=ptr, rdx=len): rbx=key, r8d=h2.
+; Clobbers rax,rcx,rsi,rdx,r8. Preserves rdi.
+ukey_name:
+    push rsi
     push rdx
-    push r8
-    push r9
-    mov qword [udirty], 1
-    mov rbx, rsi
+    call fnv1a64
+    shl rax, 8
+    shr rax, 8                  ; low 56 bits (imm56 has no AND encoding)
     mov rcx, rdi
     shl rcx, 56
-    or rbx, rcx                  ; key
-    mov rax, rsi
-    imul rax, rax, 1597334677
-    add rax, rdi
-    and eax, 8191
+    or rax, rcx
+    mov rbx, rax
+    pop rdx
+    pop rsi
+    call fnv1a32s
     mov r8d, eax
-    xor r9d, r9d
-    mov r10, -1                  ; evict ptr
-    mov r11, -1                  ; evict hits
-ub_probe:
-    cmp r9, 16
-    jae ub_evict
-    mov rax, r8
-    and eax, 8191
-    imul rax, rax, 24
-    lea rdx, [utab]
-    add rdx, rax
-    mov rax, [rdx]
-    test rax, rax
-    jz ub_insert
-    cmp rax, rbx
-    je ub_hit
-    mov rax, [rdx + 8]
-    cmp rax, r11
-    jae ub_next
-    mov r11, rax
-    mov r10, rdx
-ub_next:
-    inc r8
-    inc r9
-    jmp ub_probe
-ub_hit:
-    mov rax, [rdx + 8]
-    cmp rax, -1
-    jae ub_done
-    inc qword [rdx + 8]
-ub_done:
-    pop r9
-    pop r8
-    pop rdx
-    pop rcx
-    pop rbx
     ret
-ub_insert:
-    mov [rdx], rbx
-    mov qword [rdx + 8], 1
-    mov qword [rdx + 16], 0
-    pop r9
-    pop r8
-    pop rdx
-    pop rcx
-    pop rbx
-    ret
-ub_evict:
-    mov rdx, r10
-    mov [rdx], rbx
-    mov qword [rdx + 8], 1
-    mov qword [rdx + 16], 0
-    pop r9
-    pop r8
-    pop rdx
-    pop rcx
-    pop rbx
-    ret
-
-; use_get(rdi=kind, rsi=rowid): rax = hits (0 unknown). Same contract.
-use_get:
-    push rbx
-    push rcx
-    push rdx
-    push r8
-    push r9
+; ukey_rowid(rdi=kind, rsi=rowid): rbx=key, r8d=h2. The h2 mix keeps
+; rowid identities in the same 88-bit regime as hashed ones.
+; Clobbers rax,rcx,r8. Preserves rdi,rsi.
+ukey_rowid:
     mov rbx, rsi
+    shl rbx, 8
+    shr rbx, 8
     mov rcx, rdi
     shl rcx, 56
     or rbx, rcx
     mov rax, rsi
-    imul rax, rax, 1597334677
-    add rax, rdi
-    and eax, 8191
+    mov rcx, 2654435761
+    imul rax, rcx
+    inc rax
     mov r8d, eax
-    xor r9d, r9d
-ug_probe:
-    cmp r9, 16
-    jae ug_miss
-    mov rax, r8
-    and eax, 8191
-    imul rax, rax, 24
+    ret
+; ufind(rbx=key, r8d=h2): rdx = slot (hit, empty, or min-score victim);
+; rax = 1 hit / 0 otherwise. Probes UPROBE_N. Preserves rbx,rdi,r12-r15;
+; clobbers rax,rcx,rdx,rsi,r8-r11 (r9 = probe base).
+ufind:
+    push rbx
+    push rdi
+    push r12
+    push r13
+    mov r13d, r8d                ; h2 spill
+    mov rax, rbx
+    xor eax, r13d
+    imul rax, rax, 1597334677
+    and eax, USLOT_MASK
+    mov r9d, eax                ; base idx
+    xor r10d, r10d              ; step
+    mov r11, -1                 ; best (min) score
+    xor r12d, r12d              ; best slot (ptr)
+ufd_probe:
+    cmp r10, UPROBE_N
+    jae ufd_evict
+    mov eax, r9d
+    add eax, r10d
+    and eax, USLOT_MASK
+    shl rax, 5
     lea rdx, [utab]
     add rdx, rax
     mov rax, [rdx]
     test rax, rax
-    jz ug_miss
+    jz ufd_empty
     cmp rax, rbx
-    je ug_hit
-    inc r8
-    inc r9
-    jmp ug_probe
-ug_hit:
-    mov rax, [rdx + 8]
-    pop r9
-    pop r8
+    jne ufd_occupied
+    mov eax, [rdx + 8]
+    cmp eax, r13d
+    je ufd_hit
+ufd_occupied:
+    push rdx
+    call uscore                 ; clobbers rax,rcx only; rdx spill for safety
     pop rdx
-    pop rcx
-    pop rbx
-    ret
-ug_miss:
-    pop r9
-    pop r8
-    pop rdx
-    pop rcx
-    pop rbx
+    cmp rax, r11
+    jae ufd_next
+    mov r11, rax
+    mov r12, rdx
+ufd_next:
+    inc r10
+    jmp ufd_probe
+ufd_hit:
+    mov eax, 1
+    jmp ufd_done
+ufd_empty:
     xor eax, eax
+    jmp ufd_done
+ufd_evict:
+    mov rdx, r12
+    xor eax, eax
+ufd_done:
+    pop r13
+    pop r12
+    pop rdi
+    pop rbx
     ret
-
-; use_setmax(rdi=key, rsi=hits): load-time insert-or-keep-max (marks in sync).
-; Same register contract as use_bump.
-use_setmax:
+; uscore(rdx=slot): rax = u64 ranking score. Clobbers rax,rcx only
+; (rbx/r12 spills preserve the caller's key and eviction state).
+uscore:
+    push rbx
+    push r12
+    mov eax, [rdx + 16]         ; pos
+    mov ecx, U_PCAP
+    cmp eax, ecx
+    cmovae eax, ecx
+    mov r12d, eax               ; pos (for the net-misleading gate below)
+    xor ebx, ebx                ; score accumulator
+    mov eax, [rdx + 20]         ; neg
+    cmp eax, r12d
+    ja us_noaccess              ; net-misleading: no credit for reads
+    mov eax, [rdx + 12]         ; access
+    mov ecx, U_ACAP
+    cmp eax, ecx
+    cmovae eax, ecx
+    add rbx, rax                ; * U_WA(1): identity
+us_noaccess:
+    mov eax, [rdx + 16]         ; pos
+    mov ecx, U_PCAP
+    cmp eax, ecx
+    cmovae eax, ecx
+    imul rax, rax, U_WP
+    add rbx, rax
+    movzx eax, word [rdx + 28]  ; conf
+    imul rax, rax, U_WC
+    add rbx, rax
+    mov eax, dword [utick]            ; now (low 32, wrap-safe)
+    sub eax, [rdx + 24]         ; age = now - last mod 2^32
+    cmp eax, U_RWIN
+    jae us_norec
+    mov ecx, U_RWIN
+    sub ecx, eax
+    mov eax, ecx
+    imul rax, rax, U_WR
+    add rbx, rax
+us_norec:
+    mov eax, [rdx + 20]         ; neg
+    shl rax, 3                  ; * U_WN(8); neg u32 so no overflow
+    mov rcx, U_NSUB
+    cmp rax, rcx
+    cmovae rax, rcx
+    cmp rbx, rax
+    jb us_zero
+    sub rbx, rax
+    mov rax, rbx
+    pop r12
+    pop rbx
+    ret
+us_zero:
+    xor eax, eax
+    pop r12
+    pop rbx
+    ret
+; uenqueue(rdx=slot, rsi=name, ecx=namelen, edi=kind): record (slot,name)
+; for flush. Preserves rbx,rbp,r12-r15; clobbers rax,rcx,rdx,rsi,rdi,r8-r11.
+uenqueue:
+    push rbx
+    push r12
+    mov r8d, ecx
+    cmp r8d, 128
+    jbe uq_lenok
+    mov r8d, 128
+uq_lenok:
+    mov rax, rdx
+    lea rbx, [utab]
+    sub rax, rbx
+    shr rax, 5                  ; slot idx
+    mov r12d, eax
+    mov rax, [uq_tail]
+    inc rax
+    and rax, UQ_MASK
+    cmp rax, [uq_head]
+    jne uq_space
+    ; full: drop oldest, clear its dirty (bounded documented loss)
+    mov rax, [uq_head]
+    imul rax, rax, UQ_ENT_SZ
+    lea rbx, [uqueue]
+    add rbx, rax
+    mov eax, [rbx]              ; victim slot idx
+    shl rax, 5
+    lea rcx, [utab]
+    add rcx, rax
+    mov byte [rcx + 30], 0
+    inc qword [uq_head]
+    and qword [uq_head], UQ_MASK
+    inc qword [udropped]
+    mov rax, [uq_tail]
+    inc rax
+    and rax, UQ_MASK
+uq_space:
+    mov rcx, [uq_tail]
+    imul rcx, rcx, UQ_ENT_SZ
+    lea rbx, [uqueue]
+    add rbx, rcx
+    mov [rbx], r12d
+    mov [rbx + 4], dil
+    mov [rbx + 5], r8b          ; namelen (<=64, for flush rehash)
+    mov rdi, rbx
+    add rdi, 8
+    mov rcx, r8
+    rep movsb
+    inc qword [uq_tail]
+    and qword [uq_tail], UQ_MASK
+    pop r12
+    pop rbx
+    ret
+; use_bump_name(rdi=kind, rsi=ptr, rdx=len): access++, tick, enqueue on
+; 0->1 dirty. Preserves rbx,rcx,rdx,rsi,rdi,r12-r15.
+use_bump_name:
     push rbx
     push rcx
     push rdx
-    push r8
-    push r9
-    mov rbx, rdi                ; composite key
-    mov rcx, rdi
-    shr rcx, 56                 ; kind
-    shl rdi, 8
-    shr rdi, 8                  ; rowid
-    mov rax, rdi
-    imul rax, rax, 1597334677
-    add rax, rcx                ; same hash as bump/get
-    and eax, 8191
-    mov r8d, eax
-    xor r9d, r9d
-    mov r10, -1
-    mov r11, -1
-usm_probe:
-    cmp r9, 16
-    jae usm_evict
-    mov rax, r8
-    and eax, 8191
-    imul rax, rax, 24
-    lea rdx, [utab]
-    add rdx, rax
-    mov rax, [rdx]
+    push rsi
+    push rdi
+    mov qword [udirty], 1
+    push rsi
+    push rdx
+    call ukey_name              ; rbx=key r8d=h2 (rsi/rdx clobbered)
+    pop rdx
+    pop rsi
+    call ufind                  ; rdx=slot rax=hit
     test rax, rax
-    jz usm_store
-    cmp rax, rbx
-    je usm_hit
-    mov rax, [rdx + 8]
-    cmp rax, r11
-    jae usm_next
-    mov r11, rax
-    mov r10, rdx
-usm_next:
-    inc r8
-    inc r9
-    jmp usm_probe
-usm_hit:
-    cmp rsi, [rdx + 8]
+    jnz ubn_hit
+    mov [rdx], rbx
+    mov [rdx + 8], r8d
+    mov dword [rdx + 12], 1
+    mov dword [rdx + 16], 0
+    mov dword [rdx + 20], 0
+    inc qword [utick]
+    mov eax, dword [utick]
+    mov [rdx + 24], eax
+    mov word [rdx + 28], 0
+    mov byte [rdx + 30], 1
+    mov byte [rdx + 31], 0
+    jmp ubn_enq
+ubn_hit:
+    cmp dword [rdx + 12], 0xFFFFFFFF
+    jae ubn_ticked
+    inc dword [rdx + 12]
+ubn_ticked:
+    inc qword [utick]
+    mov eax, dword [utick]
+    mov [rdx + 24], eax
+    cmp byte [rdx + 30], 0
+    jne ubn_done
+    mov byte [rdx + 30], 1
+ubn_enq:
+    mov rsi, [rsp + 8]          ; name ptr (stack: rdi+0 rsi+8 rdx+16 rcx+24 rbx+32)
+    mov rcx, [rsp + 16]         ; namelen
+    mov rdi, [rsp]              ; kind
+    call uenqueue                ; (rdx=slot, rsi=name, ecx=len, edi=kind)
+ubn_done:
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
+    ret
+; use_bump_id(rdi=kind, rsi=rowid): same for rowid identities. Flush
+; coverage via decimal-name queue entries (u64_dec of the rowid into uqnum;
+; uenqueue copies): the loader re-derives the rowid the same way.
+; Preserves rbx,rcx,rdx,rsi,rdi,r12-r15.
+use_bump_id:
+    push rbx
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    mov qword [udirty], 1
+    call ukey_rowid
+    call ufind
+    test rax, rax
+    jnz ubi_hit
+    mov [rdx], rbx
+    mov [rdx + 8], r8d
+    mov dword [rdx + 12], 1
+    mov dword [rdx + 16], 0
+    mov dword [rdx + 20], 0
+    inc qword [utick]
+    mov eax, dword [utick]
+    mov [rdx + 24], eax
+    mov word [rdx + 28], 0
+    mov byte [rdx + 30], 1
+    mov byte [rdx + 31], 0
+    jmp ubi_enq
+ubi_hit:
+    cmp dword [rdx + 12], 0xFFFFFFFF
+    jae ubi_ticked
+    inc dword [rdx + 12]
+ubi_ticked:
+    inc qword [utick]
+    mov eax, dword [utick]
+    mov [rdx + 24], eax
+    cmp byte [rdx + 30], 0
+    jne ubi_done
+    mov byte [rdx + 30], 1
+ubi_enq:
+    push rdx                    ; slot spill (u64_dec clobbers rdx)
+    mov rax, [rsp + 16]         ; rowid (stack: slot+0 rdi+8 rsi+16 rdx+24 rcx+32 rbx+40)
+    lea rdi, [uqnum]
+    call u64_dec                ; rdx = declen
+    mov rcx, rdx
+    lea rsi, [uqnum]
+    mov rdi, [rsp + 8]          ; kind
+    pop rdx                     ; slot
+    call uenqueue
+ubi_done:
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
+    ret
+
+; use_score_name(rdi=kind, rsi=ptr, rdx=len): rax = u64 score (0 unknown).
+; use_score_id(rdi=kind, rsi=rowid): same for rowid identities.
+; use_slot_name/use_slot_id: rdx = slot, rax = 1 found / 0 not.
+; All preserve rbx,rcx,rdx,rsi,rdi,r12-r15.
+use_score_name:
+    push rbx
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    call ukey_name
+    call ufind
+    test rax, rax
+    jz usc_miss
+    call uscore
+    jmp usc_done
+usc_miss:
+    xor eax, eax
+usc_done:
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
+    ret
+use_score_id:
+    push rbx
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    call ukey_rowid
+    call ufind
+    test rax, rax
+    jz usc_miss
+    call uscore
+    jmp usc_done
+use_slot_name:
+    push rbx
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    call ukey_name
+    call ufind                  ; rdx=slot rax=hit; r8/r9 are scratch here
+    mov r8, rdx
+    mov r9, rax
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
+    mov rdx, r8
+    mov rax, r9
+    ret
+use_slot_id:
+    push rbx
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    call ukey_rowid
+    call ufind
+    mov r8, rdx
+    mov r9, rax
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
+    mov rdx, r8
+    mov rax, r9
+    ret
+; use_fb_name(rdi=kind, rsi=ptr, rdx=len, rcx=1 useful / 0 misleading):
+; pos/neg++, tick, enqueue on 0->1 dirty. Durability is the caller's job
+; (the feedback tool flushes inline). Same preserve contract.
+use_fb_name:
+    push rbx
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    push r10                        ; preserved; signal travels on the stack
+    mov qword [udirty], 1         ; (ufind clobbers r8-r11: no scratch reg
+    push rsi                      ; survives it; pushed rcx at [rsp+32] does)
+    push rdx
+    call ukey_name
+    pop rdx
+    pop rsi
+    call ufind
+    test rax, rax
+    jnz ufb_hit
+    mov [rdx], rbx
+    mov [rdx + 8], r8d
+    mov dword [rdx + 12], 0
+    cmp qword [rsp + 32], 1      ; signal (stack: r10+0 rdi+8 rsi+16 rdx+24 rcx+32 rbx+40)
+    jne ufb_neg0
+    mov dword [rdx + 16], 1
+    mov dword [rdx + 20], 0
+    jmp ufb_tick
+ufb_neg0:
+    mov dword [rdx + 16], 0
+    mov dword [rdx + 20], 1
+    jmp ufb_tick
+ufb_hit:
+    cmp qword [rsp + 32], 1      ; signal (stack layout as above)
+    jne ufb_neg
+    cmp dword [rdx + 16], 0xFFFFFFFF
+    jae ufb_ticked
+    inc dword [rdx + 16]
+    jmp ufb_ticked
+ufb_neg:
+    cmp dword [rdx + 20], 0xFFFFFFFF
+    jae ufb_ticked
+    inc dword [rdx + 20]
+ufb_ticked:
+    inc qword [utick]
+    mov eax, dword [utick]
+    mov [rdx + 24], eax
+    cmp byte [rdx + 30], 0
+    jne ufb_done
+    mov byte [rdx + 30], 1
+    mov rsi, [rsp + 16]         ; name (stack: r10+0 rdi+8 rsi+16 rdx+24 rcx+32 rbx+40)
+    mov rcx, [rsp + 24]         ; namelen
+    mov rdi, [rsp + 8]          ; kind
+    call uenqueue
+    jmp ufb_done
+ufb_tick:
+    inc qword [utick]
+    mov eax, dword [utick]
+    mov [rdx + 24], eax
+    mov word [rdx + 28], 0
+    mov byte [rdx + 30], 1
+    mov byte [rdx + 31], 0
+    mov rsi, [rsp + 16]
+    mov rcx, [rsp + 24]
+    mov rdi, [rsp + 8]
+    call uenqueue
+ufb_done:
+    pop r10
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
+    ret
+; use_fb_id(rdi=kind, rsi=rowid, rdx=1 useful / 0 misleading): same for
+; rowid identities (observations). Signal travels on the stack: ufind
+; clobbers r8-r11, so no scratch register survives it. Same preserve
+; contract as use_fb_name.
+use_fb_id:
+    push rbx
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    mov qword [udirty], 1
+    call ukey_rowid              ; preserves rdx (signal)
+    call ufind                   ; rdx=slot rax=hit
+    test rax, rax
+    jnz ufi_hit
+    mov [rdx], rbx
+    mov [rdx + 8], r8d
+    mov dword [rdx + 12], 0
+    cmp qword [rsp + 16], 1      ; signal (stack: rdi+0 rsi+8 rdx+16 rcx+24 rbx+32)
+    jne ufi_neg0
+    mov dword [rdx + 16], 1
+    mov dword [rdx + 20], 0
+    jmp ufi_tick
+ufi_neg0:
+    mov dword [rdx + 16], 0
+    mov dword [rdx + 20], 1
+    jmp ufi_tick
+ufi_hit:
+    cmp qword [rsp + 16], 1
+    jne ufi_neg
+    cmp dword [rdx + 16], 0xFFFFFFFF
+    jae ufi_ticked
+    inc dword [rdx + 16]
+    jmp ufi_ticked
+ufi_neg:
+    cmp dword [rdx + 20], 0xFFFFFFFF
+    jae ufi_ticked
+    inc dword [rdx + 20]
+ufi_ticked:
+    inc qword [utick]
+    mov eax, dword [utick]
+    mov [rdx + 24], eax
+    cmp byte [rdx + 30], 0
+    jne ufi_done
+    mov byte [rdx + 30], 1
+    push rdx                    ; slot spill (u64_dec clobbers rdx)
+    mov rax, [rsp + 24]         ; rowid (stack: slot+0 rdi+8 rsi+16 rdx+24 rcx+32 rbx+40)
+    lea rdi, [uqnum]
+    call u64_dec
+    mov rcx, rdx
+    lea rsi, [uqnum]
+    mov rdi, [rsp + 8]
+    pop rdx
+    call uenqueue
+    jmp ufi_done
+ufi_tick:
+    inc qword [utick]
+    mov eax, dword [utick]
+    mov [rdx + 24], eax
+    mov word [rdx + 28], 0
+    mov byte [rdx + 30], 1
+    mov byte [rdx + 31], 0
+    push rdx                    ; slot spill (u64_dec clobbers rdx)
+    mov rax, [rsp + 24]         ; rowid (stack: slot+0 rdi+8 rsi+16 rdx+24 rcx+32 rbx+40)
+    lea rdi, [uqnum]
+    call u64_dec
+    mov rcx, rdx
+    lea rsi, [uqnum]
+    mov rdi, [rsp + 8]
+    pop rdx
+    call uenqueue
+ufi_done:
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
+    ret
+; rsi=rowid): reinforcement (new version under a stable identity):
+; conf++ sat, tick. Same preserve contract.
+use_conf_name:
+    push rbx
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    mov qword [udirty], 1
+    push rsi
+    push rdx
+    call ukey_name
+    pop rdx
+    pop rsi
+    call ufind
+    test rax, rax
+    jnz ucn_hit
+    mov [rdx], rbx
+    mov [rdx + 8], r8d
+    mov dword [rdx + 12], 0
+    mov dword [rdx + 16], 0
+    mov dword [rdx + 20], 0
+    inc qword [utick]
+    mov eax, dword [utick]
+    mov [rdx + 24], eax
+    mov word [rdx + 28], 1
+    mov byte [rdx + 30], 1
+    mov byte [rdx + 31], 0
+    mov rsi, [rsp + 8]
+    mov rcx, [rsp + 16]
+    mov rdi, [rsp]
+    call uenqueue
+    jmp ucn_done
+ucn_hit:
+    cmp word [rdx + 28], 0xFFFF
+    jae ucn_ticked
+    inc word [rdx + 28]
+ucn_ticked:
+    inc qword [utick]
+    mov eax, dword [utick]
+    mov [rdx + 24], eax
+    cmp byte [rdx + 30], 0
+    jne ucn_done
+    mov byte [rdx + 30], 1
+    mov rsi, [rsp + 8]
+    mov rcx, [rsp + 16]
+    mov rdi, [rsp]
+    call uenqueue
+ucn_done:
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
+    ret
+use_conf_id:
+    push rbx
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    mov qword [udirty], 1
+    call ukey_rowid
+    call ufind
+    test rax, rax
+    jnz uci_hit
+    mov [rdx], rbx
+    mov [rdx + 8], r8d
+    mov dword [rdx + 12], 0
+    mov dword [rdx + 16], 0
+    mov dword [rdx + 20], 0
+    inc qword [utick]
+    mov eax, dword [utick]
+    mov [rdx + 24], eax
+    mov word [rdx + 28], 1
+    mov byte [rdx + 30], 1
+    mov byte [rdx + 31], 0
+    jmp uci_enq
+uci_hit:
+    cmp word [rdx + 28], 0xFFFF
+    jae uci_ticked
+    inc word [rdx + 28]
+uci_ticked:
+    inc qword [utick]
+    mov eax, dword [utick]
+    mov [rdx + 24], eax
+    cmp byte [rdx + 30], 0
+    jne uci_done
+    mov byte [rdx + 30], 1
+uci_enq:
+    push rdx
+    mov rax, [rsp + 16]         ; rowid (stack: slot+0 rdi+8 rsi+16 rdx+24 rcx+32 rbx+40)
+    lea rdi, [uqnum]
+    call u64_dec
+    mov rcx, rdx
+    lea rsi, [uqnum]
+    mov rdi, [rsp + 8]
+    pop rdx
+    call uenqueue
+uci_done:
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
+    ret
+
+; use_setmax_full(rbx=key, rdi=kind, rsi=nameptr, rdx=namelen): load-time
+; merge from [ulh2],[ulacc],[ulpos],[ulneg],[ullast],[ulconf] (per-signal
+; max). A slot goes dirty only when the merged vector is novel, i.e. some
+; stored field exceeds the row just read (merged != row means no single
+; table row holds the merge, so it must be persisted). Dirty 0->1 also
+; enqueues (slot,name) for flush. Preserves rbx,rcx,rdx,rsi,rdi,r12-r15.
+use_setmax_full:
+    push rbx
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    push r10
+    push r11
+    mov r8d, dword [ulh2]
+    call ufind                   ; rdx=slot rax=hit
+    test rax, rax
+    jnz usm_hit
+    mov [rdx], rbx
+    mov eax, dword [ulh2]
+    mov [rdx + 8], eax
+    mov eax, dword [ulacc]
+    mov [rdx + 12], eax
+    mov eax, dword [ulpos]
+    mov [rdx + 16], eax
+    mov eax, dword [ulneg]
+    mov [rdx + 20], eax
+    mov eax, dword [ullast]
+    mov [rdx + 24], eax
+    mov ax, word [ulconf]
+    mov [rdx + 28], ax
+    mov byte [rdx + 30], 0      ; row exists in table: in sync
+    mov byte [rdx + 31], 0
+    mov rax, [ullast]
+    cmp rax, [utick]
     jbe usm_done
-    mov [rdx + 8], rsi
-    mov [rdx + 16], rsi
+    mov [utick], rax            ; resume tick past persisted recency
+    jmp usm_done
+usm_hit:
+    xor r10d, r10d              ; novel flag
+    mov eax, dword [ulacc]
+    cmp eax, [rdx + 12]
+    jae usm_a
+    mov r10d, 1
+    jmp usm_b
+usm_a:
+    mov [rdx + 12], eax
+usm_b:
+    mov eax, dword [ulpos]
+    cmp eax, [rdx + 16]
+    jae usm_c
+    mov r10d, 1
+    jmp usm_d
+usm_c:
+    mov [rdx + 16], eax
+usm_d:
+    mov eax, dword [ulneg]
+    cmp eax, [rdx + 20]
+    jae usm_e
+    mov r10d, 1
+    jmp usm_f
+usm_e:
+    mov [rdx + 20], eax
+usm_f:
+    mov eax, dword [ullast]
+    cmp eax, [rdx + 24]
+    jae usm_g
+    mov r10d, 1
+    jmp usm_h
+usm_g:
+    mov [rdx + 24], eax
+usm_h:
+    mov ax, word [ulconf]
+    cmp ax, [rdx + 28]
+    jae usm_i
+    mov r10d, 1
+    jmp usm_j
+usm_i:
+    mov [rdx + 28], ax
+usm_j:
+    mov rax, [ullast]
+    cmp rax, [utick]
+    jbe usm_k
+    mov [utick], rax
+usm_k:
+    test r10d, r10d
+    jz usm_done
+    cmp byte [rdx + 30], 0
+    jne usm_done
+    mov byte [rdx + 30], 1
+    mov rsi, [rsp + 24]         ; name (stack: r11+0 r10+8 rdi+16 rsi+24 rdx+32 rcx+40 rbx+48)
+    mov rcx, [rsp + 32]         ; namelen
+    mov rdi, [rsp + 16]         ; kind
+    call uenqueue
 usm_done:
-    pop r9
-    pop r8
-    pop rdx
-    pop rcx
-    pop rbx
-    ret
-usm_store:
-    mov [rdx], rbx
-    mov [rdx + 8], rsi
-    mov [rdx + 16], rsi
-    pop r9
-    pop r8
-    pop rdx
-    pop rcx
-    pop rbx
-    ret
-usm_evict:
-    mov rdx, r10
-    mov [rdx], rbx
-    mov [rdx + 8], rsi
-    mov [rdx + 16], rsi
-    pop r9
-    pop r8
+    pop r11
+    pop r10
+    pop rdi
+    pop rsi
     pop rdx
     pop rcx
     pop rbx
@@ -2577,8 +3212,122 @@ ul_cell:
     call parse_row
     test rax, rax
     jnz ul_incc
-    cmp qword [gcols], 2
+    mov rax, [gcols]
+    cmp rax, 8
+    je ul_v2
+    cmp rax, 2
+    je ul_legacy
+    jmp ul_incc
+ul_v2:
+    ; (name, kind, access, pos, neg, last, conf, v): v ignored, shape is it.
+    mov rsi, qword [gfo]
+    mov rdx, qword [gfl]
+    cmp rdx, 1
     jb ul_incc
+    cmp rdx, 128
+    ja ul_incc
+    mov [ulname], rsi
+    mov [ulnamelen], rdx
+    mov rsi, qword [gfo + 8]
+    mov rdx, qword [gfl + 8]
+    call dec_parse
+    test rax, rax
+    jnz ul_incc
+    cmp rdx, 3
+    ja ul_incc
+    mov [ulkind], rdx
+    mov rsi, qword [gfo + 16]
+    mov rdx, qword [gfl + 16]
+    call dec_parse
+    test rax, rax
+    jnz ul_incc
+    mov rax, rdx
+    shr rax, 32
+    jz ulv_a
+    mov rdx, 0xFFFFFFFF
+ulv_a:
+    mov [ulacc], rdx
+    mov rsi, qword [gfo + 24]
+    mov rdx, qword [gfl + 24]
+    call dec_parse
+    test rax, rax
+    jnz ul_incc
+    mov rax, rdx
+    shr rax, 32
+    jz ulv_b
+    mov rdx, 0xFFFFFFFF
+ulv_b:
+    mov [ulpos], rdx
+    mov rsi, qword [gfo + 32]
+    mov rdx, qword [gfl + 32]
+    call dec_parse
+    test rax, rax
+    jnz ul_incc
+    mov rax, rdx
+    shr rax, 32
+    jz ulv_c
+    mov rdx, 0xFFFFFFFF
+ulv_c:
+    mov [ulneg], rdx
+    mov rsi, qword [gfo + 40]
+    mov rdx, qword [gfl + 40]
+    call dec_parse
+    test rax, rax
+    jnz ul_incc
+    mov rax, rdx
+    shr rax, 32
+    jz ulv_d
+    mov rdx, 0xFFFFFFFF
+ulv_d:
+    mov [ullast], rdx
+    mov rsi, qword [gfo + 48]
+    mov rdx, qword [gfl + 48]
+    call dec_parse
+    test rax, rax
+    jnz ul_incc
+    cmp rdx, 0xFFFF
+    jbe ulv_e
+    mov rdx, 0xFFFF
+ulv_e:
+    mov [ulconf], rdx
+    cmp qword [ulkind], 1
+    je ulv_obs
+    push rbx
+    mov rdi, [ulkind]
+    mov rsi, [ulname]
+    mov rdx, [ulnamelen]
+    call ukey_name
+    mov dword [ulh2], r8d
+    mov rdi, [ulkind]
+    mov rsi, [ulname]
+    mov rdx, [ulnamelen]
+    call use_setmax_full         ; rbx=key preserved across call
+    pop rbx
+    jmp ul_incc
+ulv_obs:
+    mov rsi, [ulname]
+    mov rdx, [ulnamelen]
+    call dec_parse               ; decimal rowid identity
+    test rax, rax
+    jnz ul_incc
+    test rdx, rdx
+    jz ul_incc
+    push rbx
+    mov rsi, rdx
+    mov rdi, 1
+    call ukey_rowid
+    mov dword [ulh2], r8d
+    mov rdi, 1
+    mov rsi, [ulname]
+    mov rdx, [ulnamelen]
+    call use_setmax_full
+    pop rbx
+    jmp ul_incc
+ul_legacy:
+    ; (ukey, hits): ukey = kind<<56 | rowid. Resolve names for string
+    ; kinds via rowid->name scan; observations keep rowid identity.
+    ; Unresolvable rows are skipped (documented): their learning died
+    ; with the row, never merged into another memory.
     mov rsi, qword [gfo]
     mov rdx, qword [gfl]
     call dec_parse
@@ -2592,10 +3341,89 @@ ul_cell:
     call dec_parse
     test rax, rax
     jnz ul_incc
+    mov rax, rdx
+    shr rax, 32
+    jz ull_h
+    mov rdx, 0xFFFFFFFF
+ull_h:
     mov [ulhits], rdx
-    mov rdi, [ulkey]
-    mov rsi, [ulhits]
-    call use_setmax
+    mov rax, [ulkey]
+    shr rax, 56
+    cmp rax, 2
+    ja ul_incc                   ; kinds 0..2 only (3 never existed)
+    mov [ulkind], rax
+    mov rax, [ulkey]
+    shl rax, 8
+    shr rax, 8
+    test rax, rax
+    jz ul_incc
+    cmp qword [ulkind], 1
+    je ull_obs
+    push rbx
+    mov rsi, rax                ; rowid for rname_of
+    mov rdx, [childn]
+    cmp rdx, 65536
+    jbe ull_rn
+    mov rdx, 65536
+ull_rn:
+    cmp qword [ulkind], 0
+    je ull_ent
+    mov rdi, [f_root_facts]
+    jmp ull_do
+ull_ent:
+    mov rdi, [f_root_ent]
+ull_do:
+    call rname_of                ; rsnbuf/rsnlen or miss
+    test rax, rax
+    jz ull_miss
+    jmp ull_named
+ull_miss:
+    pop rbx
+    jmp ul_incc
+ull_named:
+    mov rax, [ulhits]
+    mov [ulacc], rax
+    mov qword [ulpos], 0
+    mov qword [ulneg], 0
+    mov qword [ullast], 0
+    mov qword [ulconf], 0
+    mov rdi, [ulkind]
+    lea rsi, [rnbuf]
+    mov rdx, [rnlen]
+    call ukey_name
+    mov dword [ulh2], r8d
+    mov rdi, [ulkind]
+    lea rsi, [rnbuf]
+    mov rdx, [rnlen]
+    call use_setmax_full
+    pop rbx
+    jmp ul_incc
+ull_obs:
+    mov rax, [ulhits]
+    mov [ulacc], rax
+    mov qword [ulpos], 0
+    mov qword [ulneg], 0
+    mov qword [ullast], 0
+    mov qword [ulconf], 0
+    push rbx
+    mov rax, [ulkey]
+    shl rax, 8
+    shr rax, 8
+    mov rsi, rax
+    mov rdi, 1
+    call ukey_rowid
+    mov dword [ulh2], r8d
+    lea rdi, [uqnum]
+    call u64_dec                 ; decimal rowid name (loader-safe temp)
+    mov [ulnamelen], rdx
+    lea rax, [uqnum]
+    mov [ulname], rax
+    mov rdi, 1
+    mov rsi, [ulname]
+    mov rdx, [ulnamelen]
+    call use_setmax_full
+    pop rbx
+    jmp ul_incc
 ul_incc:
     inc r13
     jmp ul_cell
@@ -2610,6 +3438,111 @@ ul_fin:
     pop rbx
 ul_isdone:
     xor eax, eax
+    ret
+; rname_of(rdi=root, rsi=rowid, rdx=save_count): rax=1 + rnbuf/rnlen
+; (col0, <=64B) or 0 miss. Saves/restores childtab[0..save_count) and
+; childn across its own walk_leaves (callers may hold a live walk).
+; Uses a PRIVATE name buffer: rsnbuf belongs to request handlers and
+; must survive db_open (use_load runs resolvers during open).
+; Preserves rbx,r12-r15.
+rname_of:
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    push rdi
+    mov [rntarget], rsi         ; target rowid in memory (all regs reused below)
+    mov r12, rdx                ; save count
+    mov [rnsave], r12
+    mov rax, [childn]
+    mov [chsaven], rax
+    lea rsi, [childtab]
+    lea rdi, [chsave]
+    mov rcx, r12
+    rep movsq
+    lea rsi, [pagebuf]          ; loader may hold a live page here
+    lea rdi, [rnpsave]
+    mov rcx, 512
+    rep movsq
+    pop rdi
+    call walk_leaves
+    test rax, rax
+    jnz rn_miss
+    xor r14d, r14d
+rn_page:
+    cmp r14, [childn]
+    jae rn_miss
+    lea rsi, [childtab]
+    mov rax, r14
+    shl rax, 3
+    add rsi, rax
+    mov rdi, [rsi]
+    lea rsi, [pagebuf]
+    call pg_read_nc
+    test rax, rax
+    jnz rn_next
+    cmp byte [pagebuf], 0x0D
+    jne rn_next
+    lea rsi, [pagebuf + 3]
+    call be16_ld
+    mov [rnncell], rax
+    xor r13d, r13d
+rn_cell:
+    mov rax, [rnncell]
+    cmp r13, rax
+    jae rn_next
+    lea rsi, [pagebuf + 8]
+    mov rax, r13
+    shl rax, 1
+    add rsi, rax
+    call be16_ld
+    lea rsi, [pagebuf]
+    add rsi, rax
+    call parse_row
+    test rax, rax
+    jnz rn_incc
+    mov rax, [growid]
+    cmp rax, [rntarget]
+    jne rn_incc
+    mov rsi, qword [gfo]
+    mov rcx, qword [gfl]
+    cmp rcx, 1
+    jb rn_incc
+    cmp rcx, 128
+    ja rn_incc
+    lea rdi, [rnbuf]
+    mov rax, rcx
+    rep movsb
+    mov [rnlen], rax
+    mov eax, 1
+    jmp rn_restore
+rn_incc:
+    inc r13
+    jmp rn_cell
+rn_next:
+    inc r14
+    jmp rn_page
+rn_miss:
+    xor eax, eax
+rn_restore:
+    push rax
+    lea rsi, [rnpsave]
+    lea rdi, [pagebuf]
+    mov rcx, 512
+    rep movsq
+    mov rcx, [rnsave]
+    lea rsi, [chsave]
+    lea rdi, [childtab]
+    rep movsq
+    mov rax, [chsaven]
+    mov [childn], rax
+    pop rax
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
     ret
 
 ; use_flush: persist changed slots as new usage rows (rewrite-the-slot on next
@@ -2626,53 +3559,106 @@ use_flush:
     mov qword [svstate + 24], rax
     lea rsi, [colp]
     lea rdi, [svstate + 32]
-    mov ecx, 6
+    mov ecx, 8
     rep movsq
     lea rsi, [coll]
-    lea rdi, [svstate + 80]
-    mov ecx, 6
+    lea rdi, [svstate + 96]
+    mov ecx, 8
     rep movsq
     lea rsi, [gfo]
-    lea rdi, [svstate + 128]
-    mov ecx, 6
+    lea rdi, [svstate + 160]
+    mov ecx, 8
     rep movsq
     lea rsi, [gfl]
-    lea rdi, [svstate + 176]
-    mov ecx, 6
+    lea rdi, [svstate + 224]
+    mov ecx, 8
     rep movsq
     mov rdi, [f_root_use]
     call scan_max
     test rax, rax
     jnz uf_abort
-    mov qword [sidx], 0
 uf_slot:
-    mov rax, [sidx]
-    cmp rax, 8192
-    jae uf_done
-    imul rax, rax, 24
+    mov rax, [uq_head]
+    cmp rax, [uq_tail]
+    je uf_done
+    imul rax, rax, UQ_ENT_SZ
+    lea rbx, [uqueue]
+    add rbx, rax                ; rbx = entry
+    mov eax, [rbx]              ; slot idx
+    shl rax, 5
     lea rdx, [utab]
-    add rdx, rax
-    mov rcx, [rdx]
-    test rcx, rcx
-    jz uf_next
-    mov rax, [rdx + 8]
-    cmp rax, [rdx + 16]
-    je uf_next
-    mov [ulkey], rcx
-    mov [ulhits], rax
-    mov rax, [ulkey]
-    lea rdi, [ukeybuf]
-    call u64_dec
-    lea rax, [ukeybuf]
+    add rdx, rax                ; rdx = slot
+    cmp byte [rdx + 30], 0
+    je uf_adv                   ; clean already: skip (defensive)
+    push rbx
+    push rdx
+    movzx edi, byte [rbx + 4]   ; kind
+    lea rsi, [rbx + 8]          ; name
+    movzx edx, byte [rbx + 5]   ; len
+    call ukey_name              ; rbx=key r8d=h2 (entry/slot spilled)
+    mov r10, rbx
+    mov r11d, r8d
+    pop rdx
+    pop rbx
+    cmp r10, [rdx]
+    jne uf_adv                   ; slot reused since enqueue: stale entry
+    cmp r11d, [rdx + 8]
+    jne uf_adv
+    mov eax, [rdx + 12]
+    mov [ulacc], rax
+    mov eax, [rdx + 16]
+    mov [ulpos], rax
+    mov eax, [rdx + 20]
+    mov [ulneg], rax
+    mov eax, [rdx + 24]
+    mov [ullast], rax
+    movzx eax, word [rdx + 28]
+    mov [ulconf], rax
+    push rdx                    ; slot spill (u64_dec clobbers rdx)
+    lea rax, [rbx + 8]
     mov qword [colp], rax
-    mov qword [coll], rdx
-    mov rax, [ulhits]
-    lea rdi, [uhitbuf]
+    movzx eax, byte [rbx + 5]
+    mov qword [coll], rax
+    movzx eax, byte [rbx + 4]
+    lea rdi, [ukind1]
     call u64_dec
-    lea rax, [uhitbuf]
+    lea rax, [ukind1]
     mov qword [colp + 8], rax
     mov qword [coll + 8], rdx
-    mov qword [ncols], 2
+    mov eax, dword [ulacc]
+    lea rdi, [unum0]
+    call u64_dec
+    lea rax, [unum0]
+    mov qword [colp + 16], rax
+    mov qword [coll + 16], rdx
+    mov eax, dword [ulpos]
+    lea rdi, [unum1]
+    call u64_dec
+    lea rax, [unum1]
+    mov qword [colp + 24], rax
+    mov qword [coll + 24], rdx
+    mov eax, dword [ulneg]
+    lea rdi, [unum2]
+    call u64_dec
+    lea rax, [unum2]
+    mov qword [colp + 32], rax
+    mov qword [coll + 32], rdx
+    mov eax, dword [ullast]
+    lea rdi, [unum3]
+    call u64_dec
+    lea rax, [unum3]
+    mov qword [colp + 40], rax
+    mov qword [coll + 40], rdx
+    movzx eax, word [ulconf]
+    lea rdi, [unum4]
+    call u64_dec
+    lea rax, [unum4]
+    mov qword [colp + 48], rax
+    mov qword [coll + 48], rdx
+    lea rax, [uv2]
+    mov qword [colp + 56], rax
+    mov qword [coll + 56], 1
+    mov qword [ncols], 8
     mov rax, [maxrowid]
     inc rax
     mov [newrowid], rax
@@ -2682,16 +3668,16 @@ uf_slot:
     mov [splitroot], rax
     call place_cell
     test rax, rax
-    jnz uf_abort
-    mov rax, [sidx]
-    imul rax, rax, 24
-    lea rdx, [utab]
-    add rdx, rax
-    mov rcx, [ulhits]
-    mov [rdx + 16], rcx
-uf_next:
-    inc qword [sidx]
+    jnz uf_poabort
+    pop rdx
+    mov byte [rdx + 30], 0
+uf_adv:
+    inc qword [uq_head]
+    and qword [uq_head], UQ_MASK
     jmp uf_slot
+uf_poabort:
+    pop rdx
+    jmp uf_abort
 uf_done:
     call hdr_touch
     test rax, rax
@@ -2704,21 +3690,21 @@ uf_abort:
     mov rax, 1
     mov [rsp], rax
 uf_restore:
-    lea rsi, [svstate + 176]
+    lea rsi, [svstate + 224]
     lea rdi, [gfl]
-    mov ecx, 6
+    mov ecx, 8
     rep movsq
-    lea rsi, [svstate + 128]
+    lea rsi, [svstate + 160]
     lea rdi, [gfo]
-    mov ecx, 6
+    mov ecx, 8
     rep movsq
-    lea rsi, [svstate + 80]
+    lea rsi, [svstate + 96]
     lea rdi, [coll]
-    mov ecx, 6
+    mov ecx, 8
     rep movsq
     lea rsi, [svstate + 32]
     lea rdi, [colp]
-    mov ecx, 6
+    mov ecx, 8
     rep movsq
     mov rax, qword [svstate + 24]
     mov [ncols], rax
@@ -6349,7 +7335,7 @@ parse_row:
     dec rbx                     ; body = sptr + hval - 1
     xor ecx, ecx                ; k
 pr_ser:
-    cmp rcx, 6
+    cmp rcx, 8
     jae pr_serdone
     cmp rsi, rbx
     ja pr_serdone2
@@ -7122,7 +8108,7 @@ op_fread:
     jz dc_params
     mov rsi, rax
     lea rdi, [rsnbuf]
-    mov ecx, 64
+    mov ecx, 128
     call parse_str
     test rax, rax
     jz dc_params
@@ -7153,9 +8139,10 @@ op_fread:
     cmp rax, 1
     jne of_miss
     call db_close
-    mov edi, 2                    ; fact use -> learn
-    mov rsi, [growid]
-    call use_bump
+    mov edi, 2                    ; fact use -> learn (stable name identity)
+    lea rsi, [rsnbuf]
+    mov rdx, [rsnlen]
+    call use_bump_name
     ; inner {"rowid":N,"name":"R","body":"B"}
     lea rax, [jsontmp]
     mov [outptr], rax
@@ -7210,7 +8197,7 @@ op_fwrite:
     jz dc_params
     mov rsi, rax
     lea rdi, [rsnbuf]
-    mov ecx, 64
+    mov ecx, 128
     call parse_str
     test rax, rax
     jz dc_params
@@ -7275,6 +8262,10 @@ op_fwrite:
     mov rax, [newrowid]
     mov [maxrowid], rax
     call hdr_touch
+    mov edi, 2                    ; each version re-asserts the name
+    lea rsi, [rsnbuf]
+    mov rdx, [rsnlen]
+    call use_conf_name
     call db_close
     lea rax, [jsontmp]
     mov [outptr], rax
@@ -7393,7 +8384,7 @@ ofl_cell:
     jz olf_nextcell
     sub r10, 13
     shr r10, 1                    ; namelen
-    cmp r10, 64
+    cmp r10, 128
     ja olf_nextcell
     mov rsi, rcx
     call varint_get               ; s1 = body serial (skip to body)
@@ -7413,7 +8404,7 @@ ofl_seen:
     jae olf_add
     lea rsi, [fseen]
     mov rax, r12
-    imul rax, rax, 65
+    imul rax, rax, 129
     add rsi, rax
     movzx eax, byte [rsi]
     cmp rax, r10
@@ -7464,7 +8455,7 @@ olf_emit:
     ; store in seen
     lea rdi, [fseen]
     mov rax, [fseenn]
-    imul rax, rax, 65
+    imul rax, rax, 129
     add rdi, rax
     mov rax, [rsnlen]
     mov [rdi], al                 ; len byte
@@ -7548,7 +8539,7 @@ op_mkentity:
     jz dc_params
     mov rsi, rax
     lea rdi, [rsnbuf]
-    mov ecx, 64
+    mov ecx, 128
     call parse_str
     test rax, rax
     jz dc_params
@@ -7821,7 +8812,7 @@ op_addobs:
     jz dc_params
     mov rsi, rax
     lea rdi, [rsnbuf]
-    mov ecx, 64
+    mov ecx, 128
     call parse_str
     test rax, rax
     jz dc_params
@@ -7977,7 +8968,7 @@ op_mkrel:
     jz dc_params
     mov rsi, rax
     lea rdi, [rsnbuf]
-    mov ecx, 64
+    mov ecx, 128
     call parse_str
     test rax, rax
     jz dc_params
@@ -7997,7 +8988,7 @@ op_mkrel:
     jz dc_params
     mov rsi, rax
     lea rdi, [relbuf]
-    mov ecx, 64
+    mov ecx, 128
     call parse_str
     test rax, rax
     jz dc_params
@@ -8346,8 +9337,8 @@ st_hit:
     ; into. is_tombstoned key must never alias pagebuf (same rule applies
     ; to all callers: pass rsnbuf/relbuf/fseen, never gfo).
     mov rcx, qword [gfl]
-    cmp rcx, 64
-    ja st_collect                 ; longer than any valid name: can't match
+    cmp rcx, 128
+    ja st_noname                  ; longer than any valid name: can't match
     mov rsi, qword [gfo]
     lea rdi, [rsnbuf]
     rep movsb
@@ -8373,14 +9364,32 @@ st_skip:
     test rax, rax
     jnz st_nextpg
     jmp st_nextcell
+st_noname:
+    mov qword [rsnlen], -1       ; no name to rank by (score 0 at collect)
+    jmp st_collect
 st_collect:
     ; collect (score,mode,pgno,celloff) for usage-ranked emission
     mov rax, [sncol]
     cmp rax, 64
     jae st_sortemit              ; buffer full: rank + emit now
+    mov rax, [smode]
+    cmp rax, 1
+    je stc_obs                   ; observations: stable rowid identity
+    cmp qword [rsnlen], 0
+    jl stc_noname                ; overlong field guard above: score 0
     mov rdi, [smode]
+    lea rsi, [rsnbuf]
+    mov rdx, [rsnlen]
+    call use_score_name
+    jmp stc_store
+stc_obs:
+    mov rdi, 1
     mov rsi, [growid]
-    call use_get                ; rax = hits
+    call use_score_id
+    jmp stc_store
+stc_noname:
+    xor eax, eax
+stc_store:
     mov rcx, [sncol]
     shl rcx, 5
     lea rdx, [sbuf]
@@ -8486,9 +9495,19 @@ se_loop:
     call parse_row
     test rax, rax
     jnz se_next
+    mov rax, [smode]
+    cmp rax, 1
+    je se_obs                    ; observations: stable rowid identity
     mov rdi, [smode]
+    mov rsi, qword [gfo]         ; col0 = name (facts, entities)
+    mov rdx, qword [gfl]
+    call use_bump_name           ; surfaced -> learn
+    jmp se_emitted
+se_obs:
+    mov rdi, 1
     mov rsi, [growid]
-    call use_bump               ; surfaced -> learn
+    call use_bump_id
+se_emitted:
     call st_emit
 se_next:
     inc qword [sidx]
@@ -8621,7 +9640,7 @@ op_delete:
     jz dc_params
     mov rsi, rax
     lea rdi, [rsnbuf]
-    mov ecx, 64
+    mov ecx, 128
     call parse_str
     test rax, rax
     jz dc_params
@@ -8771,7 +9790,7 @@ cp_cell:
     jz cp_nextcell
     sub r10, 13
     shr r10, 1
-    cmp r10, 64
+    cmp r10, 128
     ja cp_nextcell
     mov rsi, rcx
     call varint_get               ; s1 = body serial (skip to body)
@@ -8798,7 +9817,7 @@ cp_seen:
     jae cp_add
     lea rsi, [fseen]
     mov rax, r12
-    imul rax, rax, 65
+    imul rax, rax, 129
     add rsi, rax
     movzx eax, byte [rsi]
     cmp rax, r10
@@ -8816,7 +9835,7 @@ cp_add:
     jae cp_full
     lea rdi, [fseen]
     mov rax, [fseenn]
-    imul rax, rax, 65
+    imul rax, rax, 129
     add rdi, rax
     mov rax, r10
     mov [rdi], al
@@ -8867,7 +9886,7 @@ op_delprefix:
     jz dc_params
     mov rsi, rax
     lea rdi, [qbuf]
-    mov ecx, 64
+    mov ecx, 128
     call parse_str
     test rax, rax
     jz dc_params
@@ -8899,7 +9918,7 @@ dp_each:
     cmp rax, [fseenn]
     jae dp_done
     lea rsi, [fseen]
-    imul rax, rax, 65
+    imul rax, rax, 129
     add rsi, rax
     movzx edx, byte [rsi]
     lea rsi, [rsi + 1]
@@ -8910,7 +9929,7 @@ dp_each:
     je om_dbclose
     mov rax, [stci]
     lea rsi, [fseen]
-    imul rax, rax, 65
+    imul rax, rax, 129
     add rsi, rax
     movzx edx, byte [rsi]
     lea rsi, [rsi + 1]
@@ -8969,7 +9988,7 @@ op_versions:
     jz dc_params
     mov rsi, rax
     lea rdi, [rsnbuf]
-    mov ecx, 64
+    mov ecx, 128
     call parse_str
     test rax, rax
     jz dc_params
@@ -9186,6 +10205,417 @@ ov_dbclose:
     jmp err_id
 
 ; op_health {}: diagnostics for operators.
+; op_feedback {name, signal, kind?}: pos/neg++, tick, inline durable flush.
+; Tombstoned names are refused with an explicit shape (ranking the buried
+; teaches nothing). Phantom names are accepted (ranking only affects
+; surfaced rows) and documented.
+op_feedback:
+    mov rsi, [pp]
+    lea rdi, [k_args]
+    mov ecx, 11
+    call find_val
+    test rax, rax
+    jz dc_params
+    mov [ap], rax
+    mov rsi, [ap]
+    lea rdi, [k_name]
+    mov ecx, 6
+    call find_val
+    test rax, rax
+    jz dc_params
+    mov rsi, rax
+    lea rdi, [rsnbuf]
+    mov ecx, 128
+    call parse_str
+    test rax, rax
+    jz dc_params
+    test rdx, rdx
+    jz dc_params
+    mov [rsnlen], rdx
+    lea rsi, [rsnbuf]
+    mov rdx, [rsnlen]
+    call valid_name
+    test rax, rax
+    jnz oc_badname
+    mov qword [fbkind], 2
+    mov rsi, [ap]
+    lea rdi, [k_kind]
+    mov ecx, 6
+    call find_val
+    test rax, rax
+    jz ofb_sig
+    mov rsi, rax
+    lea rdi, [sigbuf]
+    mov ecx, 16
+    call parse_str
+    test rax, rax
+    jz dc_params
+    test rdx, rdx
+    jz dc_params
+    mov [siglen], rdx
+    lea rsi, [sigbuf]
+    mov rdx, [siglen]
+    lea rdi, [v_fact]
+    call cmp_name
+    test rax, rax
+    jnz ofb_fact
+    lea rsi, [sigbuf]
+    mov rdx, [siglen]
+    lea rdi, [v_entity]
+    call cmp_name
+    test rax, rax
+    jnz ofb_ent
+    lea rsi, [sigbuf]
+    mov rdx, [siglen]
+    lea rdi, [v_obs]
+    call cmp_name
+    test rax, rax
+    jnz ofb_obs
+    lea rsi, [sigbuf]
+    mov rdx, [siglen]
+    lea rdi, [v_task]
+    call cmp_name
+    test rax, rax
+    jnz ofb_task
+    jmp dc_params
+ofb_fact:
+    mov qword [fbkind], 2
+    jmp ofb_sig
+ofb_ent:
+    mov qword [fbkind], 0
+    jmp ofb_sig
+ofb_obs:
+    mov qword [fbkind], 1
+    jmp ofb_sig
+ofb_task:
+    mov qword [fbkind], 3
+ofb_sig:
+    mov rsi, [ap]
+    lea rdi, [k_signal]
+    mov ecx, 8
+    call find_val
+    test rax, rax
+    jz dc_params
+    mov rsi, rax
+    lea rdi, [sigbuf]
+    mov ecx, 16
+    call parse_str
+    test rax, rax
+    jz dc_params
+    test rdx, rdx
+    jz dc_params
+    mov [siglen], rdx
+    lea rsi, [sigbuf]
+    mov rdx, [siglen]
+    lea rdi, [v_useful]
+    call cmp_name
+    test rax, rax
+    jnz ofb_pos
+    lea rsi, [sigbuf]
+    mov rdx, [siglen]
+    lea rdi, [v_mislead]
+    call cmp_name
+    test rax, rax
+    jnz ofb_neg
+    jmp dc_params
+ofb_pos:
+    mov qword [fbsig], 1
+    jmp ofb_open
+ofb_neg:
+    mov qword [fbsig], 0
+ofb_open:
+    cmp qword [fbkind], 1
+    jne ofb_db
+    lea rsi, [rsnbuf]
+    mov rdx, [rsnlen]
+    call dec_parse               ; observations: decimal rowid identity
+    test rax, rax
+    jz dc_params
+    test rdx, rdx
+    jz dc_params
+    mov [fbobsid], rdx
+ofb_db:
+    call db_open_ex
+    test rax, rax
+    jnz oc_db
+    lea rsi, [rsnbuf]
+    mov rdx, [rsnlen]
+    call is_tombstoned
+    cmp rax, 1
+    je ofb_tomb
+    cmp rax, 2
+    je om_dbclose
+    cmp qword [fbkind], 1
+    je ofb_obsbump
+    mov rdi, [fbkind]
+    lea rsi, [rsnbuf]
+    mov rdx, [rsnlen]
+    mov rcx, [fbsig]
+    call use_fb_name
+    jmp ofb_flush
+ofb_obsbump:
+    mov rdi, 1
+    mov rsi, [fbobsid]
+    mov rdx, [fbsig]
+    call use_fb_id
+ofb_flush:
+    call use_flush               ; durable on return: no silent loss
+    test rax, rax
+    jnz om_dbclose
+    call db_close
+    lea rax, [jsontmp]
+    mov [outptr], rax
+    mov qword [outlen], 0
+    lea rsi, [jn_versions]
+    call out_cstr
+    lea rsi, [rsnbuf]
+    mov rdx, [rsnlen]
+    call out_escaped
+    mov al, '"'
+    call out_byte
+    lea rsi, [jn_signal]
+    call out_cstr
+    lea rsi, [sigbuf]
+    mov rdx, [siglen]
+    call out_escaped
+    mov al, '"'
+    call out_byte
+    lea rsi, [jn_recorded]
+    call out_cstr
+    lea rsi, [b_true]
+    call out_cstr
+    mov al, '}'
+    call out_byte
+    jmp oc_envelope
+ofb_tomb:
+    call db_close
+    lea rax, [jsontmp]
+    mov [outptr], rax
+    mov qword [outlen], 0
+    lea rsi, [jn_versions]
+    call out_cstr
+    lea rsi, [rsnbuf]
+    mov rdx, [rsnlen]
+    call out_escaped
+    mov al, '"'
+    call out_byte
+    lea rsi, [jn_recorded]
+    call out_cstr
+    lea rsi, [b_false]
+    call out_cstr
+    lea rsi, [jn_note]
+    call out_cstr
+    lea rsi, [m_tomb]
+    call out_cstr
+    mov al, '"'
+    call out_byte
+    mov al, '}'
+    call out_byte
+    jmp oc_envelope
+; op_explain {name, kind?}: why a memory ranks as it does. Read-only.
+op_explain:
+    mov rsi, [pp]
+    lea rdi, [k_args]
+    mov ecx, 11
+    call find_val
+    test rax, rax
+    jz dc_params
+    mov [ap], rax
+    mov rsi, [ap]
+    lea rdi, [k_name]
+    mov ecx, 6
+    call find_val
+    test rax, rax
+    jz dc_params
+    mov rsi, rax
+    lea rdi, [rsnbuf]
+    mov ecx, 128
+    call parse_str
+    test rax, rax
+    jz dc_params
+    test rdx, rdx
+    jz dc_params
+    mov [rsnlen], rdx
+    lea rsi, [rsnbuf]
+    mov rdx, [rsnlen]
+    call valid_name
+    test rax, rax
+    jnz oc_badname
+    mov qword [fbkind], 2
+    mov rsi, [ap]
+    lea rdi, [k_kind]
+    mov ecx, 6
+    call find_val
+    test rax, rax
+    jz oex_db
+    mov rsi, rax
+    lea rdi, [sigbuf]
+    mov ecx, 16
+    call parse_str
+    test rax, rax
+    jz dc_params
+    test rdx, rdx
+    jz dc_params
+    mov [siglen], rdx
+    lea rsi, [sigbuf]
+    mov rdx, [siglen]
+    lea rdi, [v_fact]
+    call cmp_name
+    test rax, rax
+    jnz oex_db
+    lea rsi, [sigbuf]
+    mov rdx, [siglen]
+    lea rdi, [v_entity]
+    call cmp_name
+    test rax, rax
+    jnz oex_ent
+    lea rsi, [sigbuf]
+    mov rdx, [siglen]
+    lea rdi, [v_obs]
+    call cmp_name
+    test rax, rax
+    jnz oex_obs
+    lea rsi, [sigbuf]
+    mov rdx, [siglen]
+    lea rdi, [v_task]
+    call cmp_name
+    test rax, rax
+    jnz oex_task
+    jmp dc_params
+oex_ent:
+    mov qword [fbkind], 0
+    jmp oex_db
+oex_obs:
+    mov qword [fbkind], 1
+    jmp oex_db
+oex_task:
+    mov qword [fbkind], 3
+oex_db:
+    cmp qword [fbkind], 1
+    jne oex_open
+    lea rsi, [rsnbuf]
+    mov rdx, [rsnlen]
+    call dec_parse
+    test rax, rax
+    jz dc_params
+    test rdx, rdx
+    jz dc_params
+    mov [fbobsid], rdx
+oex_open:
+    call db_open
+    test rax, rax
+    jnz oc_db
+    cmp qword [fbkind], 1
+    je oex_obslookup
+    mov rdi, [fbkind]
+    lea rsi, [rsnbuf]
+    mov rdx, [rsnlen]
+    call use_slot_name
+    jmp oex_got
+oex_obslookup:
+    mov rdi, 1
+    mov rsi, [fbobsid]
+    call use_slot_id
+oex_got:
+    test rax, rax
+    jz oex_zero
+    push rdx
+    call uscore
+    mov [exscore], rax
+    pop rdx
+    mov eax, [rdx + 12]
+    mov dword [exacc], eax
+    mov eax, [rdx + 16]
+    mov dword [expos], eax
+    mov eax, [rdx + 20]
+    mov dword [exneg], eax
+    mov eax, [rdx + 24]
+    mov dword [exlast], eax
+    movzx eax, word [rdx + 28]
+    mov dword [exconf], eax
+    jmp oex_close
+oex_zero:
+    mov qword [exscore], 0
+    mov qword [exacc], 0
+    mov qword [expos], 0
+    mov qword [exneg], 0
+    mov qword [exlast], 0
+    mov qword [exconf], 0
+oex_close:
+    mov eax, dword [utick]
+    mov dword [exnow], eax
+    call db_close
+    lea rax, [jsontmp]
+    mov [outptr], rax
+    mov qword [outlen], 0
+    lea rsi, [jn_versions]
+    call out_cstr
+    lea rsi, [rsnbuf]
+    mov rdx, [rsnlen]
+    call out_escaped
+    mov al, '"'
+    call out_byte
+    lea rsi, [jn_kindkey]
+    call out_cstr
+    mov rax, [fbkind]
+    call out_uint
+    lea rsi, [jn_access]
+    call out_cstr
+    mov rax, [exacc]
+    call out_uint
+    lea rsi, [jn_useful]
+    call out_cstr
+    mov rax, [expos]
+    call out_uint
+    lea rsi, [jn_mislead]
+    call out_cstr
+    mov rax, [exneg]
+    call out_uint
+    lea rsi, [jn_last]
+    call out_cstr
+    mov rax, [exlast]
+    call out_uint
+    lea rsi, [jn_now]
+    call out_cstr
+    mov rax, [exnow]
+    call out_uint
+    lea rsi, [jn_conf]
+    call out_cstr
+    mov rax, [exconf]
+    call out_uint
+    lea rsi, [jn_score]
+    call out_cstr
+    mov rax, [exscore]
+    call out_uint
+    lea rsi, [jn_weights]
+    call out_cstr
+    mov rax, U_WA
+    call out_uint
+    lea rsi, [jn_wp]
+    call out_cstr
+    mov rax, U_WP
+    call out_uint
+    lea rsi, [jn_wn]
+    call out_cstr
+    mov rax, U_WN
+    call out_uint
+    lea rsi, [jn_wr]
+    call out_cstr
+    mov rax, U_WR
+    call out_uint
+    lea rsi, [jn_wc]
+    call out_cstr
+    mov rax, U_WC
+    call out_uint
+    mov al, '}'
+    call out_byte
+    lea rsi, [jn_window]
+    call out_cstr
+    mov rax, U_RWIN
+    call out_uint
+    mov al, '}'
+    call out_byte
+    jmp oc_envelope
 op_health:
     call db_open
     test rax, rax
@@ -9242,10 +10672,10 @@ oh_cached:
     xor ecx, ecx
     xor eax, eax
 oh_use:
-    cmp rcx, 8192
+    cmp rcx, USLOTS
     jae oh_used
     mov rdx, rcx
-    imul rdx, rdx, 24
+    shl rdx, 5                  ; USLOT_SZ
     lea rsi, [utab]
     cmp qword [rsi + rdx], 0
     je oh_unext
@@ -9318,7 +10748,7 @@ op_search:
     jz dc_params
     mov rsi, rax
     lea rdi, [qbuf]
-    mov ecx, 64
+    mov ecx, 128
     call parse_str
     test rax, rax
     jz dc_params
@@ -9432,7 +10862,7 @@ oo_loop:
     cmp byte [rsi], '"'
     jne oo_bad
     lea rdi, [relbuf]
-    mov ecx, 64
+    mov ecx, 128
     call parse_str
     test rax, rax
     jz oo_bad
@@ -9992,7 +11422,7 @@ oq_noproj:
     jz oq_nosearch
     mov rsi, rax
     lea rdi, [qbuf]
-    mov ecx, 64
+    mov ecx, 128
     call parse_str
     test rax, rax
     jz dc_params
@@ -10571,6 +12001,9 @@ ou_s5:
     mov rax, [newrowid]
     mov [maxrowid], rax
     call hdr_touch
+    mov edi, 3                    ; task update re-asserts a stable id
+    mov rsi, [qtid]
+    call use_conf_id
     call db_close
     jmp oc_envelope
 ou_corrupt:
@@ -10993,6 +12426,14 @@ k_from db '"from"', 0
 k_to db '"to"', 0
 k_entity db '"entity"', 0
 k_prefix db '"prefix"', 0
+k_signal db '"signal"', 0
+k_kind db '"kind"', 0
+v_useful db 'useful', 0
+v_mislead db 'misleading', 0
+v_fact db 'fact', 0
+v_entity db 'entity', 0
+v_obs db 'observation', 0
+v_task db 'task', 0
 
 m_init db 'initialize', 0
 m_disc db 'server/discover', 0
@@ -11019,6 +12460,8 @@ t_delete db 'delete_fact', 0
 t_delprefix db 'delete_fact_prefix', 0
 t_versions db 'read_fact_versions', 0
 t_health db 'health', 0
+t_feedback db 'feedback', 0
+t_explain db 'explain_rank', 0
 
 c_parse db '-32700', 0
 c_invalid db '-32600', 0
@@ -11067,7 +12510,7 @@ t_tomb_n db 'tombstones', 0
 t_tomb_sql db 'CREATE TABLE tombstones(name TEXT)', 0
 t_tomb_sqllen = $ - t_tomb_sql - 1
 t_use_n db 'usage', 0
-t_use_sql db 'CREATE TABLE usage(ukey TEXT, hits TEXT)', 0
+t_use_sql db 'CREATE TABLE usage(name TEXT, kind TEXT, access TEXT, pos TEXT, neg TEXT, last TEXT, conf TEXT, v TEXT)', 0
 t_use_sqllen = $ - t_use_sql - 1
 
 dbmagic db 'SQLite format 3', 0
@@ -11106,6 +12549,22 @@ jn_tombed db ',"tombstoned":', 0
 jn_capped db ',"capped":', 0
 jn_versions db '{"name":"', 0
 jn_tombflag db ',"tombstoned":', 0
+jn_recorded db ',"recorded":', 0
+jn_signal db ',"signal":"', 0
+jn_kindkey db ',"kind":', 0
+jn_access db ',"access":', 0
+jn_useful db ',"useful":', 0
+jn_mislead db ',"misleading":', 0
+jn_last db ',"last_tick":', 0
+jn_now db ',"now_tick":', 0
+jn_conf db ',"confidence":', 0
+jn_score db ',"score":', 0
+jn_weights db ',"weights":{"a":', 0
+jn_wp db ',"p":', 0
+jn_wn db ',"n":', 0
+jn_wr db ',"r":', 0
+jn_wc db ',"c":', 0
+jn_window db ',"window":', 0
 jn_versarr db ',"versions":[', 0
 jn_current db ',"current":', 0
 jn_tables db '{"tables":', 0
@@ -11216,7 +12675,17 @@ r_toolsarr db '[{"name":"sequential_thinking"'
        db ',{"name":"health"'
        db ',"description":"Database diagnostics: tables, pages, journal, caches."'
        db ',"inputSchema":{"type":"object","properties":{}}'
-       db ',"required":[]}]', 0
+       db ',"required":[]}'
+       db ',{"name":"feedback"'
+       db ',"description":"Teach ranking: mark a memory useful or misleading. Durable on return."'
+       db ',"inputSchema":{"type":"object","properties":{"name":{"type":"string"}'
+       db ',"signal":{"type":"string"},"kind":{"type":"string"}}}'
+       db ',"required":["name","signal"]}'
+       db ',{"name":"explain_rank"'
+       db ',"description":"Why a memory ranks as it does: signals, score, weights."'
+       db ',"inputSchema":{"type":"object","properties":{"name":{"type":"string"}'
+       db ',"kind":{"type":"string"}}}'
+       db ',"required":["name"]}]', 0
 
 lp dq 0
 ll dq 0
@@ -11290,6 +12759,21 @@ udirty dq 0
 uloaded dq 0
 ulkey dq 0
 ulhits dq 0
+utick dq 0
+uq_head dq 0
+uq_tail dq 0
+udropped dq 0
+ulh2 dq 0
+ulacc dq 0
+ulpos dq 0
+ulneg dq 0
+ullast dq 0
+ulconf dq 0
+ulname dq 0
+ulnamelen dq 0
+ulkind dq 0
+chsaven dq 0
+uv2 db '2', 0
 dbwmode dq 0
 tombnm dq 0
 tombnl dq 0
@@ -11379,9 +12863,33 @@ sbtmp rb 32
 ukeybuf rb 24
 uhitbuf rb 24
 udec rb 24
-svstate rb 224
+unum0 rb 24
+unum1 rb 24
+unum2 rb 24
+unum3 rb 24
+unum4 rb 24
+uqnum rb 24
+ukind1 rb 8
+svstate rb 288
 recscratch rb 64
-rsnbuf rb 64
+rsnbuf rb 128
+sigbuf rb 16
+siglen dq 0
+rnbuf rb 128
+rnlen dq 0
+rnsave dq 0
+rntarget dq 0
+rnncell dq 0
+fbkind dq 0
+fbsig dq 0
+fbobsid dq 0
+exscore dq 0
+exacc dq 0
+expos dq 0
+exneg dq 0
+exlast dq 0
+exnow dq 0
+exconf dq 0
 thbuf rb 512
 ccbuf rb 512
 dbstat rb 144
@@ -11390,18 +12898,18 @@ ddepth dq 0
 ppg dq 0
 sob rb 128
 ktab rb 768
-stab rb 48
-gfo rb 48
-gfl rb 48
-colp rb 48
-coll rb 48
+stab rb 64
+gfo rb 64
+gfl rb 64
+colp rb 64
+coll rb 64
 typebuf rb 32
 projbuf rb 32
 titlebuf rb 128
 stbuf rb 16
 pribuf rb 16
-qbuf rb 64
-relbuf rb 64
+qbuf rb 128
+relbuf rb 128
 
 ; ---- trailing BSS: all large zero-initialised buffers live here, AFTER
 ; the last initialised datum, so FASM emits them as NOBITS instead of
@@ -11420,7 +12928,8 @@ dbdirb rb 1088
 jpath rb 1104
 jbuf rb 4096
 cdata rb 65536
-utab rb 196608
+utab rb 8388608
+uqueue rb 1114112
 sbuf rb 2048
 pagebuf rb 4096
 leafbuf rb 4096
@@ -11430,9 +12939,11 @@ recbuf rb 2048
 sizetab rb 8192
 offstab rb 8192
 childtab rb 524288
+chsave rb 524288
+rnpsave rb 4096
 mbody rb 4096
 taskbuf rb 1024
 obsbuf rb 1024
-fseen rb 8320
+fseen rb 16512
 tseetab rb 4096
 thslots rb 137216
