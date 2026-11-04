@@ -111,6 +111,7 @@ read_loop:
     mov qword [linelen], 0
     call handle_line
 quit0:
+    call use_flush_exit         ; persist learned prefs on clean shutdown
     mov eax, 60
     xor edi, edi
     syscall
@@ -2302,7 +2303,7 @@ cache_flush:
     pop rax
     ret
 
-; Usage table: 256 slots of (key, hits). key = rowid | kind<<56.
+; Usage table: 8192 slots of (key, hits, flushed). key = rowid | kind<<56.
 ; Saturating hits, min-evict on full. Powers usage-ranked search.
 ; Both preserve rbx,rbp,r12-r15; clobber rax,rcx,rdx,rsi,rdi,r8-r11.
 use_bump:
@@ -2311,6 +2312,7 @@ use_bump:
     push rdx
     push r8
     push r9
+    mov qword [udirty], 1
     mov rbx, rsi
     mov rcx, rdi
     shl rcx, 56
@@ -2318,7 +2320,7 @@ use_bump:
     mov rax, rsi
     imul rax, rax, 1597334677
     add rax, rdi
-    and eax, 255
+    and eax, 8191
     mov r8d, eax
     xor r9d, r9d
     mov r10, -1                  ; evict ptr
@@ -2327,8 +2329,8 @@ ub_probe:
     cmp r9, 16
     jae ub_evict
     mov rax, r8
-    and eax, 255
-    shl rax, 4
+    and eax, 8191
+    imul rax, rax, 24
     lea rdx, [utab]
     add rdx, rax
     mov rax, [rdx]
@@ -2360,6 +2362,7 @@ ub_done:
 ub_insert:
     mov [rdx], rbx
     mov qword [rdx + 8], 1
+    mov qword [rdx + 16], 0
     pop r9
     pop r8
     pop rdx
@@ -2370,6 +2373,7 @@ ub_evict:
     mov rdx, r10
     mov [rdx], rbx
     mov qword [rdx + 8], 1
+    mov qword [rdx + 16], 0
     pop r9
     pop r8
     pop rdx
@@ -2391,15 +2395,15 @@ use_get:
     mov rax, rsi
     imul rax, rax, 1597334677
     add rax, rdi
-    and eax, 255
+    and eax, 8191
     mov r8d, eax
     xor r9d, r9d
 ug_probe:
     cmp r9, 16
     jae ug_miss
     mov rax, r8
-    and eax, 255
-    shl rax, 4
+    and eax, 8191
+    imul rax, rax, 24
     lea rdx, [utab]
     add rdx, rax
     mov rax, [rdx]
@@ -2425,6 +2429,357 @@ ug_miss:
     pop rcx
     pop rbx
     xor eax, eax
+    ret
+
+; use_setmax(rdi=key, rsi=hits): load-time insert-or-keep-max (marks in sync).
+; Same register contract as use_bump.
+use_setmax:
+    push rbx
+    push rcx
+    push rdx
+    push r8
+    push r9
+    mov rbx, rdi                ; composite key
+    mov rcx, rdi
+    shr rcx, 56                 ; kind
+    shl rdi, 8
+    shr rdi, 8                  ; rowid
+    mov rax, rdi
+    imul rax, rax, 1597334677
+    add rax, rcx                ; same hash as bump/get
+    and eax, 8191
+    mov r8d, eax
+    xor r9d, r9d
+    mov r10, -1
+    mov r11, -1
+usm_probe:
+    cmp r9, 16
+    jae usm_evict
+    mov rax, r8
+    and eax, 8191
+    imul rax, rax, 24
+    lea rdx, [utab]
+    add rdx, rax
+    mov rax, [rdx]
+    test rax, rax
+    jz usm_store
+    cmp rax, rbx
+    je usm_hit
+    mov rax, [rdx + 8]
+    cmp rax, r11
+    jae usm_next
+    mov r11, rax
+    mov r10, rdx
+usm_next:
+    inc r8
+    inc r9
+    jmp usm_probe
+usm_hit:
+    cmp rsi, [rdx + 8]
+    jbe usm_done
+    mov [rdx + 8], rsi
+    mov [rdx + 16], rsi
+usm_done:
+    pop r9
+    pop r8
+    pop rdx
+    pop rcx
+    pop rbx
+    ret
+usm_store:
+    mov [rdx], rbx
+    mov [rdx + 8], rsi
+    mov [rdx + 16], rsi
+    pop r9
+    pop r8
+    pop rdx
+    pop rcx
+    pop rbx
+    ret
+usm_evict:
+    mov rdx, r10
+    mov [rdx], rbx
+    mov [rdx + 8], rsi
+    mov [rdx + 16], rsi
+    pop r9
+    pop r8
+    pop rdx
+    pop rcx
+    pop rbx
+    ret
+
+; use_load: one-time load of usage rows into utab (insert-or-max). Db must be
+; open+locked with tables ensured. Best effort, always returns 0.
+use_load:
+    cmp qword [uloaded], 0
+    jne ul_isdone
+    push rbx
+    push r12
+    push r13
+    push r14
+    mov rdi, [f_root_use]
+    call walk_leaves
+    test rax, rax
+    jnz ul_fin
+    xor r14d, r14d
+ul_page:
+    cmp r14, [childn]
+    jae ul_fin
+    lea rsi, [childtab]
+    mov rax, r14
+    shl rax, 3
+    add rsi, rax
+    mov rdi, [rsi]
+    lea rsi, [pagebuf]
+    call pg_read_nc
+    test rax, rax
+    jnz ul_next
+    cmp byte [pagebuf], 0x0D
+    jne ul_next
+    lea rsi, [pagebuf + 3]
+    call be16_ld
+    mov rbx, rax
+    xor r13d, r13d
+ul_cell:
+    cmp r13, rbx
+    jae ul_next
+    lea rsi, [pagebuf + 8]
+    mov rax, r13
+    shl rax, 1
+    add rsi, rax
+    call be16_ld
+    lea rsi, [pagebuf]
+    add rsi, rax
+    call parse_row
+    test rax, rax
+    jnz ul_incc
+    cmp qword [gcols], 2
+    jb ul_incc
+    mov rsi, qword [gfo]
+    mov rdx, qword [gfl]
+    call dec_parse
+    test rax, rax
+    jnz ul_incc
+    test rdx, rdx
+    jz ul_incc
+    mov [ulkey], rdx
+    mov rsi, qword [gfo + 8]
+    mov rdx, qword [gfl + 8]
+    call dec_parse
+    test rax, rax
+    jnz ul_incc
+    mov [ulhits], rdx
+    mov rdi, [ulkey]
+    mov rsi, [ulhits]
+    call use_setmax
+ul_incc:
+    inc r13
+    jmp ul_cell
+ul_next:
+    inc r14
+    jmp ul_page
+ul_fin:
+    mov qword [uloaded], 1
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+ul_isdone:
+    xor eax, eax
+    ret
+
+; use_flush: persist changed slots as new usage rows (rewrite-the-slot on next
+; load via latest/max rule). Db must be open+locked. Saves/restores op state.
+; rax 0 ok / 1 err. Best effort: callers ignore status.
+use_flush:
+    mov rax, [newrowid]
+    mov qword [svstate], rax
+    mov rax, [maxrowid]
+    mov qword [svstate + 8], rax
+    mov rax, [splitroot]
+    mov qword [svstate + 16], rax
+    mov rax, [ncols]
+    mov qword [svstate + 24], rax
+    lea rsi, [colp]
+    lea rdi, [svstate + 32]
+    mov ecx, 6
+    rep movsq
+    lea rsi, [coll]
+    lea rdi, [svstate + 80]
+    mov ecx, 6
+    rep movsq
+    lea rsi, [gfo]
+    lea rdi, [svstate + 128]
+    mov ecx, 6
+    rep movsq
+    lea rsi, [gfl]
+    lea rdi, [svstate + 176]
+    mov ecx, 6
+    rep movsq
+    mov rdi, [f_root_use]
+    call scan_max
+    test rax, rax
+    jnz uf_abort
+    mov qword [sidx], 0
+uf_slot:
+    mov rax, [sidx]
+    cmp rax, 8192
+    jae uf_done
+    imul rax, rax, 24
+    lea rdx, [utab]
+    add rdx, rax
+    mov rcx, [rdx]
+    test rcx, rcx
+    jz uf_next
+    mov rax, [rdx + 8]
+    cmp rax, [rdx + 16]
+    je uf_next
+    mov [ulkey], rcx
+    mov [ulhits], rax
+    mov rax, [ulkey]
+    lea rdi, [ukeybuf]
+    call u64_dec
+    lea rax, [ukeybuf]
+    mov qword [colp], rax
+    mov qword [coll], rdx
+    mov rax, [ulhits]
+    lea rdi, [uhitbuf]
+    call u64_dec
+    lea rax, [uhitbuf]
+    mov qword [colp + 8], rax
+    mov qword [coll + 8], rdx
+    mov qword [ncols], 2
+    mov rax, [maxrowid]
+    inc rax
+    mov [newrowid], rax
+    mov [maxrowid], rax
+    call build_record_text
+    mov rax, [f_root_use]
+    mov [splitroot], rax
+    call place_cell
+    test rax, rax
+    jnz uf_abort
+    mov rax, [sidx]
+    imul rax, rax, 24
+    lea rdx, [utab]
+    add rdx, rax
+    mov rcx, [ulhits]
+    mov [rdx + 16], rcx
+uf_next:
+    inc qword [sidx]
+    jmp uf_slot
+uf_done:
+    call hdr_touch
+    test rax, rax
+    jnz uf_abort
+    mov qword [udirty], 0
+    push rax
+    jmp uf_restore
+uf_abort:
+    push rax
+    mov rax, 1
+    mov [rsp], rax
+uf_restore:
+    lea rsi, [svstate + 176]
+    lea rdi, [gfl]
+    mov ecx, 6
+    rep movsq
+    lea rsi, [svstate + 128]
+    lea rdi, [gfo]
+    mov ecx, 6
+    rep movsq
+    lea rsi, [svstate + 80]
+    lea rdi, [coll]
+    mov ecx, 6
+    rep movsq
+    lea rsi, [svstate + 32]
+    lea rdi, [colp]
+    mov ecx, 6
+    rep movsq
+    mov rax, qword [svstate + 24]
+    mov [ncols], rax
+    mov rax, qword [svstate + 16]
+    mov [splitroot], rax
+    mov rax, qword [svstate + 8]
+    mov [maxrowid], rax
+    mov rax, qword [svstate]
+    mov [newrowid], rax
+    pop rax
+    ret
+
+; use_flush_exit: best-effort persist at clean process exit.
+use_flush_exit:
+    cmp qword [udirty], 0
+    je ufe_ret
+    call db_open
+    test rax, rax
+    jnz ufe_ret
+    call use_flush
+    call db_close
+ufe_ret:
+    ret
+
+; u64_dec(rax=value, rdi=dst): decimal, no sign. rdx=len. Clobbers rax,rcx,rdx.
+u64_dec:
+    push rbx
+    push r8
+    lea rbx, [udec + 24]
+    mov r8, rdi
+    mov rcx, 10
+    test rax, rax
+    jnz ud_loop
+    mov byte [rdi], '0'
+    mov edx, 1
+    pop r8
+    pop rbx
+    ret
+ud_loop:
+    xor edx, edx
+    div rcx
+    add dl, '0'
+    dec rbx
+    mov [rbx], dl
+    test rax, rax
+    jnz ud_loop
+    lea rax, [udec + 24]
+    sub rax, rbx
+    mov rdx, rax                ; len
+    mov rsi, rbx
+    mov rdi, r8
+    mov rcx, rdx
+    rep movsb
+    pop r8
+    pop rbx
+    ret
+
+; dec_parse(rsi=ptr, rdx=len): rdx=value, rax 0 ok / 1 bad. Nonneg, <=2^63-1.
+dec_parse:
+    test rdx, rdx
+    jz dp_bad
+    cmp rdx, 19
+    ja dp_bad
+    xor eax, eax                ; value in rax
+dp_loop:
+    test rdx, rdx
+    jz dp_ok
+    movzx ecx, byte [rsi]
+    sub cl, '0'
+    cmp cl, 9
+    ja dp_bad
+    movzx ecx, cl
+    imul rax, rax, 10
+    jb dp_bad
+    add rax, rcx
+    jb dp_bad
+    inc rsi
+    dec rdx
+    jmp dp_loop
+dp_ok:
+    mov rdx, rax
+    xor eax, eax
+    ret
+dp_bad:
+    mov eax, 1
     ret
 
 ; pg_read_nc(rdi=pgno, rsi=buf): probe, else pread. No fill (scan paths).
@@ -3010,6 +3365,7 @@ do_ensure:
     call scan_max                ; conclusions max rowid
     test rax, rax
     jnz do_closeerr
+    call use_load               ; learned prefs, once per process (self-guarded)
 do_cached:
     xor eax, eax
     ret
@@ -3028,6 +3384,10 @@ db_close:
     push rax
     cmp qword [jactive], 0
     je dc_nojourn               ; read-only: disk untouched, skip fsync
+    cmp qword [udirty], 0
+    je dc_noflush
+    call use_flush              ; piggyback learned prefs into this txn; best effort
+dc_noflush:
     mov eax, 74
     mov rdi, [dbfd]
     syscall
@@ -4572,6 +4932,28 @@ et_ta:
 et_tf:
     mov [f_root_tasks], rax
 et_ok:
+    ; usage (learned preferences; latest rowid wins per key)
+    lea rsi, [t_use_n]
+    mov edx, 5
+    call find_table
+    test rax, rax
+    js et_err
+    jnz et_uf
+    lea rax, [t_use_n]
+    mov [m_name], rax
+    mov qword [m_namelen], 5
+    lea rax, [t_use_sql]
+    mov [m_sql], rax
+    mov rax, t_use_sqllen
+    mov [m_sqllen], rax
+    call et_mk
+    test rax, rax
+    jz et_err
+    mov [f_root_use], rax
+    jmp et_uok
+et_uf:
+    mov [f_root_use], rax
+et_uok:
     xor eax, eax
     ret
 et_err:
@@ -8731,6 +9113,9 @@ t_rel_sqllen = $ - t_rel_sql - 1
 t_task_n db 'tasks', 0
 t_task_sql db 'CREATE TABLE tasks(title TEXT, body TEXT, status TEXT, project TEXT, priority TEXT)', 0
 t_task_sqllen = $ - t_task_sql - 1
+t_use_n db 'usage', 0
+t_use_sql db 'CREATE TABLE usage(ukey TEXT, hits TEXT)', 0
+t_use_sqllen = $ - t_use_sql - 1
 
 dbmagic db 'SQLite format 3', 0
 dbsql db 'CREATE TABLE conclusions(reason TEXT, thought TEXT, conclusion TEXT, valid INTEGER)', 0
@@ -8916,6 +9301,10 @@ stcoff dq 0
 scurpg dq 0
 sidx dq 0
 nemit dq 0
+udirty dq 0
+uloaded dq 0
+ulkey dq 0
+ulhits dq 0
 sroot dq 0
 smode dq 0
 scount dq 0
@@ -8974,6 +9363,7 @@ f_root_ent dq 0
 f_root_obs dq 0
 f_root_rel dq 0
 f_root_tasks dq 0
+f_root_use dq 0
 hfirst db 0
 v_num dq 0
 v_total dq 0
@@ -9006,9 +9396,13 @@ jbuf rb 4096
 jbuf2 rb 8
 jpages rb 256
 cdata rb 65536
-utab rb 4096
+utab rb 196608
 sbuf rb 2048
 sbtmp rb 32
+ukeybuf rb 24
+uhitbuf rb 24
+udec rb 24
+svstate rb 224
 pagebuf rb 4096
 leafbuf rb 4096
 ipage rb 4096

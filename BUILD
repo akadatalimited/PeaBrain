@@ -3,7 +3,7 @@ tinythink - thinking + memory MCP server in pure x86-64 assembly
 
 Sequential-thinking mimic plus a conclusion tool and a small memory
 core, backed by a real SQLite database written in pure asm (no includes,
-no libc). One ~41K statically-linked Linux binary.
+no libc). One ~42K statically-linked Linux binary.
 
 Needs: fasm (flat assembler) 1.73+, Linux x86-64 with x86-64-v3
 microarchitecture (AVX/AVX2/FMA/BMI1/BMI2/LZCNT; check
@@ -102,11 +102,20 @@ ino/size/mtime, write-through, flushed on mismatch):
   throughput unchanged (writes stay fsync-bound by design).
 
 Learning: usage-ranked search_nodes. Direct reads (read_fact) and
-surfaced results bump per-row use counts (256-slot table, saturating,
+surfaced results bump per-row use counts (8192-slot table, saturating,
 min-evict). Searches collect up to 64 hits, stable-sort by score
 descending (ties keep walk order, so cold behavior is unchanged), and
 emit the top of the slim budget. Verified: alpha_one/two/three walk
 order before use, alpha_three first after 10 reads.
+
+Persistence: learned scores live in a real SQLite `usage(ukey, hits)`
+table (upsert semantics: one live row per key, latest/max wins on
+load). In-RAM slots carry a flushed watermark, so only changed slots
+are rewritten — steady state appends nothing. Saved on clean process
+exit and piggybacked onto write-txn commits (reads never pay fsync);
+loaded once per process at first open. Verified: train 10 reads,
+exit, fresh process ranks alpha_three first. Crash loses at most the
+unflushed delta (safe degradation to cold ranking).
 
 Value cap: no single TEXT value over 1024 bytes (fact bodies included).
 Max cell ~1.2KB < page/3, so both split halves always fit; oversize
