@@ -3,7 +3,7 @@ tinythink - thinking + memory MCP server in pure x86-64 assembly
 
 Sequential-thinking mimic plus a conclusion tool and a small memory
 core, backed by a real SQLite database written in pure asm (no includes,
-no libc). One ~43K statically-linked Linux binary.
+no libc). One ~44K statically-linked Linux binary.
 
 Needs: fasm (flat assembler) 1.73+, Linux x86-64 with x86-64-v3
 microarchitecture (AVX/AVX2/FMA/BMI1/BMI2/LZCNT; check
@@ -85,9 +85,13 @@ SQLite subset (genuine on-disk format: pragma integrity_check passes,
 opens in real sqlite3, bidirectional, old DBs gain new tables on open):
 page size 4096, UTF-8, sqlite_master + data tables, rowid leaf pages,
 size-ordered leaf splits, root interior on first split, dead space on
-  the freelist, whole-db flock, fsync per write txn. No overflow pages;
-  rollback journal (TJRR) with recovery + truncate on open, commit
-  (fsync, unlink, dirsync) on close. Read-only txns skip fsync entirely.
+the freelist, whole-db flock, fsync per write txn. No overflow pages;
+rollback journal (TJRR) with recovery + truncate on open, commit
+(fsync, unlink, dirsync) on close. Read-only txns skip fsync entirely.
+Master rootpage uses minimal width (int8 to 127 pages, int16 to 32767;
+read side always supported both). A corrupt master row for the
+engine-owned usage table is dropped and recreated on open (validated
+by root range); user tables are never auto-repaired.
 
   Multi-access (no WAL file; lock modes instead): reads take LOCK_SH
   and run fully concurrently; writes take LOCK_EX. A reader escalates

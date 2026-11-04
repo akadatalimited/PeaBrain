@@ -3756,7 +3756,9 @@ dbc_err:
 build_master_cell:
     push rbx
     mov rax, [m_rootpg]
-    cmp rax, 127
+    test rax, rax
+    jz bmc_err
+    cmp rax, 32767              ; int16 cap (128MB db); wider needs serial 4
     ja bmc_err
     lea rdi, [recscratch]
     mov rax, 23                  ; 'table'
@@ -3774,11 +3776,22 @@ build_master_cell:
     add rdi, [slen]
     call varint_put
     add [slen], rcx
+    mov rax, [m_rootpg]
+    cmp rax, 127
+    ja bmc_r16
     mov rax, 1                   ; rootpage int8
     lea rdi, [recscratch]
     add rdi, [slen]
     call varint_put
     add [slen], rcx
+    jmp bmc_rdone
+bmc_r16:
+    mov rax, 2                   ; rootpage int16
+    lea rdi, [recscratch]
+    add rdi, [slen]
+    call varint_put
+    add [slen], rcx
+bmc_rdone:
     mov rax, [m_sqllen]
     lea rax, [rax + rax + 13]    ; sql serial
     lea rdi, [recscratch]
@@ -3806,9 +3819,17 @@ build_master_cell:
     mov rcx, [m_namelen]
     add [reclen], rcx
     rep movsb
-    mov rax, [m_rootpg]         ; rootpage byte
+    mov rax, [m_rootpg]         ; rootpage value, minimal width
+    cmp rax, 127
+    ja bmc_w16
     stosb
     inc qword [reclen]
+    jmp bmc_wdone
+bmc_w16:
+    call be16_st
+    add rdi, 2                  ; be16_st does not advance rdi (stosb does)
+    add qword [reclen], 2
+bmc_wdone:
     mov rsi, [m_sql]
     mov rcx, [m_sqllen]
     add [reclen], rcx
@@ -4309,7 +4330,193 @@ mp_err:
     mov eax, 1
     ret
 
-; split_leaf: pagebuf=P full leaf, [curpg]=P, new cell in celltmp.
+; master_drop(rsi=name, rdx=len): remove a master cell by name (repair path
+; for corrupt rows, e.g. pre-width-fix usage entries). rax 0 ok (found and
+; removed, or not present), 1 io. Preserves rbx,rbp,r12-r15.
+master_drop:
+    push rbx
+    push r12
+    push r13
+    push r14
+    mov [ftname], rsi
+    mov [ftlen], rdx
+    mov edi, 1
+    lea rsi, [pagebuf]
+    call pg_read
+    test rax, rax
+    jnz md_err
+    cmp byte [pagebuf + 100], 0x0D
+    jne md_err
+    lea rsi, [pagebuf + 103]
+    call be16_ld
+    mov rbx, rax                ; n
+    xor r12d, r12d              ; i
+md_cell:
+    cmp r12, rbx
+    jae md_ok                   ; not present: nothing to do
+    lea rsi, [pagebuf + 108]
+    mov rax, r12
+    shl rax, 1
+    add rsi, rax
+    call be16_ld                ; coff
+    mov r14, rax
+    lea rsi, [pagebuf]
+    add rsi, rax
+    lea rdx, [pagebuf + 4096]
+    call varint_get             ; plen
+    test rcx, rcx
+    jz md_err
+    mov [ts1], rax              ; stash plen
+    mov rsi, rcx
+    call varint_get             ; rowid
+    test rcx, rcx
+    jz md_err
+    mov [ts2], rcx              ; stash after-rowid ptr for L
+    mov rsi, rcx
+    call varint_get             ; hdrsize
+    test rcx, rcx
+    jz md_err
+    mov rsi, rcx
+    call varint_get             ; s0
+    test rcx, rcx
+    jz md_err
+    cmp rax, 13                 ; s0 must be odd TEXT here
+    jb md_next
+    test al, 1
+    jz md_next
+    sub rax, 13
+    shr rax, 1
+    mov r13, rax                ; len0
+    mov rsi, rcx
+    call varint_get             ; s1 (name serial)
+    test rcx, rcx
+    jz md_err
+    mov r10, rcx                ; after-s1 ptr
+    cmp rax, 13
+    jb md_next
+    test al, 1
+    jz md_next
+    sub rax, 13
+    shr rax, 1                  ; len1
+    cmp rax, [ftlen]
+    jne md_next
+    mov rsi, rcx
+    call varint_get             ; s2
+    test rcx, rcx
+    jz md_err
+    mov rsi, rcx
+    call varint_get             ; s3
+    test rcx, rcx
+    jz md_err
+    mov rsi, rcx
+    call varint_get             ; s4
+    test rcx, rcx
+    jz md_err
+    mov r11, rcx                ; body
+    add r11, r13                ; col1 = body + len0
+    mov rsi, r11
+    mov rdi, [ftname]
+    mov rcx, [ftlen]
+    rep cmpsb
+    jne md_next
+md_found:
+    ; L = (after-rowid - cellstart) + plen
+    lea rax, [pagebuf]
+    add rax, r14                ; cell start abs
+    mov rcx, [ts2]              ; after-rowid abs
+    sub rcx, rax
+    add rcx, [ts1]              ; + plen
+    mov [ts3], rcx              ; L
+    ; content pointer
+    lea rsi, [pagebuf + 105]
+    call be16_ld
+    mov r13, rax                ; content
+    ; memmove [content, coff) -> [content+L, coff+L), backward
+    mov rcx, r14
+    sub rcx, r13                ; len (0 ok: rep nop)
+    lea rsi, [pagebuf]
+    add rsi, r14
+    dec rsi
+    lea rdi, [pagebuf]
+    add rdi, r14
+    add rdi, [ts3]
+    dec rdi
+    std
+    rep movsb
+    cld
+    ; fix ptrs below coff (skip i)
+    mov r10, r12                ; i
+    xor r11d, r11d              ; j
+md_fix:
+    cmp r11, rbx
+    jae md_fixdone
+    cmp r11, r10
+    je md_fixnext
+    lea rsi, [pagebuf + 108]
+    mov rax, r11
+    shl rax, 1
+    add rsi, rax
+    call be16_ld
+    cmp rax, r14
+    jae md_fixnext
+    add rax, [ts3]
+    mov rdi, rsi
+    call be16_st
+md_fixnext:
+    inc r11
+    jmp md_fix
+md_fixdone:
+    ; drop ptr[i]: shift tail down 2
+    lea rsi, [pagebuf + 108]
+    mov rax, r10
+    shl rax, 1
+    add rsi, rax
+    add rsi, 2                  ; src = &ptr[i+1]
+    mov rdi, rsi
+    sub rdi, 2                  ; dst = &ptr[i]
+    mov rcx, rbx
+    sub rcx, r10
+    dec rcx
+    shl rcx, 1
+    jz md_noarr
+    rep movsb
+md_noarr:
+    lea rsi, [pagebuf + 103]
+    call be16_ld
+    dec rax
+    lea rdi, [pagebuf + 103]
+    call be16_st
+    lea rsi, [pagebuf + 105]
+    call be16_ld
+    add rax, [ts3]
+    lea rdi, [pagebuf + 105]
+    call be16_st
+    mov edi, 1
+    lea rsi, [pagebuf]
+    call pg_write
+    test rax, rax
+    jnz md_err
+    jmp md_ok
+md_next:
+    inc r12
+    jmp md_cell
+md_err:
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    mov eax, 1
+    ret
+md_ok:
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    xor eax, eax
+    ret
+    ; match: remove cell [coff, coff+L), L = (after-rowid - coff) + plen.
+    ; r14 = coff. recompute end: after-rowid ptr = (s1-after ptr) - (s1 varint len)...
+    jmp md_found
 ; Size-ordered division; new cell (max rowid) always lands in the right page.
 ; rax 0 ok / 1 io / 2 full.
 split_leaf:
@@ -4908,7 +5115,6 @@ ft_err:
 et_mk:
     mov rax, [dbpages]
     inc rax
-    mov [dbpages], rax
     mov [et_root], rax
     lea rdi, [leafbuf]
     mov ecx, 4096
@@ -4922,6 +5128,8 @@ et_mk:
     call pg_write
     test rax, rax
     jnz etm_err
+    mov rax, [et_root]        ; adopt now: leaf exists; jorig kept original
+    mov [dbpages], rax
     mov rax, [mmaxrowid]
     inc rax
     mov [mmaxrowid], rax
@@ -5067,7 +5275,20 @@ et_ok:
     call find_table
     test rax, rax
     js et_err
-    jnz et_uf
+    jz et_mk_use
+    cmp rax, 1                  ; found: root must be sane, else repair
+    jb et_repair                ; (pre-width-fix rows decode wild)
+    cmp rax, [dbpages]
+    ja et_repair
+    mov [f_root_use], rax
+    jmp et_uok
+et_repair:
+    lea rsi, [t_use_n]
+    mov edx, 5
+    call master_drop            ; drop the corrupt row; recreate below
+    test rax, rax
+    jnz et_err
+et_mk_use:
     lea rax, [t_use_n]
     mov [m_name], rax
     mov qword [m_namelen], 5
@@ -5080,8 +5301,6 @@ et_ok:
     jz et_err
     mov [f_root_use], rax
     jmp et_uok
-et_uf:
-    mov [f_root_use], rax
 et_uok:
     xor eax, eax
     ret
