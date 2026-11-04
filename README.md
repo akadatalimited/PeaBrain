@@ -56,9 +56,21 @@ fasm tinythink.asm /tmp/tt0 && mv /tmp/tt0 tinythink
 
 ## Run
 
+The repo ships the built application as `tinythink` — no build needed,
+no dependencies (not even libc). It runs on any Linux x86-64 machine
+with an x86-64-v3 CPU (AVX/AVX2/FMA/BMI1/BMI2/LZCNT; anything from ~2013
+onward — it refuses with a clear error otherwise):
+
+```sh
+chmod +x tinythink
+./tinythink   # speaks MCP stdio JSON-RPC; Ctrl-D / stdin close to stop
+```
+
 `tinythink` is an MCP stdio server: newline-delimited JSON-RPC on
-stdin/stdout. The database lives **next to the executable**, so each copy
-of the binary is a separate store. Minimal client config (opencode):
+stdin/stdout. The database (`tinythink.db`) is created **next to the
+executable** on first write, so each copy of the binary is a separate
+store — copy it somewhere else for a scratch database. Minimal client
+config (opencode):
 
 ```json
 { "mcp": { "tinythink": {
@@ -117,9 +129,12 @@ via the journal, leaves no journal behind, and verifies clean
 
 ## Repository
 
+- `tinythink` — the built application, committed so anyone can run it
+  immediately (rebuilt from `tinythink.asm` byte-identically; see Build).
 - `tinythink.asm` — the entire server (~11.5k lines, no includes).
 - `BUILD` — build notes, tool/capacity/security documentation.
-- Binaries and `*.db` files are intentionally untracked.
+- Databases (`tinythink.db*`) and backups (`*.bak-*`) are untracked by
+  design (see `.gitignore`) — your memory stays yours.
 
 ## Binary layout (for the curious)
 
