@@ -1635,6 +1635,42 @@ do_call:
     call cmp_name
     test rax, rax
     jnz op_explain
+    lea rsi, [toolbuf]
+    mov rdx, [toollen]
+    lea rdi, [t_modinit]
+    call cmp_name
+    test rax, rax
+    jnz op_modinit
+    lea rsi, [toolbuf]
+    mov rdx, [toollen]
+    lea rdi, [t_modtrain]
+    call cmp_name
+    test rax, rax
+    jnz op_modtrain
+    lea rsi, [toolbuf]
+    mov rdx, [toollen]
+    lea rdi, [t_modpredict]
+    call cmp_name
+    test rax, rax
+    jnz op_modpredict
+    lea rsi, [toolbuf]
+    mov rdx, [toollen]
+    lea rdi, [t_modsave]
+    call cmp_name
+    test rax, rax
+    jnz op_modsave
+    lea rsi, [toolbuf]
+    mov rdx, [toollen]
+    lea rdi, [t_modload]
+    call cmp_name
+    test rax, rax
+    jnz op_modload
+    lea rsi, [toolbuf]
+    mov rdx, [toollen]
+    lea rdi, [t_modstatus]
+    call cmp_name
+    test rax, rax
+    jnz op_modstatus
     lea rdi, [c_params]
     lea rsi, [m_notool]
     jmp err_id
@@ -12407,6 +12443,9 @@ ot_inner_end:
     call out_byte
     jmp emit
 
+; PeaBrain on-board model (Stages 1-3 proven). Code lives in the model dir.
+include 'model/md_code.asm'
+
 segment gnustack
 
 segment readable writeable
@@ -12495,6 +12534,18 @@ k_entity db '"entity"', 0
 k_prefix db '"prefix"', 0
 k_signal db '"signal"', 0
 k_kind db '"kind"', 0
+k_path db '"path"', 0
+k_x db '"x"', 0
+k_y db '"y"', 0
+k_target db '"target"', 0
+k_xs db '"xs"', 0
+k_ys db '"ys"', 0
+k_targets db '"targets"', 0
+k_steps db '"steps"', 0
+k_lr db '"lr"', 0
+k_hidden db '"hidden"', 0
+k_seed db '"seed"', 0
+k_activation db '"activation"', 0
 v_useful db 'useful', 0
 v_mislead db 'misleading', 0
 v_fact db 'fact', 0
@@ -12529,6 +12580,12 @@ t_versions db 'read_fact_versions', 0
 t_health db 'health', 0
 t_feedback db 'feedback', 0
 t_explain db 'explain_rank', 0
+t_modinit db 'model_init', 0
+t_modtrain db 'model_train', 0
+t_modpredict db 'model_predict', 0
+t_modsave db 'model_save', 0
+t_modload db 'model_load', 0
+t_modstatus db 'model_status', 0
 
 c_parse db '-32700', 0
 c_invalid db '-32600', 0
@@ -12748,11 +12805,36 @@ r_toolsarr db '[{"name":"sequential_thinking"'
        db ',"inputSchema":{"type":"object","properties":{"name":{"type":"string"}'
        db ',"signal":{"type":"string"},"kind":{"type":"string"}}}'
        db ',"required":["name","signal"]}'
-       db ',{"name":"explain_rank"'
-       db ',"description":"Why a memory ranks as it does: signals, score, weights."'
-       db ',"inputSchema":{"type":"object","properties":{"name":{"type":"string"}'
-       db ',"kind":{"type":"string"}}}'
-       db ',"required":["name"]}]', 0
+        db ',{"name":"explain_rank"'
+        db ',"description":"Why a memory ranks as it does: signals, score, weights."'
+        db ',"inputSchema":{"type":"object","properties":{"name":{"type":"string"}'
+        db ',"kind":{"type":"string"}}}'
+        db ',"required":["name"]}'
+        db ',{"name":"model_init"'
+        db ',"description":"Initialise the on-board trainable model (2->H->1 leaky MLP, FP32, AVX2/FMA)."'
+        db ',"inputSchema":{"type":"object","properties":{"hidden":{"type":"number"}'
+        db ',"seed":{"type":"number"},"activation":{"type":"string"}}}}'
+        db ',{"name":"model_train"'
+        db ',"description":"Train the on-board model on examples (full-batch SGD+momentum, deterministic)."'
+        db ',"inputSchema":{"type":"object","properties":{"xs":{"type":"array","items":{"type":"number"}}'
+        db ',"ys":{"type":"array","items":{"type":"number"}}'
+        db ',"targets":{"type":"array","items":{"type":"number"}}'
+        db ',"lr":{"type":"number"},"steps":{"type":"number"}}}'
+        db ',"required":["xs","ys","targets"]}'
+        db ',{"name":"model_predict"'
+        db ',"description":"Predict with the on-board model (FP32 forward)."'
+        db ',"inputSchema":{"type":"object","properties":{"xs":{"type":"array","items":{"type":"number"}}'
+        db ',"ys":{"type":"array","items":{"type":"number"}}}}'
+        db ',"required":["xs","ys"]}'
+        db ',{"name":"model_save"'
+        db ',"description":"Save model weights, biases, optimiser state and step (crash-safe PBMD)."'
+        db ',"inputSchema":{"type":"object","properties":{"path":{"type":"string"}}}}'
+        db ',{"name":"model_load"'
+        db ',"description":"Load a model checkpoint (validated; bad files rejected, current kept)."'
+        db ',"inputSchema":{"type":"object","properties":{"path":{"type":"string"}}}}'
+        db ',{"name":"model_status"'
+        db ',"description":"Model dimensions, steps, loss, memory, compute backend."'
+        db ',"inputSchema":{"type":"object","properties":{}}}]', 0
 
 lp dq 0
 ll dq 0
@@ -12963,6 +13045,8 @@ dbstat rb 144
 dstack rb 128
 ddepth dq 0
 ppg dq 0
+; PeaBrain on-board model consts (initialized, before trailing BSS).
+include 'model/md_consts.asm'
 sob rb 128
 ktab rb 768
 stab rb 64
@@ -13014,3 +13098,6 @@ obsbuf rb 1024
 fseen rb 16512
 tseetab rb 4096
 thslots rb 137216
+
+; PeaBrain on-board model data (consts, then ALL rb trailing: NOBITS).
+include 'model/md_data.asm'

@@ -9,13 +9,15 @@ PeaBrain.)
 
 ## Features
 
-- **21 MCP tools**: `sequential_thinking`, `thought_history`, `thought_reset`,
+- **27 MCP tools**: `sequential_thinking`, `thought_history`, `thought_reset`,
   `conclusion`, `write_fact`, `read_fact`, `list_facts`, `read_fact_versions`,
   `delete_fact`, `delete_fact_prefix`, `create_entities`, `add_observations`,
   `create_relations`, `search_nodes`, `open_nodes`, `create_task_or_note`,
   `query_tasks`, `update_task`, `health`, plus `feedback` (teach ranking:
-  useful/misleading, durable on return) and `explain_rank` (why a memory
-  scores as it does: signals, score, weights).
+  useful/misleading, durable on return), `explain_rank` (why a memory
+  scores as it does: signals, score, weights), and six model tools —
+  `model_init`, `model_train`, `model_predict`, `model_save`, `model_load`,
+  `model_status` (a trainable on-board MLP, see below).
 - **Real SQLite format**: 4096-byte pages, UTF-8, rowid leaf pages.
   `pragma integrity_check` passes and the file opens in stock `sqlite3`.
 - **Unbounded growth**: interiors split at any depth (right-edge appends;
@@ -36,6 +38,17 @@ PeaBrain.)
   popularity never asserts truth), persisted across restarts in the
   `usage` table with graceful min-score eviction at capacity; a 16-slot
   LRU page cache serves hot reads (~140x on large files).
+- **It trains**: an on-board FP32 MLP (2 inputs → H≤16 hidden, leaky-ReLU
+  or linear → 1 output), handwritten AVX2/FMA matmul with a scalar
+  reference backend (differential suites assert identical behaviour),
+  SGD with momentum, deterministic seeded init. The model lives in a
+  4 GiB sparse mmap arena (8 fixed regions: weights, biases,
+  velocities); `model_save`/`model_load` use the PBMD v2 checkpoint
+  format (64-byte header, region table, tmp+fsync+atomic-rename;
+  bad files are rejected and the live model survives). INT8/VNNI
+  inference path prototyped in `model/`; GPU rejected after
+  feasibility review (no libcuda in this environment — CPU is the
+  supported backend).
 - **Hardened input**: machine identifiers (`[A-Za-z0-9._@:+#~-]`, 1–128
   chars; no spaces, slashes, or JSON syntax) and ASCII-only text,
   duplicate-key rejection, header-last parsing, `0600` database file
@@ -146,7 +159,11 @@ preserved counts.
 - `tinythink` — the built PeaBrain application, committed so anyone can
   run it immediately (rebuilt from `tinythink.asm` byte-identically;
   see Build).
-- `tinythink.asm` — the entire server (~11.5k lines, no includes).
+- `tinythink.asm` — the server (~11.5k lines) plus model code in
+  `model/md_code.asm` (included into the executable segment),
+  `model/md_consts.asm` / `model/md_data.asm` (initialized data /
+  trailing NOBITS); `model/MODEL` records the arena/matmul/MLP/quant
+  prototypes and the GPU feasibility verdict.
 - `BUILD` — build notes, tool/capacity/security documentation.
 - Databases (`tinythink.db*`) and backups (`*.bak-*`) are untracked by
   design (see `.gitignore`) — your memory stays yours.

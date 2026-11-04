@@ -2,8 +2,8 @@ tinythink - thinking + memory MCP server in pure x86-64 assembly
 ===============================================================
 
 Sequential-thinking mimic plus a conclusion tool and a small memory
-core, backed by a real SQLite database written in pure asm (no includes,
-no libc). One ~49K statically-linked Linux binary.
+core, backed by a real SQLite database written in pure asm (model code
+in model/*.asm includes, no libc). One ~49K statically-linked Linux binary.
 
 Needs: fasm (flat assembler) 1.73+, Linux x86-64 with x86-64-v3
 microarchitecture (AVX/AVX2/FMA/BMI1/BMI2/LZCNT; check
@@ -200,6 +200,26 @@ Measured on i9-13900K, pinned core, interleaved rounds, medians
                                   triggers on adversarial input; typical
                                   text is clean and neutral-or-better)
 Behavioural identity v3 vs scalar verified by differential suites.
+
+Model tools (on-board trainable MLP, 2->H->1, H 1..16, FP32):
+model_init {hidden?, seed?, activation? leaky|linear} (He init,
+bias 0.1, velocities zeroed); model_train {xs,ys,targets,lr,steps}
+(full-batch SGD+momentum 0.9, batch <= 128, MSE loss, magnitude guard
+|v| <= 1e6); model_predict {xs,ys}; model_save/model_load {path?}
+(PBMD v2: 64B header magic/version/arch/count/H/step/payload-bytes/
+table+payload FNV-64 hashes/activation, 8-entry region table, region
+payloads; tmp sibling + fsync + atomic rename + dirsync; staged load
+with rollback, bad files rejected, live model survives); model_status
+(initialized/hidden/step/loss/allocated+mincore-committed/backend/gpu).
+Paths [A-Za-z0-9._/-]{1,256}, no "..", default peabrain.pbmd. Math:
+handwritten AVX2/FMA matmul + scalar reference (USE_SCALAR selects;
+ differential suites assert identity); leaky-ReLU 0.01; LCG-seeded.
+Arena: 4GiB mmap NORESERVE bump allocator, page-aligned, 8 regions max.
+Validated: linear-map loss -> ~1e-5, in-domain unseen error < 0.05,
+save file exactly 840B (64+256+520), reload predictions identical,
+training resumes from checkpoint step. GPU unavailable by review (no
+libcuda; CPU reference is the supported backend). model/ holds the
+stage prototypes (arena/matmul/mlp/quant) and the MODEL verdict note.
 
 Smoke test
 ----------
