@@ -3993,16 +3993,9 @@ oh_nok:
     mov rax, 64
 oh_nok2:
     mov [hlimit], rax
-    lea rax, [outbuf]
+    lea rax, [jsontmp]
     mov [outptr], rax
     call out_reset
-    lea rsi, [j1]
-    call out_cstr
-    lea rsi, [idbuf]
-    mov rdx, [idlen]
-    call out_bytes
-    lea rsi, [jres]
-    call out_cstr
     lea rsi, [jhisthead]
     call out_cstr
     mov rax, [hcount]
@@ -4145,11 +4138,7 @@ oh_tail:
     call out_uint
     mov al, '}'
     call out_byte
-    mov al, '}'               ; close result + root
-    call out_byte
-    mov al, 10
-    call out_byte
-    jmp emit
+    jmp oc_envelope
 
 ; op_reset: {confirm:true} -> clear history.
 op_reset:
@@ -4173,23 +4162,14 @@ op_reset:
     cmp byte [boolval], 1
     jne dc_params
     mov qword [hcount], 0
-    lea rax, [outbuf]
+    lea rax, [jsontmp]
     mov [outptr], rax
     call out_reset
-    lea rsi, [j1]
-    call out_cstr
-    lea rsi, [idbuf]
-    mov rdx, [idlen]
-    call out_bytes
-    lea rsi, [jres]
-    call out_cstr
     lea rsi, [r_resetok]
     call out_cstr
-    mov al, '}'
-    call out_byte
-    mov al, 10
-    call out_byte
-    jmp emit
+    mov rax, [outlen]
+    mov [innerlen], rax
+    jmp oc_envelope
 
 ; ---- memory: facts (append-only versions, latest rowid wins) ----
 ; op_fread {name}
@@ -4525,8 +4505,6 @@ olf_nextpg:
     jmp ofl_page
 olf_tail:
     call db_close
-    lea rsi, [jcontent_end2]
-    call out_cstr
     mov rax, [outlen]
     mov [innerlen], rax
     jmp oc_envelope
@@ -5460,16 +5438,9 @@ os_nolim:
     call db_open
     test rax, rax
     jnz oc_db
-    lea rax, [outbuf]
+    lea rax, [jsontmp]
     mov [outptr], rax
     call out_reset
-    lea rsi, [j1]
-    call out_cstr
-    lea rsi, [idbuf]
-    mov rdx, [idlen]
-    call out_bytes
-    lea rsi, [jres]
-    call out_cstr
     lea rsi, [jn_results]
     call out_cstr
     mov qword [scount], 0
@@ -5497,11 +5468,7 @@ os_nolim:
     call out_byte
     mov al, '}'
     call out_byte
-    mov al, '}'
-    call out_byte
-    mov al, 10
-    call out_byte
-    jmp emit
+    jmp oc_envelope
 os_dbclose:
     call db_close
     lea rdi, [c_internal]
@@ -5532,16 +5499,9 @@ op_open:
     call db_open
     test rax, rax
     jnz oc_db
-    lea rax, [outbuf]
+    lea rax, [jsontmp]
     mov [outptr], rax
     call out_reset
-    lea rsi, [j1]
-    call out_cstr
-    lea rsi, [idbuf]
-    mov rdx, [idlen]
-    call out_bytes
-    lea rsi, [jres]
-    call out_cstr
     lea rsi, [jn_nodes]
     call out_cstr
     mov byte [hfirst], 1
@@ -5831,11 +5791,7 @@ oo_tail:
     call out_byte
     mov al, '}'
     call out_byte
-    mov al, '}'
-    call out_byte
-    mov al, 10
-    call out_byte
-    jmp emit
+    jmp oc_envelope
 oo_many:
     call db_close
     lea rdi, [c_params]
@@ -6151,16 +6107,9 @@ oq_nolim:
     call db_open
     test rax, rax
     jnz oc_db
-    lea rax, [outbuf]
+    lea rax, [jsontmp]
     mov [outptr], rax
     call out_reset
-    lea rsi, [j1]
-    call out_cstr
-    lea rsi, [idbuf]
-    mov rdx, [idlen]
-    call out_bytes
-    lea rsi, [jres]
-    call out_cstr
     lea rsi, [jn_tasks]
     call out_cstr
     mov qword [scount], 0
@@ -6353,11 +6302,7 @@ oq_tail:
     call out_byte
     mov al, '}'
     call out_byte
-    mov al, '}'
-    call out_byte
-    mov al, 10
-    call out_byte
-    jmp emit
+    jmp oc_envelope
 
 ; out_escaped_rawnum(rsi=digits, rdx=len): raw copy (validated digits).
 out_escaped_rawnum:
@@ -7423,7 +7368,7 @@ fvalid db 0
 inbuf rb 4096
 line rb 8192
 outbuf rb 65536
-jsontmp rb 4096
+jsontmp rb 65536
 thtmp rb 2048
 bidtmp rb 40
 methodbuf rb 32
