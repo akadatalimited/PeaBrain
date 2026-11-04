@@ -208,8 +208,11 @@ bias 0.1, velocities zeroed); model_train {xs,ys,targets,lr,steps}
 |v| <= 1e6); model_predict {xs,ys}; model_save/model_load {path?}
 (PBMD v2: 64B header magic/version/arch/count/H/step/payload-bytes/
 table+payload FNV-64 hashes/activation, 8-entry region table, region
-payloads; tmp sibling + fsync + atomic rename + dirsync; staged load
-with rollback, bad files rejected, live model survives); model_status
+payloads; tmp sibling + fsync + atomic rename + dirsync; two-pass load
+(stream-verifies table + every region crc + cumulative hash before
+touching live state, then resets the arena and stages — bad files are
+rejected with the live model intact, and load works in a live process,
+not just a fresh one); model_status
 (initialized/hidden/step/loss/allocated+mincore-committed/backend/gpu).
 Paths [A-Za-z0-9._/-]{1,256}, no "..", default peabrain.pbmd. Math:
 handwritten AVX2/FMA matmul + scalar reference (USE_SCALAR selects;

@@ -20,6 +20,7 @@ md_actlen    rq 1
 md_tablehash rq 1
 md_payloadhash rq 1
 md_tmpcrc    rq 1
+md_savechunk rq 1
 md_savemark  rq 1
 md_savenreg  rq 1
 md_astride   rq 1

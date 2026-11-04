@@ -394,6 +394,9 @@ md_fnv64:
     ret
 
 ; md_write_all: rdi=fd rsi=ptr rdx=len -> rax=0 ok / -1 fail.
+; Contract: preserves rbx,r12-r15; destroys rax,rcx,rdx,rsi,rdi,r8-r11
+; (inner syscall takes rcx+r11 per the kernel ABI; r10 is spared by the
+; kernel but NOT saved across calls that reuse it, e.g. md_arena_alloc).
 md_write_all:
     push rbx
     push r12
@@ -425,6 +428,7 @@ md_write_all:
     ret
 
 ; md_read_all: rdi=fd rsi=ptr rdx=len -> rax=0 ok / -1 fail/short.
+; Same contract as md_write_all: preserves rbx,r12-r15 only.
 md_read_all:
     push rbx
     push r12
@@ -908,7 +912,12 @@ md_save:
     pop rbx
     ret
 
-; md_load: rsi=NUL-term path -> rax=0 ok / -1 fail (current model preserved).
+; md_load: rsi=NUL-term path -> rax=0 ok / -1 fail.
+; Two passes: pass 1 stream-verifies table + every region crc + the
+; cumulative payload hash straight from the file without touching live
+; state; pass 2 resets the arena and stages. A bad checkpoint is
+; rejected with the live model fully intact (load also works in a live
+; process, not just a fresh one).
 md_load:
     push rbx
     push r12
@@ -988,10 +997,85 @@ md_load:
     call md_fnv64
     cmp rax, qword [md_hdrbuf + 40]
     jne .failclose
-    mov rax, [md_acur]
-    mov [md_savemark], rax
-    mov rax, [md_nreg]
-    mov [md_savenreg], rax
+    ; PASS 1: stream-verify every region body + the cumulative payload
+    ; hash straight from the file. Nothing live is touched here (no
+    ; arena, regtab or counter writes), so a bad checkpoint is rejected
+    ; with the current model fully intact. This also makes load work in
+    ; a live process: staging below resets the arena first.
+    mov rax, MD_FNV_OFF
+    mov [md_tmpcrc], rax
+    xor ebx, ebx
+    test r12d, r12d
+    jz .pass1done
+.pass1reg:
+    mov rax, rbx
+    shl rax, 5
+    lea r10, [md_tabbuf]
+    add r10, rax
+    ; NOTE: r15 holds bytes-remaining (r11/rcx DIE in the read syscall
+    ; below per the kernel ABI, which spares only rbx,r12-r15 — see the
+    ; contract on md_read_all). Chunk length parks in md_savechunk.
+    mov r15, [r10 + 16]              ; region bytes remaining
+    mov r13, MD_FNV_OFF              ; running region hash
+    test r15, r15
+    jz .regdone
+.regchunk:
+    mov rdx, r15
+    cmp rdx, 65536
+    jbe .havechunk
+    mov rdx, 65536                   ; md_minvec streaming window
+.havechunk:
+    mov [md_savechunk], rdx
+    mov rdi, r14
+    lea rsi, [md_minvec]
+    call md_read_all
+    test rax, rax
+    jnz .failclose
+    lea rsi, [md_minvec]
+    mov rdx, [md_savechunk]
+.byte:
+    test rdx, rdx
+    jz .bytedone
+    movzx ecx, byte [rsi]
+    xor r13, rcx
+    mov rcx, MD_FNV_PRM
+    imul r13, rcx
+    movzx ecx, byte [rsi]
+    mov rax, [md_tmpcrc]
+    xor rax, rcx
+    mov rcx, MD_FNV_PRM
+    imul rax, rcx
+    mov [md_tmpcrc], rax
+    inc rsi
+    dec rdx
+    jne .byte
+.bytedone:
+    sub r15, [md_savechunk]
+    ja .regchunk
+.regdone:
+    cmp r13, qword [r10 + 24]
+    jne .failclose
+    inc rbx
+    cmp ebx, r12d
+    jb .pass1reg
+.pass1done:
+    mov rax, [md_tmpcrc]
+    cmp rax, qword [md_hdrbuf + 48]
+    jne .failclose
+    ; PASS 2: file fully validated. Reset the arena, rewind to the first
+    ; payload byte, and stage for real (crcs already proven above; a
+    ; short read here means the file changed under us mid-load).
+    call md_arena_reset
+    mov rax, r12
+    shl rax, 5
+    add rax, 64
+    mov rsi, rax
+    mov rax, 8
+    mov rdi, r14
+    xor edx, edx
+    syscall
+    test rax, rax
+    js .failclose
     xor ebx, ebx
     test r12d, r12d
     jz .allstaged
@@ -1009,67 +1093,21 @@ md_load:
     pop rbx
     pop r10
     test rax, rax
-    jz .rollback
+    jz .failclose
     mov rdi, r14
     mov rsi, rax
     mov rdx, [r10 + 16]
-    push rax
     push r10
     push rbx
     call md_read_all
     pop rbx
     pop r10
-    pop r11
     test rax, rax
-    jnz .rollback
-    mov rsi, r11
-    mov rdx, [r10 + 16]
-    push r10
-    push rbx
-    call md_fnv64
-    pop rbx
-    pop r10
-    cmp rax, qword [r10 + 24]
-    jne .rollback
+    jnz .failclose
     inc rbx
     cmp ebx, r12d
     jb .stage
 .allstaged:
-    mov rax, MD_FNV_OFF
-    mov [md_tmpcrc], rax
-    mov rax, [md_savenreg]
-    mov r11, [md_nreg]
-.stcrc:
-    cmp rax, r11
-    jae .stcrcdone
-    push rax
-    mov rdx, rax
-    shl rdx, 5
-    lea r10, [md_regtab]
-    add r10, rdx
-    mov rsi, [r10 + 8]
-    add rsi, [md_arenabase]
-    mov rdx, [r10 + 16]
-    mov rax, [md_tmpcrc]
-    test rdx, rdx
-    jz .stnext
-.stloop:
-    movzx ecx, byte [rsi]
-    xor rax, rcx
-    mov rcx, MD_FNV_PRM
-    imul rax, rcx
-    inc rsi
-    dec rdx
-    jne .stloop
-.stnext:
-    mov [md_tmpcrc], rax
-    pop rax
-    inc rax
-    jmp .stcrc
-.stcrcdone:
-    mov rax, [md_tmpcrc]
-    cmp rax, qword [md_hdrbuf + 48]
-    jne .rollbackfull
     mov rax, qword [md_hdrbuf + 24]
     mov [md_step], rax
     mov eax, [md_ldh]
@@ -1085,15 +1123,6 @@ md_load:
     pop r12
     pop rbx
     ret
-.rollback:
-    jmp .rollbackfull
-.rollbackfull:
-    mov rax, [md_savemark]
-    mov [md_acur], rax
-    mov rax, [md_savenreg]
-    mov [md_nreg], rax
-    mov rdi, r14
-    call md_close_fd
 .failclose:
     mov rdi, r14
     call md_close_fd
