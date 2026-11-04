@@ -36,6 +36,51 @@ Prove: unknown linear map first, then f(x,y)=3x^2-2y+1. Metrics: train loss
 + held-out validation error must both fall (no memorisation). Save/resume:
 step counter + weights round-trip exactly; predictions identical post-load.
 
+BUILD: mlp_core.asm + mlp_data.asm splice onto arena infra (which carries
+the PBMD save/load + arena alloc + prints; arena's own _start self-test is
+excluded from the splice):
+  python3 -c "a=open('arena.asm').read();
+  out=a[:a.index('; ---- self-test ----')]+open('mlp_core.asm').read()+chr(10)+a[a.index('segment readable writeable'):]+chr(10)+open('mlp_data.asm').read();
+  open('mlp.asm','w').write(out)"
+  fasm mlp.asm /tmp/mlp && /tmp/mlp            (train)
+  /tmp/mlp resume                               (restart: load, verify, resume)
+mlp.asm is GENERATED (not committed); mlp_core/mlp_data are the sources.
+
+STAGE 3 RESULTS (2026-11-04, all strict asserts green, exit 0):
+- MICRO (hand N=1 H=1 linear): loss 10.24 exact, grads [25.6,38.4,12.8,
+  11.84,6.4] all rel<1e-5 vs hand computation. Proves fwd+backprop exactly.
+- LINEAR 2->8->1 (t=2.5x-1.7y+0.8, init independent): 9.3 -> 2e-8 train,
+  held matches, 8 unseen points maxerr-e6=0 (bit-exact predictions).
+- GRADCHECK (H=4 N=8, central diff eps=1e-2): linear AND leaky both strict:
+  all params rel<1e-3 except ONE (W1[2], absdiff 4.4e-5) passing via the
+  documented 1e-4 abs floor (FP32 cancellation on small grads). NaN-safe
+  comparisons; exact param-restore check (loss bits identical after).
+  ReLU kink safety: deterministic reseed (bounded 16) keeps all |z+b1| >
+  0.05; perturbation shifts z by <=0.02, so crossing is impossible.
+  Two real bugs caught: (1) backward ReLU gate MUST test the biased sum
+  z+b1, not raw z (found via margin anomalies); (2) margin scan must also
+  use z+b1 (it scanned raw Z1 and could never pass with b1=2.0).
+- NONLINEAR 2->16->1 leaky-ReLU(0.01), full-batch warmup replaced by
+  deterministic cyclic minibatches (B=16, slice = f(mstep), bit-exact
+  across save/resume): INIT 61.6/80.8 -> S1 20000 @lr0.05 -> S2 20000
+  @lr0.01 -> train 0.0079 / held 0.0109 (~8000x down, gap 1.4x, no
+  memorisation). Chosen over plain-ReLU (dead units trapped lr=0.05 at
+  0.24) and over full-batch (stuck at 0.019).
+- PERSISTENCE: 8 PBMD regions (W1,b1,W2,b2 + 4 momentum velocities) +
+  step counter. Restart test: RESUME block == SAVE block and RFINAL ==
+  FINAL block, byte-identical (diff clean): reload fidelity + continued
+  training bit-exact vs uninterrupted.
+- Determinism: fixed LCG seeds everywhere; three consecutive full runs
+  bit-identical (md5). Tolerances: micro 1e-5, grad rel 1e-3 + abs floor
+  1e-4, linear 1e-6/1e-3-unseen, nonlinear train<0.015 held<0.02
+  improve>=100x gap<5x. ASLR-independent (setarch -R identical).
+- init_w/gendata cover [-1,0) not [-1,1) (shr 41 keeps 23 bits; comments
+  said [0,2) — off by 2x; harmless here, noted for training quality).
+  Same quirk exists in mat.asm (left as-is: distribution-independent
+  proofs there).
+- Future: H=32 capacity, target normalisation, per-param eps, INT4/FP16
+  (Stage 4), GPU probe (Stage 5). Live tinythink.db never touched.
+
 QUANT (Stage 4): INT8 symmetric per-tensor scale (+INT4 nibble packing and
 FP16 storage evaluated where they win); inference-only, training stays FP32;
 tolerance documented vs FP32. VNNI vpdpbusd sdot; scalar dequant reference.
