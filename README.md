@@ -1,17 +1,21 @@
-# tinythink
+# PeaBrain
 
-Persistent agent memory in ~53 KB: a pure-FASM x86-64 MCP server backed by
+Persistent agent memory in ~62 KB: a pure-FASM x86-64 MCP server backed by
 a genuine on-disk SQLite database. No libc, no interpreter, no runtime —
 raw syscalls only. It speaks MCP stdio JSON-RPC and stores thoughts,
 facts, entities, relations, and tasks in `tinythink.db` next to the binary.
+(The executable keeps its historical name `tinythink`; the project is
+PeaBrain.)
 
 ## Features
 
-- **19 MCP tools**: `sequential_thinking`, `thought_history`, `thought_reset`,
+- **21 MCP tools**: `sequential_thinking`, `thought_history`, `thought_reset`,
   `conclusion`, `write_fact`, `read_fact`, `list_facts`, `read_fact_versions`,
   `delete_fact`, `delete_fact_prefix`, `create_entities`, `add_observations`,
   `create_relations`, `search_nodes`, `open_nodes`, `create_task_or_note`,
-  `query_tasks`, `update_task`, `health`.
+  `query_tasks`, `update_task`, `health`, plus `feedback` (teach ranking:
+  useful/misleading, durable on return) and `explain_rank` (why a memory
+  scores as it does: signals, score, weights).
 - **Real SQLite format**: 4096-byte pages, UTF-8, rowid leaf pages.
   `pragma integrity_check` passes and the file opens in stock `sqlite3`.
 - **Unbounded growth**: interiors split at any depth (right-edge appends;
@@ -26,11 +30,15 @@ facts, entities, relations, and tasks in `tinythink.db` next to the binary.
   (`delete_fact`, bulk `delete_fact_prefix` capped at 128 names) that hide
   names from reads, search, and open-nodes. Tombstoned bytes are retained
   (hidden, not wiped — not secure deletion) and names never resurrect.
-- **It learns**: an 8192-slot usage table ranks search results and persists
-  across restarts in the `usage` table; a 16-slot LRU page cache serves hot
-  reads (~140x on large files).
-- **Hardened input**: ASCII-only names (`[A-Za-z0-9._-]`, 1–64 chars) and
-  text, duplicate-key rejection, header-last parsing, `0600` database file
+- **It learns**: a 262,144-slot usage-ranking table with 88-bit stable
+  identity and 64-bit weighted scores (access frequency, explicit
+  useful/misleading feedback, recency, corroboration confidence —
+  popularity never asserts truth), persisted across restarts in the
+  `usage` table with graceful min-score eviction at capacity; a 16-slot
+  LRU page cache serves hot reads (~140x on large files).
+- **Hardened input**: machine identifiers (`[A-Za-z0-9._@:+#~-]`, 1–128
+  chars; no spaces, slashes, or JSON syntax) and ASCII-only text,
+  duplicate-key rejection, header-last parsing, `0600` database file
   with uid check, non-executable stack, PIE.
 
 ## Requirements
@@ -94,7 +102,7 @@ hits flush on exit or piggyback on the next write commit).
 
 ## Documented limits
 
-- Cells ≤ ~1100 bytes; names 1–64 chars `[A-Za-z0-9._-]`; text ASCII only.
+- Cells ≤ ~1100 bytes; identifiers 1–128 chars `[A-Za-z0-9._@:+#~-]`; text ASCII only.
 - Listing budgets cap large outputs; distinct-name scans are capped
   (facts 128, tasks 512); prefix deletion caps at 128 names (`capped:true`).
 - No overflow pages; growth comes from page splits, bounded only by the
@@ -127,10 +135,17 @@ Crash recovery is tested, not just designed: SIGKILL mid-transaction
 via the journal, leaves no journal behind, and verifies clean
 (structure + `integrity_check` + exact row counts).
 
+Learning at scale: a 262,144-fill completes with all identities
+persisted; min-score eviction past capacity is exact (239,911 live +
+22,233 evicted, zero false hits); a useful memory outranks a 300x-read
+misleading one after a restart; legacy databases migrate with exact
+preserved counts.
+
 ## Repository
 
-- `tinythink` — the built application, committed so anyone can run it
-  immediately (rebuilt from `tinythink.asm` byte-identically; see Build).
+- `tinythink` — the built PeaBrain application, committed so anyone can
+  run it immediately (rebuilt from `tinythink.asm` byte-identically;
+  see Build).
 - `tinythink.asm` — the entire server (~11.5k lines, no includes).
 - `BUILD` — build notes, tool/capacity/security documentation.
 - Databases (`tinythink.db*`) and backups (`*.bak-*`) are untracked by
@@ -145,10 +160,11 @@ all normal for a FASM `format ELF64 dynamic` binary that only issues
 syscalls. ASLR is effective (two live instances map their code at
 distinct randomized bases) since all addressing is RIP-relative.
 
-Size split (~53 KB on disk, ~1.1 MB resident): ~44 KB code, ~11 KB
-file-backed writable data, ~1.1 MB BSS. The binary used to be ~1 MB
-because FASM emits leading `rb` blocks as file zeros and only trailing
-`rb` becomes NOBITS (verified with a minimal probe: 1 MB `rb` before an
-8-byte `dq` → 1 MB file; after → 193 bytes). Moving the giant tables
-(`childtab`, `utab`, `thslots`, caches) after the last initialized datum
-shrunk it 19x with a byte-identical runtime footprint.
+Size split (~62 KB on disk, ~10.9 MB resident, almost all NOBITS):
+~48 KB code, ~12 KB file-backed writable data. The binary used to be
+~1 MB because FASM emits leading `rb` blocks as file zeros and only
+trailing `rb` becomes NOBITS (verified with a minimal probe: 1 MB `rb`
+before an 8-byte `dq` → 1 MB file; after → 193 bytes). Moving the giant
+tables (`childtab`, `utab`, `thslots`, caches, learning queue) after the
+last initialized datum keeps the file tiny while the 8 MiB learning
+table and friends live in zero-backed memory.

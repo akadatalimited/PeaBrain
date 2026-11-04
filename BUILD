@@ -55,7 +55,7 @@ conclusion {reason, thought?, conclusion?, valid?}: conclusions table
   else read the row by reason.
 read_fact {name} / write_fact {name,text} / list_facts {}: facts table
   (name TEXT, body TEXT), append-only versions, latest rowid wins.
-  Names 1..64 [A-Za-z0-9._-]; bodies 0..4096 ascii.
+  Names 1..128 [A-Za-z0-9._@:+#~-]; bodies 0..4096 ascii.
 delete_fact {name} / delete_fact_prefix {prefix} / read_fact_versions {name}:
   tombstones(name) table; tombstoned names read as missing everywhere
   (facts, entities, search, open) and refuse writes ("tombstoned",
@@ -124,21 +124,39 @@ ino/size/mtime, write-through, flushed on mismatch):
   read+read+search mix 37 -> 9 (~4x). Cold single-shot and write
   throughput unchanged (writes stay fsync-bound by design).
 
-Learning: usage-ranked search_nodes. Direct reads (read_fact) and
-surfaced results bump per-row use counts (8192-slot table, saturating,
-min-evict). Searches collect up to 64 hits, stable-sort by score
-descending (ties keep walk order, so cold behavior is unchanged), and
-emit the top of the slim budget. Verified: alpha_one/two/three walk
-order before use, alpha_three first after 10 reads.
+Learning: usage-ranked search_nodes over a 262,144-slot hot table
+(USLOT_BITS/MASK/SZ are the single growth point). Stable identity:
+facts/entities/tasks hash their machine name (FNV-1a-64, low 56 bits;
+observations use immutable rowids); a second 32-bit hash makes 88-bit
+identity, so collisions resolve to separate slots via probing instead
+of merging, and the persistent table keeps original names for audit.
+Per-slot signals (all saturating): access reads, useful/misleading
+explicit feedback, recency tick, confidence from repeat versions.
+Score (u64, overflow-impossible by clamped inputs, floored at zero):
+gated access + 8*useful + 2*confidence + recency(1024-tick window)
+- 8*misleading, where popularity counts only when useful >=
+misleading. Searches collect up to 64 hits, stable-sort by score
+descending. feedback {name,signal} teaches (durable on return);
+explain_rank {name} shows signals, score, and weights, so benchmarks
+verify learning rather than observing order.
 
-Persistence: learned scores live in a real SQLite `usage(ukey, hits)`
-table (upsert semantics: one live row per key, latest/max wins on
-load). In-RAM slots carry a flushed watermark, so only changed slots
-are rewritten — steady state appends nothing. Saved on clean process
-exit and piggybacked onto write-txn commits (reads never pay fsync);
-loaded once per process at first open. Verified: train 10 reads,
-exit, fresh process ranks alpha_three first. Crash loses at most the
-unflushed delta (safe degradation to cold ranking).
+Persistence: learned signals live in shape-versioned `usage` rows
+(legacy 2-col plus v2 8-col side by side; readers key off actual
+column count, schemas never rewritten). Legacy rowid keys resolve to
+names via rowid->name scans (private buffers; unresolvable rows are
+skipped, never merged). Hot slots hold hashes only, so a pending-name
+queue records (slot,name) at slot-create and flush drains it; flush
+re-verifies each entry by rehash before writing (evicted slots skip).
+Rowids come from a txn-fresh [maxrowid] (++ per row; concurrent writers
+are locked out), never from per-write full-table scans: a rightmost-
+descent tail_max() sizes new rows in O(depth), keeping flush O(1)
+amortized (262,144-row fill in seconds, not hours). At capacity the
+table degrades gracefully via min-score eviction (proven: 239,911 live
+slots + 22,233 evictions over a 262,144 fill, zero false hits).
+Saved on clean process exit and piggybacked onto write-txn commits;
+loaded once per process at first open, tick resuming past persisted
+recency. Verified: useful beats 300x-popular-plus-misleading after
+restart; live-DB migration restores exact legacy counts.
 
 Value cap: no single TEXT value over 1024 bytes (fact bodies included).
 Max cell ~1.2KB < page/3, so both split halves always fit; oversize
