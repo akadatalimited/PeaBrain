@@ -221,5 +221,33 @@ free/sizes proven, mapping deferred). Awaiting operator direction.
 Box left clean: ~50 test procs closed fds (kernel freed RM state),
 smi shows pre-existing desktop only, 19W/41C baseline.
 
+Stage 6d (615 revalidation + FINAL feasibility decision, Nov 2026):
+Driver upgraded 610.57.04 -> 615.78.08 (kernel 7.2.14). ABI diff of every
+pinned item against tag 615.78.08: NV escapes IDENTICAL, card_info
+IDENTICAL, NVOS02/NVOS33 IDENTICAL, UVM ioctl numbers IDENTICAL,
+cl0080/cl2080/cl0040 IDENTICAL. Only changes: copyrights, one comment,
+one new flag, channel-group struct +2 fields (6d-adjacent, unused).
+Rebuilt + rerun on 615: gpu_probe PASS, rm_client 20/20 PASS, dmesg
+unreadable (unchanged), smi shows desktop compositor only, no residue.
+Bounded re-probe of the 6c gates on 615: classic 0x21 map still EINVAL
+x8, UVM REGISTER_GPU still 27 x4, libcuda still issues zero XFER
+ioctls. No new documented compute door in 615 (escape list unchanged).
+VERDICT (per operator direction): no viable documented route to GPU
+computation exists under pure-assembly + no-libcuda constraints short
+of reimplementing RM channel/vaspace/UVM-session bring-up — an
+extensive userspace-driver reimplementation explicitly out of scope.
+PAM STAYS CPU-ONLY. gpu remains "unavailable" in model_status with the
+reason; the 6a/6b prototypes are preserved as proven research (driver
+contact without libcuda is real and repeatable) in case constraints
+ever change (dlopen-libcuda-with-fallback would unblock 6c/6d at once).
+No further GPU stages planned.
+CPU path (the supported backend): AVX2/FMA FP32 + scalar reference
+(IDENTICAL suites), INT8/VNNI inference prototype, H=1..16 configurable
+at init, batch<=128 enforced (129 correctly rejected), PBMD stores H.
+Raising caps = BSS growth + format/compat review; deferred until a
+workload needs it (65 params today). Correctness baseline holds on the
+merged tree (model 13/13 both backends, adv/mem/conc/think clean,
+v3diff IDENTICAL, rowid blast suites clean).
+
 BACKEND PRIORITY: proven-GPU(explicit opt-in) > VNNI-quant > AVX2/FMA FP32 >
 reference. model_status always reports selected backend + why others lost.
