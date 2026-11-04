@@ -2180,8 +2180,15 @@ pgr_ok:
     xor eax, eax
     ret
 
-; pg_write(rdi=pgno, rsi=buf): rax 0 ok / 1 err
+; pg_write(rdi=pgno, rsi=buf): rax 0 ok / 1 err. Journals pre-image first.
 pg_write:
+    push rdi
+    push rsi
+    call jwrite
+    pop rsi
+    pop rdi
+    test rax, rax
+    jnz pgw_err
     mov r10, rdi
     dec r10
     shl r10, 12
@@ -2195,6 +2202,289 @@ pg_write:
     ret
 pgw_ok:
     xor eax, eax
+    ret
+pgw_err:
+    mov eax, 1
+    ret
+
+; jwrite(rdi=pgno): journal current on-disk image before overwrite.
+; Appends [pgno u32][4096B] + fsyncs journal. rax 0 ok / 1 err.
+; Preserves rbx,rbp,r12-r15,rsi.
+jwrite:
+    push rbx
+    push r12
+    push rsi
+    mov rbx, rdi                ; pgno
+    ; already journaled?
+    xor ecx, ecx
+jw_scan:
+    cmp rcx, [jn]
+    jae jw_new
+    lea rax, [jpages]
+    shl rcx, 3
+    add rax, rcx
+    shr rcx, 3
+    cmp qword [rax], rbx
+    je jw_ok
+    inc rcx
+    jmp jw_scan
+jw_new:
+    cmp qword [jn], 32
+    jae jw_err                  ; txn too wide: fail closed
+    cmp qword [jactive], 0
+    jne jw_have
+    ; first touch: open journal (0600) + header
+    mov eax, 2
+    lea rdi, [jpath]
+    mov esi, 66                 ; O_RDWR|O_CREAT
+    mov edx, 384
+    syscall
+    test rax, rax
+    js jw_err
+    mov [jfd], rax
+    mov eax, 91                 ; fchmod 0600
+    mov rdi, [jfd]
+    mov esi, 384
+    syscall
+    test rax, rax
+    js jw_err
+    lea rdi, [jbuf]
+    mov al, 'T'
+    mov [rdi], al
+    mov al, 'J'
+    mov [rdi + 1], al
+    mov al, 'R'
+    mov [rdi + 2], al
+    mov al, 'R'
+    mov [rdi + 3], al
+    mov rax, [dbpages]
+    mov [jorig], rax
+    mov rax, [jorig]
+    lea rdi, [jbuf + 4]
+    call be32_st
+    mov eax, 1
+    mov rdi, [jfd]
+    lea rsi, [jbuf]
+    mov edx, 8
+    syscall
+    cmp rax, 8
+    jne jw_err
+    mov qword [jactive], 1
+jw_have:
+    ; pre-image of pgno into jbuf (zeros if beyond EOF)
+    mov eax, 0
+    mov rdi, [dbfd]
+    lea rsi, [jbuf]
+    mov edx, 4096
+    mov r10, rbx
+    dec r10
+    shl r10, 12
+    mov eax, 17
+    syscall
+    test rax, rax
+    js jw_err
+    cmp rax, 4096
+    je jw_full
+    ; short read: zero the tail
+    lea rdi, [jbuf]
+    add rdi, rax
+    mov rcx, 4096
+    sub rcx, rax
+    xor eax, eax
+    rep stosb
+jw_full:
+    ; append [pgno u32][page]: sequential position (single writer under flock)
+    mov rax, rbx
+    lea rdi, [jbuf2]
+    call be32_st
+    mov eax, 1
+    mov rdi, [jfd]
+    lea rsi, [jbuf2]
+    mov edx, 4
+    syscall
+    cmp rax, 4
+    jne jw_err
+    mov eax, 1
+    mov rdi, [jfd]
+    lea rsi, [jbuf]
+    mov edx, 4096
+    syscall
+    cmp rax, 4096
+    jne jw_err
+    mov eax, 74                   ; fsync journal before the data write
+    mov rdi, [jfd]
+    syscall
+    test rax, rax
+    js jw_err
+    lea rax, [jpages]
+    mov rcx, [jn]
+    shl rcx, 3
+    add rax, rcx
+    mov [rax], rbx
+    inc qword [jn]
+jw_ok:
+    pop rsi
+    pop r12
+    pop rbx
+    xor eax, eax
+    ret
+jw_err:
+    pop rsi
+    pop r12
+    pop rbx
+    mov eax, 1
+    ret
+
+; pg_write_fd(rdi=pgno, rsi=buf, rdx=fd): rax 0 ok / 1 err. No journal.
+; Direct pwrite for tmp-create. Clobbers rax,rcx,rdi,rdx,r10,r11.
+pg_write_fd:
+    push r10
+    mov r10, rdi
+    dec r10
+    shl r10, 12
+    mov rdi, rdx
+    mov edx, 4096
+    mov eax, 18
+    syscall
+    pop r10
+    cmp rax, 4096
+    je pgfd_ok
+    mov eax, 1
+    ret
+pgfd_ok:
+    xor eax, eax
+    ret
+
+; jrecover: rollback torn txn if journal file exists. Called after flock.
+; Reads [jpath], restores pre-images to [dbfd], truncates to orig pages,
+; fsyncs, unlinks + dirsync. rax 0 ok / 1 err. Preserves rbx,rbp,r12-r15.
+jrecover:
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    mov eax, 2
+    lea rdi, [jpath]
+    xor esi, esi                ; O_RDONLY
+    xor edx, edx
+    syscall
+    test rax, rax
+    js jrc_none                  ; no journal: nothing to do
+    mov r14, rax                ; journal fd
+    mov rdi, r14
+    lea rsi, [jbuf]
+    mov edx, 8
+    call read_all
+    cmp rax, 8
+    jne jrc_drop                 ; torn header: db untouched, drop journal
+    cmp byte [jbuf], 'T'
+    jne jrc_drop
+    cmp byte [jbuf+1], 'J'
+    jne jrc_drop
+    cmp byte [jbuf+2], 'R'
+    jne jrc_drop
+    cmp byte [jbuf+3], 'R'
+    jne jrc_drop
+    lea rsi, [jbuf+4]
+    call be32_ld
+    mov r15, rax                ; orig pages
+    cmp r15, 0x100000
+    ja jrc_drop                  ; absurd: drop
+jrc_next:
+    mov rdi, r14
+    lea rsi, [jbuf2]
+    mov edx, 4
+    call read_all
+    test rax, rax
+    jz jrc_commit                ; clean EOF
+    cmp rax, 4
+    jne jrc_commit               ; torn tail: rollback what we have
+    lea rsi, [jbuf2]
+    call be32_ld
+    mov r12, rax                ; pgno
+    test r12, r12
+    jz jrc_commit                ; pgno 0: torn, stop
+    cmp r12, 0x100000
+    ja jrc_commit
+    mov rdi, r14
+    lea rsi, [jbuf]
+    mov edx, 4096
+    call read_all
+    cmp rax, 4096
+    jne jrc_commit               ; torn page tail: ignore, rollback prior
+    mov rax, r12
+    dec rax
+    shl rax, 12
+    mov r10, rax
+    mov rdi, [dbfd]
+    lea rsi, [jbuf]
+    mov edx, 4096
+    mov eax, 18
+    syscall
+    cmp rax, 4096
+    jne jrc_err
+    jmp jrc_next
+jrc_commit:
+    mov eax, 74                 ; fsync restored pages
+    mov rdi, [dbfd]
+    syscall
+    mov rax, r15
+    shl rax, 12
+    mov rsi, rax                ; len = orig*4096
+    mov eax, 77                 ; ftruncate back (drops grown tail)
+    mov rdi, [dbfd]
+    syscall
+    mov eax, 74
+    mov rdi, [dbfd]
+    syscall
+    mov eax, 3
+    mov rdi, r14
+    syscall
+    mov eax, 87
+    lea rdi, [jpath]
+    syscall
+    call dirsync
+    mov qword [jn], 0
+    mov qword [jactive], 0
+    mov qword [jfd], 0
+    mov qword [jorig], 0
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    xor eax, eax
+    ret
+jrc_drop:
+    mov eax, 3
+    mov rdi, r14
+    syscall
+    mov eax, 87
+    lea rdi, [jpath]
+    syscall
+    call dirsync
+jrc_none:
+    mov qword [jn], 0
+    mov qword [jactive], 0
+    mov qword [jfd], 0
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    xor eax, eax
+    ret
+jrc_err:
+    mov eax, 3
+    mov rdi, r14
+    syscall
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    mov eax, 1
     ret
 
 ; magic_ok(rsi=page): rax 0 ok / 1 bad
@@ -2244,7 +2534,7 @@ do_sl:
     rep movsb
     mov byte [rdi], 0
     add qword [dblen], 12
-    jmp do_open
+    jmp do_paths
 do_cwd:
     lea rsi, [dbfile]
     lea rdi, [dbpath]
@@ -2252,7 +2542,55 @@ do_cwd:
     rep movsb
     mov byte [rdi], 0
     mov qword [dblen], 12
+do_paths:
+    ; jpath = dbpath + "-journal"; dbdirb = dirname (for dirsync)
+    mov rax, [dblen]
+    add rax, 8
+    cmp rax, 1100
+    ja do_err                   ; absurd path: fail closed, no fd yet
+    lea rsi, [dbpath]
+    lea rdi, [jpath]
+    mov rcx, [dblen]
+    rep movsb
+    mov al, '-'
+    stosb
+    mov al, 'j'
+    stosb
+    mov al, 'o'
+    stosb
+    mov al, 'u'
+    stosb
+    mov al, 'r'
+    stosb
+    mov al, 'n'
+    stosb
+    mov al, 'a'
+    stosb
+    mov al, 'l'
+    stosb
+    xor al, al
+    stosb
+    mov rax, [dblen]
+    cmp rax, 12
+    je do_dotdir
+    sub rax, 12                 ; strip "/tinythink.db"
+    lea rsi, [dbpath]
+    lea rdi, [dbdirb]
+    mov rcx, rax
+    rep movsb
+    mov byte [rdi], 0
+    jmp do_open
+do_dotdir:
+    lea rdi, [dbdirb]
+    mov al, '.'
+    stosb
+    xor al, al
+    stosb
+    jmp do_open
 do_open:
+    mov qword [jn], 0
+    mov qword [jactive], 0
+    mov qword [jfd], 0
     mov eax, 2
     lea rdi, [dbpath]
     mov esi, 66                 ; O_RDWR|O_CREAT
@@ -2273,6 +2611,9 @@ do_open:
     syscall
     test rax, rax
     js do_closeerr
+    call jrecover               ; rollback torn txn if journal present
+    test rax, rax
+    jnz do_closeerr
     mov eax, 5                  ; fstat: st_size @ +48
     mov rdi, [dbfd]
     lea rsi, [dbstat]
@@ -2347,12 +2688,37 @@ do_closeerr:
 do_err:
     ret
 
-; db_close: fsync, unlock, close. preserves rax.
+; db_close: commit (fsync, drop journal, dirsync), unlock, close. preserves rax.
 db_close:
     push rax
     mov eax, 74
     mov rdi, [dbfd]
     syscall
+    cmp qword [jactive], 0
+    je dc_nojourn
+    mov eax, 87                 ; unlink journal: commit point
+    lea rdi, [jpath]
+    syscall
+    test rax, rax
+    jz dc_unlinked
+    ; unlink failed: truncate journal to empty (recovery-safe) + fsync
+    mov eax, 77
+    mov rdi, [jfd]
+    xor esi, esi
+    syscall
+    mov eax, 74
+    mov rdi, [jfd]
+    syscall
+dc_unlinked:
+    call dirsync
+    mov eax, 3
+    mov rdi, [jfd]
+    syscall
+    mov qword [jn], 0
+    mov qword [jactive], 0
+    mov qword [jfd], 0
+    mov qword [jorig], 0
+dc_nojourn:
     mov eax, 73
     mov rdi, [dbfd]
     mov esi, 8                  ; LOCK_UN
@@ -2363,7 +2729,64 @@ db_close:
     pop rax
     ret
 
-; memzero(rdi=dst, rcx=len). v3: 128B VEC_ZERO128 blocks + scalar tail.
+; dirsync: fsync the db directory (rename/unlink durability). best effort.
+; Preserves rbx,rbp,r12-r15.
+dirsync:
+    push rdi
+    push rsi
+    push rdx
+    push rcx
+    mov eax, 2
+    lea rdi, [dbdirb]
+    mov esi, 0x10000             ; O_RDONLY|O_DIRECTORY
+    xor edx, edx
+    syscall
+    test rax, rax
+    js ds_done
+    mov rdi, rax
+    mov eax, 74
+    syscall
+    mov eax, 3
+    syscall                     ; rdi still dirfd
+ds_done:
+    pop rcx
+    pop rdx
+    pop rsi
+    pop rdi
+    ret
+
+; read_all(rdi=fd, rsi=buf, rdx=len): rax = total bytes read (short ok).
+; Preserves rbx,rbp,r12-r15.
+read_all:
+    push rbx
+    push r12
+    push r13
+    push r14
+    mov r14, rdi                ; fd
+    mov r12, rsi                ; cursor
+    mov rbx, rdx                ; remaining
+    mov r13, rdx                ; original len
+ra_loop:
+    test rbx, rbx
+    jz ra_done
+    mov rdi, r14
+    mov rsi, r12
+    mov rdx, rbx
+    mov eax, 0
+    syscall
+    test rax, rax
+    jle ra_done                 ; EOF/error: return short
+    add r12, rax
+    sub rbx, rax
+    jmp ra_loop
+ra_done:
+    mov rax, r13
+    sub rax, rbx                ; total = len - remaining
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
 memzero:
 if defined USE_SCALAR
     xor eax, eax
@@ -7822,6 +8245,7 @@ m_big db 'too large', 0
 
 dbexe db '/proc/self/exe', 0
 dbfile db 'tinythink.db', 0
+jmagic db 'TTJR', 0
 m_table db 'table', 0
 m_conct db 'conclusions', 0
 t_facts_n db 'facts', 0
@@ -8008,6 +8432,10 @@ qpg dq 0
 tmprow dq 0
 tmpvoff dq 0
 rfsize dq 0
+jfd dq 0
+jn dq 0
+jactive dq 0
+jorig dq 0
 sroot dq 0
 smode dq 0
 scount dq 0
@@ -8092,6 +8520,11 @@ idbuf rb 96
 numtmp rb 32
 exebuf rb 1024
 dbpath rb 1088
+dbdirb rb 1088
+jpath rb 1104
+jbuf rb 4096
+jbuf2 rb 8
+jpages rb 256
 pagebuf rb 4096
 leafbuf rb 4096
 ipage rb 4096

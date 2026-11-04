@@ -3,7 +3,7 @@ tinythink - thinking + memory MCP server in pure x86-64 assembly
 
 Sequential-thinking mimic plus a conclusion tool and a small memory
 core, backed by a real SQLite database written in pure asm (no includes,
-no libc). One ~37K statically-linked Linux binary.
+no libc). One ~39K statically-linked Linux binary.
 
 Needs: fasm (flat assembler) 1.73+, Linux x86-64 with x86-64-v3
 microarchitecture (AVX/AVX2/FMA/BMI1/BMI2/LZCNT; check
@@ -85,8 +85,9 @@ SQLite subset (genuine on-disk format: pragma integrity_check passes,
 opens in real sqlite3, bidirectional, old DBs gain new tables on open):
 page size 4096, UTF-8, sqlite_master + data tables, rowid leaf pages,
 size-ordered leaf splits, root interior on first split, dead space on
-the freelist, whole-db flock, fsync per write txn. No overflow pages,
-no journal.
+  the freelist, whole-db flock, fsync per write txn. No overflow pages;
+  rollback journal (TJRR) with recovery + truncate on open, commit
+  (fsync, unlink, dirsync) on close.
 
 Value cap: no single TEXT value over 1024 bytes (fact bodies included).
 Max cell ~1.2KB < page/3, so both split halves always fit; oversize
@@ -104,17 +105,15 @@ Security posture (see TT-01..TT-05 review cycle):
   bounded sizes) and must not face untrusted clients directly.
 - TT-03 crash consistency: header (size/counter/taskseq) is written
   last, page counts come from the header (never beyond the file), and
-  tree walks refuse out-of-range pages. A killed process leaves the
-  last consistent view (verified by repeated SIGKILL + integrity_check).
-  Power-loss torn pages would still need a real journal (deferred).
+  tree walks refuse out-of-range pages. Every overwrite journals its
+  pre-image ([pgno][page] + fsync) under flock; open rolls back torn
+  txns (restore + truncate to orig size) and close commits (fsync db,
+  unlink/ truncate journal, dirsync). Verified by SIGKILL +
+  integrity_check, torn-tail + growth-truncate recovery tests.
 - TT-04 hardening: ET_DYN (PIE, ASLR slides verified) + PT_GNU_STACK
   with no exec permission + separated R E / RW segments. No W+X.
 - TT-05 conformance: every tools/call result uses the MCP content
   envelope (verified per tool).
-
-Value cap: no single TEXT value over 1024 bytes (fact bodies included).
-Max cell ~1.2KB < page/3, so both split halves always fit; oversize
-cells are refused ("too large"), never written.
 
 x86-64-v3 use (explicit 32B lanes, unaligned ops, scalar tails,
 vzeroupper hygiene; VEC_ZERO128 macro): 4K page zeroing, ascii
