@@ -18,19 +18,80 @@
 ;   reason 1..64 ascii; thought 0..512 ascii; conclusion 1..512 ascii.
 ;   conclusion present -> insert (dup reason refused); else valid present ->
 ;   set valid flag (invalidate/revalidate); else read row by reason.
+; Value cap everywhere: no single TEXT value over 1024 bytes (fact bodies
+; included). Max cell ~1.2KB < page/3, so both split halves always fit;
+; oversize cells are refused, never written (no overflow pages by design).
 ; SQLite subset (genuine file format, opens in real sqlite3):
 ;   page size 4096, UTF-8, single table + sqlite_master, rowid leaf pages,
 ;   size-ordered leaf splits, root interior once split, whole-db flock,
 ;   fsync per write txn. Limits: cell <= ~1100B, interior never splits
 ;   (~600 leaves, thousands of conclusions), no overflow pages, no journal.
 ; Assumes standard key order (method/id before params, name before arguments).
+;
+; BASELINE: x86-64-v3. The binary freely uses AVX/AVX2/FMA/BMI1/BMI2/LZCNT.
+; FASM emits no runtime compatibility check, so start: runs a CPUID gate
+; first (stderr + exit 1 on older CPUs). Scalar paths remain for tails and
+; for branchy/pointer-chasing work where SIMD does not pay (JSON parser,
+; b-tree splits, thought recording). Vectorized: 4K page zeroing, ascii
+; validation bulk lanes, JSON-escape clean-block copies, substring
+; first-byte filters. Build the scalar A/B reference with:
+;   fasm -dUSE_SCALAR=1 tinythink.asm tinythink-scalar
 
 format ELF64 executable 3
 entry start
 
+; ---- x86-64-v3 macro discipline ----
+; Explicit 32B lanes (pack width in the name), unaligned (U) memory ops
+; (our buffers carry no alignment guarantee), scalar tails. YMM0-YMM7 are
+; scratch inside vector routines (never carry cross-call state); each
+; vector routine ends with vzeroupper. Scalar reference builds select the
+; scalar path with: fasm -dUSE_SCALAR=1 tinythink.asm tinythink-scalar
+macro VEC_ZERO128 base* {
+    vmovdqu [base + 0], ymm0
+    vmovdqu [base + 32], ymm0
+    vmovdqu [base + 64], ymm0
+    vmovdqu [base + 96], ymm0
+}
+; callers zero ymm0 first: vpxor ymm0, ymm0, ymm0
+
 segment readable executable
 
 start:
+    ; x86-64-v3 baseline gate (FASM emits none; without this the first
+    ; v3-only instruction would die with SIGILL and no explanation).
+    mov eax, 1
+    cpuid                         ; ECX: FMA(12) MOVBE(22) OSXSAVE(27) AVX(28)
+    mov eax, ecx
+    and eax, 0x18401000
+    cmp eax, 0x18401000
+    jne v3_fail
+    xor ecx, ecx
+    xgetbv                        ; XCR0: XMM(1) + YMM(2) state enabled?
+    and eax, 6
+    cmp eax, 6
+    jne v3_fail
+    mov eax, 7
+    xor ecx, ecx
+    cpuid                         ; EBX: BMI1(3) AVX2(5) BMI2(8)
+    mov eax, ebx
+    and eax, 0x128
+    cmp eax, 0x128
+    jne v3_fail
+    mov eax, 0x80000001
+    cpuid                         ; ECX: LZCNT(5)
+    test ecx, 0x20
+    jz v3_fail
+    jmp v3_ok
+v3_fail:
+    mov eax, 1
+    mov edi, 2
+    lea rsi, [v3msg]
+    mov edx, v3msg_len
+    syscall
+    mov eax, 60
+    mov edi, 1
+    syscall
+v3_ok:
     cld
     lea rax, [outbuf]
     mov [outptr], rax
@@ -169,13 +230,52 @@ ou_emit:
     pop rbx
     jmp out_bytes
 
-; out_escaped(rsi=ptr, rdx=len)
+; out_escaped(rsi=ptr, rdx=len). v3: 32B clean-block copies (no byte
+; needing JSON escape in the lane) + scalar body/tail. Scalar build: body only.
 out_escaped:
     test rdx, rdx
     jz oe_ret
     push rbx
     mov rbx, rsi
     add rdx, rsi
+if defined USE_SCALAR
+    jmp oe_loop
+else
+    vpxor ymm0, ymm0, ymm0
+    vpbroadcastb ymm4, [c34]
+    vpbroadcastb ymm5, [c92]
+    vpbroadcastb ymm6, [c31]
+    vpbroadcastb ymm7, [c127]
+oe_blk:
+    mov rax, rdx
+    sub rax, rbx
+    cmp rax, 32
+    jb oe_loop
+    vmovdqu ymm1, [rbx]
+    vpcmpeqb ymm2, ymm1, ymm4    ; '"'
+    vpmovmskb eax, ymm2
+    mov r8d, eax
+    vpcmpeqb ymm2, ymm1, ymm5    ; '\'
+    vpmovmskb eax, ymm2
+    or r8d, eax
+    vpcmpgtb ymm2, ymm1, ymm6    ; > 31?
+    vpmovmskb eax, ymm2
+    not eax                     ; <= 31 (incl. >= 128 signed-negative)
+    or r8d, eax
+    vpcmpeqb ymm2, ymm1, ymm7    ; == 127?
+    vpmovmskb eax, ymm2
+    or r8d, eax
+    test r8d, r8d
+    jnz oe_loop                 ; lane needs escapes: one scalar byte
+    vmovdqu ymm2, [rbx]
+    mov rcx, [outlen]
+    mov rdi, [outptr]
+    add rdi, rcx
+    vmovdqu [rdi], ymm2
+    add qword [outlen], 32
+    add rbx, 32
+    jmp oe_blk
+end if
 oe_loop:
     cmp rbx, rdx
     jae oe_done
@@ -248,6 +348,10 @@ oe_raw:
     jmp oe_loop
 oe_done:
     pop rbx
+if defined USE_SCALAR
+else
+    vzeroupper
+end if
 oe_ret:
     ret
 
@@ -1469,8 +1573,11 @@ vn_bad:
     mov eax, 1
     ret
 
-; ascii_only(rsi, rdx=len): rax=0 ok, 1 bad. allows 9,10,13,32..126.
+; ascii_only(rsi, rdx=len): rax=0 ok, 1 bad. Allows 9,10,13,32..126.
+; v3: 32B classify lanes (sign-bit reject, DEL reject, <=31 minus 9/10/13
+; reject) + scalar tail. Scalar build: pure scalar loop.
 ascii_only:
+if defined USE_SCALAR
     test rdx, rdx
     jz ao_ok
 ao_loop:
@@ -1496,6 +1603,73 @@ ao_ok:
 ao_bad:
     mov eax, 1
     ret
+else
+    test rdx, rdx
+    jz ao_okv
+    vpxor ymm0, ymm0, ymm0
+    vpbroadcastb ymm2, [c127]
+    vpbroadcastb ymm4, [c31]
+    vpbroadcastb ymm5, [c9]
+    vpbroadcastb ymm6, [c10]
+    vpbroadcastb ymm7, [c13]
+ao_blk:
+    cmp rdx, 32
+    jb ao_tail
+    vmovdqu ymm1, [rsi]
+    vpmovmskb eax, ymm1          ; any byte >= 0x80?
+    test eax, eax
+    jnz ao_badv
+    vpcmpeqb ymm3, ymm1, ymm2    ; == 127?
+    vpmovmskb eax, ymm3
+    test eax, eax
+    jnz ao_badv
+    vpcmpgtb ymm3, ymm1, ymm4    ; > 31? (32..127; negatives already out)
+    vpmovmskb r8d, ymm3
+    vpcmpeqb ymm3, ymm1, ymm5    ; == 9?
+    vpmovmskb r9d, ymm3
+    vpcmpeqb ymm3, ymm1, ymm6    ; == 10?
+    vpmovmskb r10d, ymm3
+    vpcmpeqb ymm3, ymm1, ymm7    ; == 13?
+    vpmovmskb r11d, ymm3
+    or r9d, r10d
+    or r9d, r11d                ; allowed-low mask
+    not r8d                     ; <= 31 mask (all 32 lanes meaningful)
+    not r9d                     ; not-allowed mask
+    and r8d, r9d                ; bad = low AND not allowed
+    test r8d, r8d
+    jnz ao_badv
+    add rsi, 32
+    sub rdx, 32
+    jmp ao_blk
+ao_tail:
+    test rdx, rdx
+    jz ao_okv
+ao_sloop:
+    mov al, [rsi]
+    inc rsi
+    dec rdx
+    cmp al, 9
+    je ao_snext
+    cmp al, 10
+    je ao_snext
+    cmp al, 13
+    je ao_snext
+    cmp al, 32
+    jb ao_badv
+    cmp al, 126
+    ja ao_badv
+ao_snext:
+    test rdx, rdx
+    jnz ao_sloop
+ao_okv:
+    vzeroupper
+    xor eax, eax
+    ret
+ao_badv:
+    vzeroupper
+    mov eax, 1
+    ret
+end if
 
 ; ---------------- sqlite engine (pure asm, genuine file format) ----------------
 ; Clobbers rax,rcx,rdx,rsi,rdi,r8-r11; preserves rbx,rbp,r12-r15.
@@ -1780,12 +1954,33 @@ db_close:
     pop rax
     ret
 
+; memzero(rdi=dst, rcx=len). v3: 128B VEC_ZERO128 blocks + scalar tail.
+memzero:
+if defined USE_SCALAR
+    xor eax, eax
+    rep stosb
+    ret
+else
+    vpxor ymm0, ymm0, ymm0
+mz_loop:
+    cmp rcx, 128
+    jb mz_tail
+    VEC_ZERO128 rdi
+    add rdi, 128
+    sub rcx, 128
+    jmp mz_loop
+mz_tail:
+    xor eax, eax
+    rep stosb
+    vzeroupper
+    ret
+end if
+
 ; db_create: fresh header + master + empty leaf. rax 0/1.
 db_create:
     lea rdi, [pagebuf]
     mov ecx, 4096
-    xor eax, eax
-    rep stosb
+    call memzero
     lea rsi, [dbmagic]
     lea rdi, [pagebuf]
     mov ecx, 16
@@ -1866,8 +2061,7 @@ db_create:
     ; page 2: empty leaf
     lea rdi, [pagebuf]
     mov ecx, 4096
-    xor eax, eax
-    rep stosb
+    call memzero
     mov byte [pagebuf], 0x0D
     mov rax, 4096
     lea rdi, [pagebuf + 5]
@@ -2297,10 +2491,15 @@ ir_split:
 
 ; place_cell: insert celltmp/[clen] at right edge of [splitroot] table.
 ; Data pages only (base 0). Cell rowid must exceed table max (append order).
-; rax 0 ok / 1 io / 2 full.
+; Oversize cells (clen+2 > 4000, near page usable) are refused, never split.
+; rax 0 ok / 1 io / 2 full / 3 oversize.
 place_cell:
     push rbx
     push r12
+    mov rax, [clen]
+    add rax, 2
+    cmp rax, 4000
+    ja pc_over
     mov rdi, [splitroot]
     call rightmost_leaf
     test rax, rax
@@ -2359,6 +2558,11 @@ pc_err:
     pop r12
     pop rbx
     mov eax, 1
+    ret
+pc_over:
+    pop r12
+    pop rbx
+    mov eax, 3
     ret
 pc_split:
     call split_leaf
@@ -2677,7 +2881,7 @@ sp_rootcase:
     mov rax, [wcontent]
     lea rdi, [pagebuf + 5]
     call be16_st              ; content
-    mov edi, 2
+    mov rdi, [splitroot]
     lea rsi, [pagebuf]
     call pg_write
     test rax, rax
@@ -3029,8 +3233,7 @@ et_mk:
     mov [et_root], rax
     lea rdi, [leafbuf]
     mov ecx, 4096
-    xor eax, eax
-    rep stosb
+    call memzero
     mov byte [leafbuf], 0x0D
     mov rax, 4096
     lea rdi, [leafbuf + 5]
@@ -3261,6 +3464,8 @@ brt_cell:
     ret
 
 ; sub_find(field ptr rsi, len rdx, key ptr rdi, keylen rcx): rax=1 hit / 0 miss.
+; v3: 32B first-byte candidate lanes (broadcast + movmsk + tzcnt) with
+; scalar memcmp confirm; scalar tail (also covers lane-boundary starts).
 sub_find:
     test rcx, rcx
     jz sf_no
@@ -3273,6 +3478,63 @@ sub_find:
     mov r13, rdx
     sub r13, rcx                ; last start offset
     xor ebx, ebx
+if defined USE_SCALAR
+    jmp sf_loop
+else
+    push r14
+    push r15
+    mov r14, rdi                ; needle
+    mov r15, rcx                ; needlen
+    vpbroadcastb ymm4, [r14]    ; needle[0] x32
+av_lane:
+    mov rax, rbx
+    add rax, 32
+    mov rdx, r13
+    add rdx, r15                ; fieldlen
+    cmp rax, rdx
+    ja av_tail                  ; lane would overread: scalar tail
+    vmovdqu ymm1, [r12 + rbx]
+    vpcmpeqb ymm2, ymm1, ymm4
+    vpmovmskb eax, ymm2
+    test eax, eax
+    jz av_nextlane
+av_cand:
+    test eax, eax
+    jz av_nextlane
+    tzcnt ecx, eax              ; candidate bit index
+    shr eax, cl
+    mov r10, rbx
+    add r10, rcx                ; candpos
+    cmp r10, r13
+    ja av_consume               ; needle cannot fit here
+    mov rsi, r12
+    add rsi, r10
+    mov rdi, r14
+    mov rcx, r15
+    rep cmpsb
+    je av_hit
+av_consume:
+    shr eax, 1
+    jmp av_cand
+av_nextlane:
+    add rbx, 32
+    jmp av_lane
+av_tail:
+    mov rcx, r15
+    mov rdi, r14
+    pop r15
+    pop r14
+    jmp sf_loop
+av_hit:
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    vzeroupper
+    mov eax, 1
+    ret
+end if
 sf_loop:
     cmp rbx, r13
     ja sf_nom
@@ -3296,6 +3558,10 @@ sf_hitp:
     pop r13
     pop r12
     pop rbx
+if defined USE_SCALAR
+else
+    vzeroupper
+end if
     mov eax, 1
     ret
 sf_nextp:
@@ -3308,8 +3574,14 @@ sf_nom:
     pop r12
     pop rbx
 sf_no:
+if defined USE_SCALAR
     xor eax, eax
     ret
+else
+    vzeroupper
+    xor eax, eax
+    ret
+end if
 
 ; match_status(rsi, rdx=len): rax=0 ok / 1 bad.
 match_status:
@@ -4287,7 +4559,7 @@ op_fwrite:
     jz dc_params
     mov rsi, rax
     lea rdi, [mbody]
-    mov ecx, 4096
+    mov ecx, 1024
     call parse_str
     test rax, rax
     jz dc_params
@@ -4349,11 +4621,18 @@ ow_dbclose:
     lea rsi, [m_nodb]
     jmp err_id
 ow_insfail:
+    cmp rax, 3
+    je ow_big
     cmp rax, 2
     je ow_full
     call db_close
     lea rdi, [c_internal]
     lea rsi, [m_nodb]
+    jmp err_id
+ow_big:
+    call db_close
+    lea rdi, [c_params]
+    lea rsi, [m_big]
     jmp err_id
 ow_full:
     call db_close
@@ -4748,11 +5027,18 @@ om_dbclose:
     lea rsi, [m_nodb]
     jmp err_id
 om_insfail:
+    cmp rax, 3
+    je om_big
     cmp rax, 2
     je om_full
     call db_close
     lea rdi, [c_internal]
     lea rsi, [m_nodb]
+    jmp err_id
+om_big:
+    call db_close
+    lea rdi, [c_params]
+    lea rsi, [m_big]
     jmp err_id
 om_full:
     call db_close
@@ -6990,6 +7276,8 @@ ot_inner_end:
 segment readable writeable
 
 jnull db 'null', 0
+v3msg db 'tinythink: x86-64-v3 CPU required (AVX/AVX2/FMA/BMI1/BMI2/LZCNT)', 10
+v3msg_len = $ - v3msg
 
 j1 db '{"jsonrpc":"2.0","id":', 0
 jres db ',"result":', 0
@@ -7027,6 +7315,13 @@ pr_cr db 'critical', 0
 kd_ent db 'entity', 0
 kd_obs db 'observation', 0
 kd_fact db 'fact', 0
+c127 db 127
+c31 db 31
+c34 db 34
+c92 db 92
+c9 db 9
+c10 db 10
+c13 db 13
 
 k_method db '"method"', 0
 k_id db '"id"', 0

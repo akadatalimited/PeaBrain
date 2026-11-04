@@ -5,11 +5,15 @@ Sequential-thinking mimic plus a conclusion tool and a small memory
 core, backed by a real SQLite database written in pure asm (no includes,
 no libc). One ~37K statically-linked Linux binary.
 
-Needs: fasm (flat assembler) 1.73+, Linux x86-64.
+Needs: fasm (flat assembler) 1.73+, Linux x86-64 with x86-64-v3
+microarchitecture (AVX/AVX2/FMA/BMI1/BMI2/LZCNT; check
+/proc/cpuinfo). The binary gates on CPUID at startup (stderr +
+exit 1 on older CPUs) because FASM emits no runtime check.
 
 Build
 -----
-  fasm tinythink.asm tinythink
+  fasm tinythink.asm tinythink            # v3 baseline binary
+  fasm -dUSE_SCALAR=1 tinythink.asm tinythink-scalar   # scalar A/B reference
 
 Run (MCP stdio: newline-delimited JSON-RPC on stdin/stdout)
 -----
@@ -83,6 +87,27 @@ page size 4096, UTF-8, sqlite_master + data tables, rowid leaf pages,
 size-ordered leaf splits, root interior on first split, dead space on
 the freelist, whole-db flock, fsync per write txn. No overflow pages,
 no journal.
+
+Value cap: no single TEXT value over 1024 bytes (fact bodies included).
+Max cell ~1.2KB < page/3, so both split halves always fit; oversize
+cells are refused ("too large"), never written.
+
+x86-64-v3 use (explicit 32B lanes, unaligned ops, scalar tails,
+vzeroupper hygiene; VEC_ZERO128 macro): 4K page zeroing, ascii
+validation bulk lanes, JSON-escape clean-block copies, substring
+first-byte filters. Deliberately scalar: JSON parser, b-tree splits,
+thought recording (pointer-chasing/varints/branches; SIMD-hostile).
+
+Measured on i9-13900K, pinned core, interleaved rounds, medians
+(v3 vs scalar reference, same workload):
+  search full-scan miss, 2k obs:  0.072ms vs 0.097ms  (~1.35x)
+  search hit, 2k obs:             0.091ms vs 0.110ms  (~1.2x)
+  thought record:                 parity (scalar path, as expected)
+  write 1K (fsync-dominated):     parity
+  read 1K clean / escape-dense:   parity / ~0.87x (fast path never
+                                  triggers on adversarial input; typical
+                                  text is clean and neutral-or-better)
+Behavioural identity v3 vs scalar verified by differential suites.
 
 Smoke test
 ----------
