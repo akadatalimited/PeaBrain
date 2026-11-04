@@ -3726,10 +3726,10 @@ uf_done:
     test rax, rax
     jnz uf_abort
     mov qword [udirty], 0
-    mov rax, [maxrowid]
-    mov qword [svstate + 8], rax   ; keep the advanced high-water mark:
-    push rax                       ; the shared restore below must not
-    jmp uf_restore                 ; revert it to the pre-flush value
+    push rax                       ; hdr_touch status (0): use_flush must
+    mov rax, [maxrowid]            ; return 0 on success, so save it first;
+    mov qword [svstate + 8], rax   ; then refresh the slot with the advanced
+    jmp uf_restore                 ; high-water mark for the shared restore
 uf_abort:
     ; Placed rows persist (the piggyback commits with the outer txn, and
     ; the exit path commits too), so the pre-flush counter must not come
