@@ -3,7 +3,7 @@ tinythink - thinking + memory MCP server in pure x86-64 assembly
 
 Sequential-thinking mimic plus a conclusion tool and a small memory
 core, backed by a real SQLite database written in pure asm (no includes,
-no libc). One ~44K statically-linked Linux binary.
+no libc). One ~49K statically-linked Linux binary.
 
 Needs: fasm (flat assembler) 1.73+, Linux x86-64 with x86-64-v3
 microarchitecture (AVX/AVX2/FMA/BMI1/BMI2/LZCNT; check
@@ -56,6 +56,15 @@ conclusion {reason, thought?, conclusion?, valid?}: conclusions table
 read_fact {name} / write_fact {name,text} / list_facts {}: facts table
   (name TEXT, body TEXT), append-only versions, latest rowid wins.
   Names 1..64 [A-Za-z0-9._-]; bodies 0..4096 ascii.
+delete_fact {name} / delete_fact_prefix {prefix} / read_fact_versions {name}:
+  tombstones(name) table; tombstoned names read as missing everywhere
+  (facts, entities, search, open) and refuse writes ("tombstoned",
+  write-once, no resurrect). Prefix bulk-tombstones benchmark
+  namespaces (cap 128, reports capped). Versions lists every version
+  newest-first with a current flag plus tombstone state. Tombstones
+  hide rows but bytes remain on disk: NOT secure deletion.
+health {}: {tables, pages, journal, cache_used, usage_tracked,
+  pending_flush} for operators.
 create_entities {name, type?, project?, observations?[]}: entities table.
   Duplicate names return the existing row with created:false.
 add_observations {name, observations[1..16]}: appends (auto-creates

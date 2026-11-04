@@ -1599,6 +1599,30 @@ do_call:
     call cmp_name
     test rax, rax
     jnz op_mkrel
+    lea rsi, [toolbuf]
+    mov rdx, [toollen]
+    lea rdi, [t_delete]
+    call cmp_name
+    test rax, rax
+    jnz op_delete
+    lea rsi, [toolbuf]
+    mov rdx, [toollen]
+    lea rdi, [t_delprefix]
+    call cmp_name
+    test rax, rax
+    jnz op_delprefix
+    lea rsi, [toolbuf]
+    mov rdx, [toollen]
+    lea rdi, [t_versions]
+    call cmp_name
+    test rax, rax
+    jnz op_versions
+    lea rsi, [toolbuf]
+    mov rdx, [toollen]
+    lea rdi, [t_health]
+    call cmp_name
+    test rax, rax
+    jnz op_health
     lea rdi, [c_params]
     lea rsi, [m_notool]
     jmp err_id
@@ -3241,6 +3265,12 @@ need_create:
     test rax, rax
     js nc_yes
     jz nc_yes
+    lea rsi, [t_tomb_n]
+    mov edx, 10
+    call find_table
+    test rax, rax
+    js nc_yes
+    jz nc_yes
     pop qword [mmaxrowid]
     pop qword [maxrowid]
     xor eax, eax
@@ -3249,6 +3279,15 @@ nc_yes:
     pop qword [mmaxrowid]
     pop qword [maxrowid]
     mov eax, 1
+    ret
+
+; is_tombstoned(rsi=name, rdx=len): rax 1 tombstoned / 0 live / 2 corrupt.
+; Db must be open (reads tombstones table). Preserves rbx,rbp,r12-r15.
+is_tombstoned:
+    mov [mkey], rsi
+    mov [mkeylen], rdx
+    mov rdi, [f_root_tomb]
+    call scan_key_latest
     ret
 
 ; db_open: shared/read (LOCK_SH). db_open_ex: exclusive/write (LOCK_EX).
@@ -5302,6 +5341,28 @@ et_mk_use:
     mov [f_root_use], rax
     jmp et_uok
 et_uok:
+    ; tombstones (retention; hidden from reads, bytes remain)
+    lea rsi, [t_tomb_n]
+    mov edx, 10
+    call find_table
+    test rax, rax
+    js et_err
+    jnz et_tf2
+    lea rax, [t_tomb_n]
+    mov [m_name], rax
+    mov qword [m_namelen], 10
+    lea rax, [t_tomb_sql]
+    mov [m_sql], rax
+    mov rax, t_tomb_sqllen
+    mov [m_sqllen], rax
+    call et_mk
+    test rax, rax
+    jz et_err
+    mov [f_root_tomb], rax
+    jmp et_tok
+et_tf2:
+    mov [f_root_tomb], rax
+et_tok:
     xor eax, eax
     ret
 et_err:
@@ -6398,6 +6459,13 @@ op_fread:
     jnz oc_db
     lea rsi, [rsnbuf]
     mov rdx, [rsnlen]
+    call is_tombstoned             ; hidden names read as missing
+    cmp rax, 1
+    je of_miss
+    cmp rax, 2
+    je oc_corrupt
+    lea rsi, [rsnbuf]
+    mov rdx, [rsnlen]
     mov [mkey], rsi
     mov [mkeylen], rdx
     mov rdi, [f_root_facts]
@@ -6495,6 +6563,13 @@ op_fwrite:
     call db_open_ex
     test rax, rax
     jnz oc_db
+    lea rsi, [rsnbuf]
+    mov rdx, [rsnlen]
+    call is_tombstoned             ; tombstoned names stay buried
+    cmp rax, 1
+    je ow_tomb
+    cmp rax, 2
+    je ow_dbclose
     mov rdi, [f_root_facts]
     call scan_max
     test rax, rax
@@ -6543,6 +6618,11 @@ ow_dbclose:
     lea rdi, [c_internal]
     lea rsi, [m_nodb]
     jmp err_id
+ow_tomb:
+    call db_close
+    lea rdi, [c_params]
+    lea rsi, [m_tomb]
+    jmp err_id
 ow_insfail:
     cmp rax, 3
     je ow_big
@@ -6588,6 +6668,7 @@ ofl_page:
     shl rax, 3
     add rsi, rax
     mov rdi, [rsi]
+    mov [scurpg], rdi               ; tomb walk reuses pagebuf: restore point
     lea rsi, [pagebuf]
     call pg_read
     test rax, rax
@@ -6670,6 +6751,23 @@ olf_add:
     jae olf_tail                  ; seen-set full: stop
     cmp qword [outlen], 60000
     ja olf_tail
+    mov rsi, r11                  ; copy name aside: tomb walk reuses pagebuf
+    lea rdi, [rsnbuf]
+    mov rcx, r10
+    rep movsb
+    mov [rsnlen], r10
+    lea rsi, [rsnbuf]
+    mov rdx, [rsnlen]
+    call is_tombstoned
+    cmp rax, 1
+    je olf_skip                   ; hidden: restore page, skip all output
+    cmp rax, 2
+    je ow_dbclose
+    mov rdi, [scurpg]             ; restore facts page clobbered above
+    lea rsi, [pagebuf]
+    call pg_read
+    test rax, rax
+    jnz olf_nextcell
     cmp byte [hfirst], 1
     je olf_first
     mov al, '\'
@@ -6680,21 +6778,29 @@ olf_add:
 olf_first:
     mov byte [hfirst], 0
 olf_emit:
-    mov rsi, r11
-    mov rdx, r10
+    lea rsi, [rsnbuf]
+    mov rdx, [rsnlen]
     call out_escaped
     ; store in seen
     lea rdi, [fseen]
     mov rax, [fseenn]
     imul rax, rax, 65
     add rdi, rax
-    mov rax, r10
+    mov rax, [rsnlen]
     mov [rdi], al                 ; len byte
-    mov rsi, r11
+    lea rsi, [rsnbuf]
     lea rdi, [rdi + 1]
-    mov rcx, r10
+    mov rcx, [rsnlen]
     rep movsb
     inc qword [fseenn]
+    jmp olf_nextcell
+olf_skip:
+    mov rdi, [scurpg]               ; same restore on the skip path
+    lea rsi, [pagebuf]
+    call pg_read
+    test rax, rax
+    jnz olf_nextpg
+    jmp olf_nextcell
 olf_nextcell:
     test rbx, rbx
     jz olf_nextpg
@@ -6819,6 +6925,13 @@ om_noproj:
     call db_open_ex
     test rax, rax
     jnz oc_db
+    lea rsi, [rsnbuf]
+    mov rdx, [rsnlen]
+    call is_tombstoned
+    cmp rax, 1
+    je ow_tomb
+    cmp rax, 2
+    je om_dbclose
     ; dup? -> return existing, created:false
     lea rsi, [rsnbuf]
     mov rdx, [rsnlen]
@@ -7055,6 +7168,13 @@ op_addobs:
     call db_open_ex
     test rax, rax
     jnz oc_db
+    lea rsi, [rsnbuf]
+    mov rdx, [rsnlen]
+    call is_tombstoned
+    cmp rax, 1
+    je ow_tomb
+    cmp rax, 2
+    je om_dbclose
     ; ensure entity (auto-create stub)
     lea rsi, [rsnbuf]
     mov rdx, [rsnlen]
@@ -7232,6 +7352,20 @@ op_mkrel:
     call db_open_ex
     test rax, rax
     jnz oc_db
+    lea rsi, [rsnbuf]
+    mov rdx, [rsnlen]
+    call is_tombstoned             ; endpoints must be live
+    cmp rax, 1
+    je ow_tomb
+    cmp rax, 2
+    je om_dbclose
+    lea rsi, [relbuf]
+    mov rdx, [rllen]
+    call is_tombstoned
+    cmp rax, 1
+    je ow_tomb
+    cmp rax, 2
+    je om_dbclose
     ; dup triple? scan all rel rows for exact match
     mov rdi, [f_root_rel]
     call walk_leaves
@@ -7527,6 +7661,39 @@ st_m1:
 st_hit:
     test rax, rax
     jz st_nextcell
+    ; hidden names (fact/entity, or obs of a hidden entity) never surface.
+    ; NB: copy aside first: the tomb walk reuses pagebuf, which gfo points
+    ; into. is_tombstoned key must never alias pagebuf (same rule applies
+    ; to all callers: pass rsnbuf/relbuf/fseen, never gfo).
+    mov rcx, qword [gfl]
+    cmp rcx, 64
+    ja st_collect                 ; longer than any valid name: can't match
+    mov rsi, qword [gfo]
+    lea rdi, [rsnbuf]
+    rep movsb
+    mov rax, qword [gfl]
+    mov [rsnlen], rax
+    lea rsi, [rsnbuf]
+    mov rdx, [rsnlen]
+    call is_tombstoned
+    cmp rax, 1
+    je st_skip
+    cmp rax, 2
+    je os_dbclose
+    mov rdi, [scurpg]               ; restore scan page (tomb walk reused pagebuf)
+    lea rsi, [pagebuf]
+    call pg_read
+    test rax, rax
+    jnz st_nextpg
+    jmp st_collect
+st_skip:
+    mov rdi, [scurpg]               ; same restore on the skip path
+    lea rsi, [pagebuf]
+    call pg_read
+    test rax, rax
+    jnz st_nextpg
+    jmp st_nextcell
+st_collect:
     ; collect (score,mode,pgno,celloff) for usage-ranked emission
     mov rax, [sncol]
     cmp rax, 64
@@ -7546,6 +7713,11 @@ st_hit:
     mov rcx, [stcoff]
     mov [rdx + 24], rcx
     inc qword [sncol]
+    mov rdi, [scurpg]               ; tomb walk reused pagebuf: restore
+    lea rsi, [pagebuf]
+    call pg_read
+    test rax, rax
+    jnz st_nextpg
     jmp st_nextcell
 st_sortemit:
     ; insertion sort sbuf[0..sncol) by score desc, stable (ties keep walk order)
@@ -7712,6 +7884,726 @@ st_err:
     mov eax, 1
     ret
 
+; tomb_insert(rsi=name, rdx=len): append one tombstone row. Db open+locked.
+; rax 0 ok / 1 io-or-full. Preserves rbx,rbp,r12-r15.
+tomb_insert:
+    push rbx
+    push r12
+    mov [tombnm], rsi
+    mov [tombnl], rdx
+    mov rdi, [f_root_tomb]
+    call scan_max
+    test rax, rax
+    jnz ti_err
+    mov rax, [maxrowid]
+    inc rax
+    mov [newrowid], rax
+    mov rsi, [tombnm]
+    mov rdx, [tombnl]
+    mov qword [colp], rsi
+    mov qword [coll], rdx
+    mov qword [ncols], 1
+    call build_record_text
+    mov rax, [f_root_tomb]
+    mov [splitroot], rax
+    call place_cell
+    test rax, rax
+    jnz ti_err
+    mov rax, [newrowid]
+    mov [maxrowid], rax
+    call hdr_touch
+    test rax, rax
+    jnz ti_err
+    pop r12
+    pop rbx
+    xor eax, eax
+    ret
+ti_err:
+    pop r12
+    pop rbx
+    mov eax, 1
+    ret
+
+; op_delete {name}: tombstone one fact/entity name (write-once; bytes remain).
+op_delete:
+    mov rsi, [pp]
+    lea rdi, [k_args]
+    mov ecx, 11
+    call find_val
+    test rax, rax
+    jz dc_params
+    mov [ap], rax
+    mov rsi, [ap]
+    lea rdi, [k_name]
+    mov ecx, 6
+    call find_val
+    test rax, rax
+    jz dc_params
+    mov rsi, rax
+    lea rdi, [rsnbuf]
+    mov ecx, 64
+    call parse_str
+    test rax, rax
+    jz dc_params
+    test rdx, rdx
+    jz dc_params
+    mov [rsnlen], rdx
+    lea rsi, [rsnbuf]
+    mov rdx, [rsnlen]
+    call valid_name
+    test rax, rax
+    jnz oc_badname
+    call db_open_ex
+    test rax, rax
+    jnz oc_db
+    lea rsi, [rsnbuf]
+    mov rdx, [rsnlen]
+    call is_tombstoned
+    cmp rax, 1
+    je od_dup
+    cmp rax, 2
+    je om_dbclose
+    lea rsi, [rsnbuf]
+    mov rdx, [rsnlen]
+    call tomb_insert
+    test rax, rax
+    jnz om_dbclose
+    call db_close
+    lea rax, [jsontmp]
+    mov [outptr], rax
+    mov qword [outlen], 0
+    lea rsi, [jn_versions]
+    call out_cstr
+    lea rsi, [rsnbuf]
+    mov rdx, [rsnlen]
+    call out_escaped
+    mov al, '"'
+    call out_byte
+    lea rsi, [jn_deleted]
+    call out_cstr
+    lea rsi, [b_true]
+    call out_cstr
+    mov al, '}'
+    call out_byte
+    jmp oc_envelope
+od_dup:
+    call db_close
+    lea rax, [jsontmp]
+    mov [outptr], rax
+    mov qword [outlen], 0
+    lea rsi, [jn_versions]
+    call out_cstr
+    lea rsi, [rsnbuf]
+    mov rdx, [rsnlen]
+    call out_escaped
+    mov al, '"'
+    call out_byte
+    lea rsi, [jn_deleted]
+    call out_cstr
+    lea rsi, [b_false]
+    call out_cstr
+    lea rsi, [jn_note]
+    call out_cstr
+    lea rsi, [m_already]
+    call out_cstr
+    mov al, '"'
+    call out_byte
+    mov al, '}'
+    call out_byte
+    jmp oc_envelope
+
+; collect_prefix(rdi=root): distinct names starting with qbuf/qlen into
+; fseen/fseenn (cap 128, sets dpcap). rax 0 ok / 1 io. No output.
+collect_prefix:
+    push rbx
+    push r12
+    push r15
+    call walk_leaves
+    test rax, rax
+    jnz cp_err
+    mov rax, [childn]
+    test rax, rax
+    jz cp_done
+    dec rax
+    mov [wn], rax
+cp_page:
+    lea rsi, [childtab]
+    mov rax, [wn]
+    shl rax, 3
+    add rsi, rax
+    mov rdi, [rsi]
+    lea rsi, [pagebuf]
+    call pg_read
+    test rax, rax
+    jnz cp_nextpg
+    cmp byte [pagebuf], 0x0D
+    jne cp_nextpg
+    lea rsi, [pagebuf + 3]
+    call be16_ld
+    test rax, rax
+    jz cp_nextpg
+    mov rbx, rax
+    dec rbx
+cp_cell:
+    lea rsi, [pagebuf + 8]
+    mov rax, rbx
+    shl rax, 1
+    add rsi, rax
+    call be16_ld
+    lea r15, [pagebuf]
+    add r15, rax
+    lea rdx, [pagebuf + 4096]
+    mov rsi, r15
+    call varint_get
+    test rcx, rcx
+    jz cp_nextcell
+    mov rsi, rcx
+    call varint_get
+    test rcx, rcx
+    jz cp_nextcell
+    mov rsi, rcx
+    call varint_get
+    test rcx, rcx
+    jz cp_nextcell
+    mov rsi, rcx
+    call varint_get
+    test rcx, rcx
+    jz cp_nextcell
+    mov r10, rax
+    cmp r10, 13
+    jb cp_nextcell
+    test r10b, 1
+    jz cp_nextcell
+    sub r10, 13
+    shr r10, 1
+    cmp r10, 64
+    ja cp_nextcell
+    mov rsi, rcx
+    call varint_get               ; s1 = body serial (skip to body)
+    test rcx, rcx
+    jz cp_nextcell
+    mov r11, rcx                  ; body = col0 (name) value
+    mov rax, r11
+    add rax, r10
+    lea rdx, [pagebuf + 4096]
+    cmp rax, rdx
+    ja cp_nextcell
+    ; prefix?
+    mov rcx, [qlen]
+    cmp r10, rcx
+    jb cp_nextcell
+    mov rsi, r11
+    lea rdi, [qbuf]
+    rep cmpsb
+    jne cp_nextcell
+    ; seen?
+    xor r12d, r12d
+cp_seen:
+    cmp r12, [fseenn]
+    jae cp_add
+    lea rsi, [fseen]
+    mov rax, r12
+    imul rax, rax, 65
+    add rsi, rax
+    movzx eax, byte [rsi]
+    cmp rax, r10
+    jne cp_nextseen
+    lea rdi, [rsi + 1]
+    mov rsi, r11
+    mov rcx, r10
+    rep cmpsb
+    je cp_nextcell
+cp_nextseen:
+    inc r12
+    jmp cp_seen
+cp_add:
+    cmp qword [fseenn], 128
+    jae cp_full
+    lea rdi, [fseen]
+    mov rax, [fseenn]
+    imul rax, rax, 65
+    add rdi, rax
+    mov rax, r10
+    mov [rdi], al
+    mov rsi, r11
+    lea rdi, [rdi + 1]
+    mov rcx, r10
+    rep movsb
+    inc qword [fseenn]
+cp_nextcell:
+    test rbx, rbx
+    jz cp_nextpg
+    dec rbx
+    jmp cp_cell
+cp_nextpg:
+    cmp qword [wn], 0
+    je cp_done
+    dec qword [wn]
+    jmp cp_page
+cp_full:
+    mov qword [dpcap], 1
+cp_done:
+    pop r15
+    pop r12
+    pop rbx
+    xor eax, eax
+    ret
+cp_err:
+    pop r15
+    pop r12
+    pop rbx
+    mov eax, 1
+    ret
+
+; op_delprefix {prefix}: tombstone all facts/entities starting with prefix.
+op_delprefix:
+    mov rsi, [pp]
+    lea rdi, [k_args]
+    mov ecx, 11
+    call find_val
+    test rax, rax
+    jz dc_params
+    mov [ap], rax
+    mov rsi, [ap]
+    lea rdi, [k_prefix]
+    mov ecx, 8
+    call find_val
+    test rax, rax
+    jz dc_params
+    mov rsi, rax
+    lea rdi, [qbuf]
+    mov ecx, 64
+    call parse_str
+    test rax, rax
+    jz dc_params
+    test rdx, rdx
+    jz dc_params
+    mov [qlen], rdx
+    lea rsi, [qbuf]
+    mov rdx, [qlen]
+    call ascii_only
+    test rax, rax
+    jnz oc_ascii
+    call db_open_ex
+    test rax, rax
+    jnz oc_db
+    mov qword [fseenn], 0
+    mov qword [dpcap], 0
+    mov qword [scount], 0
+    mov rdi, [f_root_facts]
+    call collect_prefix
+    test rax, rax
+    jnz om_dbclose
+    mov rdi, [f_root_ent]
+    call collect_prefix
+    test rax, rax
+    jnz om_dbclose
+    mov qword [stci], 0
+dp_each:
+    mov rax, [stci]
+    cmp rax, [fseenn]
+    jae dp_done
+    lea rsi, [fseen]
+    imul rax, rax, 65
+    add rsi, rax
+    movzx edx, byte [rsi]
+    lea rsi, [rsi + 1]
+    call is_tombstoned
+    cmp rax, 1
+    je dp_next
+    cmp rax, 2
+    je om_dbclose
+    mov rax, [stci]
+    lea rsi, [fseen]
+    imul rax, rax, 65
+    add rsi, rax
+    movzx edx, byte [rsi]
+    lea rsi, [rsi + 1]
+    call tomb_insert
+    test rax, rax
+    jnz om_dbclose
+    inc qword [scount]
+dp_next:
+    inc qword [stci]
+    jmp dp_each
+dp_done:
+    call db_close
+    lea rax, [jsontmp]
+    mov [outptr], rax
+    mov qword [outlen], 0
+    lea rsi, [jn_prefix]
+    call out_cstr
+    lea rsi, [qbuf]
+    mov rdx, [qlen]
+    call out_escaped
+    mov al, '"'
+    call out_byte
+    lea rsi, [jn_tombed]
+    call out_cstr
+    mov rax, [scount]
+    call out_uint
+    lea rsi, [jn_capped]
+    call out_cstr
+    cmp qword [dpcap], 0
+    je dp_uncapped
+    lea rsi, [b_true]
+    call out_cstr
+    jmp dp_tail
+dp_uncapped:
+    lea rsi, [b_false]
+    call out_cstr
+dp_tail:
+    mov al, '}'
+    call out_byte
+    jmp oc_envelope
+
+; op_versions {name, limit?}: every version of a fact, newest first.
+op_versions:
+    mov rsi, [pp]
+    lea rdi, [k_args]
+    mov ecx, 11
+    call find_val
+    test rax, rax
+    jz dc_params
+    mov [ap], rax
+    mov rsi, [ap]
+    lea rdi, [k_name]
+    mov ecx, 6
+    call find_val
+    test rax, rax
+    jz dc_params
+    mov rsi, rax
+    lea rdi, [rsnbuf]
+    mov ecx, 64
+    call parse_str
+    test rax, rax
+    jz dc_params
+    test rdx, rdx
+    jz dc_params
+    mov [rsnlen], rdx
+    lea rsi, [rsnbuf]
+    mov rdx, [rsnlen]
+    call valid_name
+    test rax, rax
+    jnz oc_badname
+    mov qword [slim], 20
+    mov rsi, [ap]
+    lea rdi, [k_limit]
+    mov ecx, 7
+    call find_val
+    test rax, rax
+    jz ov_nolim
+    mov rsi, rax
+    call parse_int
+    test rax, rax
+    jnz dc_params
+    mov rax, [numval]
+    cmp rax, 1
+    jb dc_params
+    cmp rax, 20
+    ja dc_params
+    mov [slim], rax
+ov_nolim:
+    call db_open
+    test rax, rax
+    jnz oc_db
+    lea rsi, [rsnbuf]
+    mov rdx, [rsnlen]
+    call is_tombstoned
+    cmp rax, 2
+    je oc_corrupt
+    mov [ts1], rax                ; tombstoned flag (0/1)
+    lea rax, [jsontmp]
+    mov [outptr], rax
+    call out_reset
+    lea rsi, [jn_versions]
+    call out_cstr
+    lea rsi, [rsnbuf]
+    mov rdx, [rsnlen]
+    call out_escaped
+    mov al, '"'
+    call out_byte
+    lea rsi, [jn_tombflag]
+    call out_cstr
+    cmp qword [ts1], 0
+    je ov_live
+    lea rsi, [b_true]
+    call out_cstr
+    jmp ov_arr
+ov_live:
+    lea rsi, [b_false]
+    call out_cstr
+ov_arr:
+    lea rsi, [jn_versarr]
+    call out_cstr
+    mov byte [hfirst], 1
+    mov qword [scount], 0
+    mov rdi, [f_root_facts]
+    call walk_leaves
+    test rax, rax
+    jnz ov_dbclose
+    mov rax, [childn]
+    test rax, rax
+    jz ov_tail
+    dec rax
+    mov [wn], rax
+ov_page:
+    lea rsi, [childtab]
+    mov rax, [wn]
+    shl rax, 3
+    add rsi, rax
+    mov rdi, [rsi]
+    lea rsi, [pagebuf]
+    call pg_read
+    test rax, rax
+    jnz ov_nextpg
+    cmp byte [pagebuf], 0x0D
+    jne ov_nextpg
+    lea rsi, [pagebuf + 3]
+    call be16_ld
+    test rax, rax
+    jz ov_nextpg
+    mov rbx, rax
+    dec rbx
+ov_cell:
+    lea rsi, [pagebuf + 8]
+    mov rax, rbx
+    shl rax, 1
+    add rsi, rax
+    call be16_ld
+    lea rsi, [pagebuf]
+    add rsi, rax
+    lea rdx, [pagebuf + 4096]
+    call varint_get
+    test rcx, rcx
+    jz ov_nextcell
+    mov rsi, rcx
+    call varint_get
+    test rcx, rcx
+    jz ov_nextcell
+    mov [tmprow], rax             ; rowid
+    mov rsi, rcx
+    call varint_get
+    test rcx, rcx
+    jz ov_nextcell
+    mov rsi, rcx
+    call varint_get               ; s0 = name serial
+    test rcx, rcx
+    jz ov_nextcell
+    mov r10, rax
+    cmp r10, 13
+    jb ov_nextcell
+    test r10b, 1
+    jz ov_nextcell
+    sub r10, 13
+    shr r10, 1                    ; namelen
+    cmp r10, [rsnlen]
+    jne ov_nextcell
+    mov rsi, rcx
+    call varint_get               ; s1 = body serial
+    test rcx, rcx
+    jz ov_nextcell
+    mov r12, rax
+    cmp r12, 13
+    jb ov_nextcell
+    test r12b, 1
+    jz ov_nextcell
+    sub r12, 13
+    shr r12, 1                    ; bodylen
+    mov r11, rcx                  ; body = col0 (name) value
+    mov rax, r11
+    add rax, r10
+    add rax, r12                  ; col1 end
+    lea rdx, [pagebuf + 4096]
+    cmp rax, rdx
+    ja ov_nextcell
+    mov rsi, r11
+    lea rdi, [rsnbuf]
+    mov rcx, r10
+    rep cmpsb
+    jne ov_nextcell
+    mov rsi, r11
+    add rsi, r10                  ; col1 (body) value
+    mov [ulkey], rsi              ; borrow as scratch (no load/flush here)
+    mov [ulhits], r12
+    ; cap + budget
+    mov rax, [scount]
+    cmp rax, [slim]
+    jae ov_tail
+    cmp qword [outlen], 60000
+    ja ov_tail
+    cmp byte [hfirst], 1
+    je ov_first
+    mov al, ','
+    call out_byte
+    jmp ov_emit
+ov_first:
+    mov byte [hfirst], 0
+ov_emit:
+    lea rsi, [jc_rowid + 1]       ; '"rowid":' (skip leading {)
+    call out_cstr
+    mov rax, [tmprow]
+    call out_uint
+    lea rsi, [jn_body]
+    call out_cstr
+    mov rsi, [ulkey]
+    mov rdx, [ulhits]
+    call out_escaped
+    mov al, '"'
+    call out_byte
+    lea rsi, [jn_current]
+    call out_cstr
+    cmp qword [scount], 0
+    je ov_cur
+    lea rsi, [b_false]
+    call out_cstr
+    jmp ov_emitted
+ov_cur:
+    lea rsi, [b_true]
+    call out_cstr
+ov_emitted:
+    mov al, '}'
+    call out_byte
+    inc qword [scount]
+ov_nextcell:
+    test rbx, rbx
+    jz ov_nextpg
+    dec rbx
+    jmp ov_cell
+ov_nextpg:
+    cmp qword [wn], 0
+    je ov_tail
+    dec qword [wn]
+    jmp ov_page
+ov_tail:
+    call db_close
+    mov al, ']'
+    call out_byte
+    mov al, '}'
+    call out_byte
+    jmp oc_envelope
+ov_dbclose:
+    call db_close
+    lea rdi, [c_internal]
+    lea rsi, [m_nodb]
+    jmp err_id
+
+; op_health {}: diagnostics for operators.
+op_health:
+    call db_open
+    test rax, rax
+    jnz oc_db
+    mov qword [scount], 0
+    cmp qword [f_root_facts], 0
+    je oh_1
+    inc qword [scount]
+oh_1:
+    cmp qword [f_root_ent], 0
+    je oh_2
+    inc qword [scount]
+oh_2:
+    cmp qword [f_root_obs], 0
+    je oh_3
+    inc qword [scount]
+oh_3:
+    cmp qword [f_root_rel], 0
+    je oh_4
+    inc qword [scount]
+oh_4:
+    cmp qword [f_root_tasks], 0
+    je oh_5
+    inc qword [scount]
+oh_5:
+    cmp qword [f_root_use], 0
+    je oh_6
+    inc qword [scount]
+oh_6:
+    cmp qword [f_root_tomb], 0
+    je oh_7
+    inc qword [scount]
+oh_7:
+    mov rax, [dbpages]
+    mov [tmprow], rax
+    call jhave
+    mov [ts1], rax
+    xor ecx, ecx
+    xor eax, eax
+oh_cache:
+    cmp rcx, 16
+    jae oh_cached
+    lea rsi, [cpg]
+    mov rdx, rcx
+    shl rdx, 3
+    cmp qword [rsi + rdx], 0
+    je oh_cnext
+    inc rax
+oh_cnext:
+    inc rcx
+    jmp oh_cache
+oh_cached:
+    mov [ts2], rax
+    xor ecx, ecx
+    xor eax, eax
+oh_use:
+    cmp rcx, 8192
+    jae oh_used
+    mov rdx, rcx
+    imul rdx, rdx, 24
+    lea rsi, [utab]
+    cmp qword [rsi + rdx], 0
+    je oh_unext
+    inc rax
+oh_unext:
+    inc rcx
+    jmp oh_use
+oh_used:
+    mov [ts3], rax
+    call db_close
+    lea rax, [jsontmp]
+    mov [outptr], rax
+    mov qword [outlen], 0
+    lea rsi, [jn_tables]
+    call out_cstr
+    mov rax, [scount]
+    call out_uint
+    lea rsi, [jn_pages]
+    call out_cstr
+    mov rax, [tmprow]
+    call out_uint
+    lea rsi, [jn_journal]
+    call out_cstr
+    cmp qword [ts1], 0
+    je oh_nj
+    lea rsi, [b_true]
+    call out_cstr
+    jmp oh_nw
+oh_nj:
+    lea rsi, [b_false]
+    call out_cstr
+oh_nw:
+    lea rsi, [jn_cacheused]
+    call out_cstr
+    mov rax, [ts2]
+    call out_uint
+    lea rsi, [jn_tracked]
+    call out_cstr
+    mov rax, [ts3]
+    call out_uint
+    lea rsi, [jn_pending]
+    call out_cstr
+    cmp qword [udirty], 0
+    je oh_np
+    lea rsi, [b_true]
+    call out_cstr
+    jmp hh_tail
+oh_np:
+    lea rsi, [b_false]
+    call out_cstr
+hh_tail:
+    mov al, '}'
+    call out_byte
+    jmp oc_envelope
+
 ; op_search {query, limit?}
 op_search:
     mov rsi, [pp]
@@ -7857,7 +8749,14 @@ oo_loop:
     test rax, rax
     jnz oo_bad
     inc rbx
-    ; lookup entity (latest)
+    ; lookup entity (latest); tombstoned names report missing
+    lea rsi, [relbuf]
+    mov rdx, [rllen]
+    call is_tombstoned
+    cmp rax, 1
+    je oo_missing
+    cmp rax, 2
+    je oo_dbclose
     lea rsi, [relbuf]
     mov rdx, [rllen]
     mov [mkey], rsi
@@ -9396,6 +10295,7 @@ k_search db '"search"', 0
 k_from db '"from"', 0
 k_to db '"to"', 0
 k_entity db '"entity"', 0
+k_prefix db '"prefix"', 0
 
 m_init db 'initialize', 0
 m_disc db 'server/discover', 0
@@ -9418,6 +10318,10 @@ t_mktask db 'create_task_or_note', 0
 t_query db 'query_tasks', 0
 t_updtask db 'update_task', 0
 t_mkrel db 'create_relations', 0
+t_delete db 'delete_fact', 0
+t_delprefix db 'delete_fact_prefix', 0
+t_versions db 'read_fact_versions', 0
+t_health db 'health', 0
 
 c_parse db '-32700', 0
 c_invalid db '-32600', 0
@@ -9440,6 +10344,7 @@ m_dbfull db 'db full', 0
 m_ascii db 'ascii only', 0
 m_nofile db 'not found', 0
 m_big db 'too large', 0
+m_tomb db 'tombstoned', 0
 
 dbexe db '/proc/self/exe', 0
 dbfile db 'tinythink.db', 0
@@ -9461,6 +10366,9 @@ t_rel_sqllen = $ - t_rel_sql - 1
 t_task_n db 'tasks', 0
 t_task_sql db 'CREATE TABLE tasks(title TEXT, body TEXT, status TEXT, project TEXT, priority TEXT)', 0
 t_task_sqllen = $ - t_task_sql - 1
+t_tomb_n db 'tombstones', 0
+t_tomb_sql db 'CREATE TABLE tombstones(name TEXT)', 0
+t_tomb_sqllen = $ - t_tomb_sql - 1
 t_use_n db 'usage', 0
 t_use_sql db 'CREATE TABLE usage(ukey TEXT, hits TEXT)', 0
 t_use_sqllen = $ - t_use_sql - 1
@@ -9493,6 +10401,22 @@ jn_miss2 db '","missing":true}', 0
 jn_results db '{"results":[', 0
 jn_tasks db '{"tasks":[', 0
 jn_nodes db '{"nodes":[', 0
+jn_deleted db ',"deleted":', 0
+jn_note db ',"note":"', 0
+m_already db 'already tombstoned', 0
+jn_prefix db '{"prefix":"', 0
+jn_tombed db ',"tombstoned":', 0
+jn_capped db ',"capped":', 0
+jn_versions db '{"name":"', 0
+jn_tombflag db ',"tombstoned":', 0
+jn_versarr db ',"versions":[', 0
+jn_current db ',"current":', 0
+jn_tables db '{"tables":', 0
+jn_pages db ',"pages":', 0
+jn_journal db ',"journal":', 0
+jn_cacheused db ',"cache_used":', 0
+jn_tracked db ',"usage_tracked":', 0
+jn_pending db ',"pending_flush":', 0
 jc_thought db ',"thought":"', 0
 jc_conc db ',"conclusion":"', 0
 jc_valid db ',"valid":', 0
@@ -9579,7 +10503,23 @@ r_toolsarr db '[{"name":"sequential_thinking"'
        db ',"description":"Link two entities with a typed relation."'
        db ',"inputSchema":{"type":"object","properties":{"from":{"type":"string"}'
        db ',"to":{"type":"string"},"type":{"type":"string"}}}'
-       db ',"required":["from","to","type"]}]', 0
+       db ',"required":["from","to","type"]}'
+       db ',{"name":"delete_fact"'
+       db ',"description":"Tombstone a fact/entity name (hidden from reads; bytes remain on disk)."'
+       db ',"inputSchema":{"type":"object","properties":{"name":{"type":"string"}}}'
+       db ',"required":["name"]}'
+       db ',{"name":"delete_fact_prefix"'
+       db ',"description":"Tombstone all facts/entities whose name starts with prefix."'
+       db ',"inputSchema":{"type":"object","properties":{"prefix":{"type":"string"}}}'
+       db ',"required":["prefix"]}'
+       db ',{"name":"read_fact_versions"'
+       db ',"description":"All versions of a fact, newest first, with current flag."'
+       db ',"inputSchema":{"type":"object","properties":{"name":{"type":"string"}'
+       db ',"limit":{"type":"integer"}},"required":["name"]}}'
+       db ',{"name":"health"'
+       db ',"description":"Database diagnostics: tables, pages, journal, caches."'
+       db ',"inputSchema":{"type":"object","properties":{}}'
+       db ',"required":[]}]', 0
 
 lp dq 0
 ll dq 0
@@ -9654,6 +10594,9 @@ uloaded dq 0
 ulkey dq 0
 ulhits dq 0
 dbwmode dq 0
+tombnm dq 0
+tombnl dq 0
+dpcap dq 0
 sroot dq 0
 smode dq 0
 scount dq 0
@@ -9713,6 +10656,7 @@ f_root_obs dq 0
 f_root_rel dq 0
 f_root_tasks dq 0
 f_root_use dq 0
+f_root_tomb dq 0
 hfirst db 0
 v_num dq 0
 v_total dq 0
