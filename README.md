@@ -105,7 +105,15 @@ pinned rounds, warmup discarded):
 End-to-end through MCP on the live database: 1,000
 write→update→read→tombstone→verify cycles at **15.59 cycles/s**
 (31.18 durable writes/s), **132.56 warm reads/s**, 0 errors; 10/10
-sequential checkpoints accepted.
+sequential checkpoints accepted. Extended stress: **3,000 cycles
+(15,000 MCP ops, 6,000 durable writes, 3,000 tombstones) at 14.5
+cycles/s (29.01 writes/s), 0 errors**, pages growing 716→1,146
+through real splits with integrity clean throughout.
+
+Crash recovery is tested, not just designed: SIGKILL mid-transaction
+(4 KB journal on disk, splits in flight) followed by reopen recovers
+via the journal, leaves no journal behind, and verifies clean
+(structure + `integrity_check` + exact row counts).
 
 ## Repository
 
@@ -119,4 +127,15 @@ sequential checkpoints accepted.
 (R+E code, RW data), no `INTERP` (there is no libc to load), a
 flagless `GNU_STACK` (non-executable stack), and no section headers —
 all normal for a FASM `format ELF64 dynamic` binary that only issues
-syscalls.
+syscalls. ASLR is effective (two live instances map their code at
+distinct randomized bases) since all addressing is RIP-relative.
+
+Size split (~1 MB total): ~44 KB code, ~963 KB file-backed writable
+data, ~157 KB BSS. Almost all of the file-backed part is zero-filled
+reservations (`rb`): FASM emits leading `rb` blocks as file zeros, and
+only trailing `rb` becomes NOBITS (verified with a minimal probe:
+1 MB `rb` before an 8-byte `dq` → 1 MB file; after → 193 bytes).
+Moving the giant tables (`childtab`, `utab`, `thslots`, caches) after
+the last initialized datum would shrink the binary to ~100 KB with an
+identical runtime footprint — the clearest size-reduction target, left
+as future work since 1 MB is operationally irrelevant.
