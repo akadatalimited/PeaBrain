@@ -11368,44 +11368,23 @@ discard db 0
 cvalid db 0
 fvalid db 0
 
-inbuf rb 4096
-line rb 8192
-outbuf rb 65536
-jsontmp rb 65536
-thtmp rb 2048
 bidtmp rb 40
 methodbuf rb 32
 toolbuf rb 32
 idbuf rb 96
 numtmp rb 32
-exebuf rb 1024
-dbpath rb 1088
-dbdirb rb 1088
-jpath rb 1104
-jbuf rb 4096
 jbuf2 rb 8
 jpages rb 256
-cdata rb 65536
-utab rb 196608
-sbuf rb 2048
 sbtmp rb 32
 ukeybuf rb 24
 uhitbuf rb 24
 udec rb 24
 svstate rb 224
-pagebuf rb 4096
-leafbuf rb 4096
-ipage rb 4096
-celltmp rb 2048
-recbuf rb 2048
 recscratch rb 64
 rsnbuf rb 64
 thbuf rb 512
 ccbuf rb 512
 dbstat rb 144
-sizetab rb 8192
-offstab rb 8192
-childtab rb 524288
 dstack rb 128
 ddepth dq 0
 ppg dq 0
@@ -11416,15 +11395,43 @@ gfo rb 48
 gfl rb 48
 colp rb 48
 coll rb 48
-mbody rb 4096
 typebuf rb 32
 projbuf rb 32
 titlebuf rb 128
-taskbuf rb 1024
 stbuf rb 16
 pribuf rb 16
 qbuf rb 64
 relbuf rb 64
+
+; ---- trailing BSS: all large zero-initialised buffers live here, AFTER
+; the last initialised datum, so FASM emits them as NOBITS instead of
+; file-backed zeros (a 1 MB rb before a dq costs 1 MB on disk; after
+; costs ~0). Keep this group last: anything appended below uninitialised
+; stays free, anything initialised re-inflates the file. Sizes are pure
+; BSS (zero-filled at load, identical semantics to file zeros).
+inbuf rb 4096
+line rb 8192
+outbuf rb 65536
+jsontmp rb 65536
+thtmp rb 2048
+exebuf rb 1024
+dbpath rb 1088
+dbdirb rb 1088
+jpath rb 1104
+jbuf rb 4096
+cdata rb 65536
+utab rb 196608
+sbuf rb 2048
+pagebuf rb 4096
+leafbuf rb 4096
+ipage rb 4096
+celltmp rb 2048
+recbuf rb 2048
+sizetab rb 8192
+offstab rb 8192
+childtab rb 524288
+mbody rb 4096
+taskbuf rb 1024
 obsbuf rb 1024
 fseen rb 8320
 tseetab rb 4096
