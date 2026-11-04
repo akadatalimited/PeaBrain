@@ -1927,6 +1927,8 @@ vn_loop:
     jb vn_sym
     cmp al, 'Z'
     jbe vn_loop
+    cmp al, '_'
+    je vn_loop
     cmp al, 'a'
     jb vn_bad
     cmp al, 'z'
