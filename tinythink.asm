@@ -2166,7 +2166,276 @@ vp_last:
     ret
 
 ; pg_read(rdi=pgno, rsi=buf): rax 0 ok / 1 err
-pg_read:
+; Page cache: 16 slots of (pgno, use-tick, 4096B). Write-through, flushed
+; whenever the db identity (ino/size/mtime) differs at open. All helpers
+; preserve rbx,rbp,r12-r15 and their rdi/rsi args; clobber rax,rcx,rdx,r8-r11.
+cache_probe:
+    mov edi, edi                ; canonical 32-bit pgno for matching
+    test rdi, rdi                ; pgno 0 never cached
+    jz cp_miss
+    push rdi
+    push rsi
+    push rcx
+    push r8
+    xor ecx, ecx
+cp_scan:
+    cmp rcx, 16
+    jae cp_miss_p
+    mov rax, rcx
+    shl rax, 3
+    lea r8, [cpg]
+    cmp [r8 + rax], rdi
+    je cp_hit
+    inc rcx
+    jmp cp_scan
+cp_hit:
+    mov rax, rcx
+    shl rax, 3                    ; slot qword index for cuse
+    push rax
+    shl rcx, 12                   ; slot byte offset
+    lea rsi, [cdata]
+    add rsi, rcx
+    mov rdi, [rsp + 24]           ; saved dst buf (rsi)
+    mov ecx, 512
+    rep movsq
+    inc qword [ctick]
+    mov rcx, [ctick]
+    pop rax                       ; slot*8
+    lea rdx, [cuse]
+    mov [rdx + rax], rcx
+    pop r8
+    pop rcx
+    pop rsi
+    pop rdi
+    xor eax, eax
+    ret
+cp_miss_p:
+    pop r8
+    pop rcx
+    pop rsi
+    pop rdi
+cp_miss:
+    mov eax, 1
+    ret
+
+; cache_fill(rdi=pgno, rsi=src): store page (LRU victim). Preserves rdi,rsi.
+cache_fill:
+    mov edi, edi
+    test rdi, rdi
+    jz cf_ret
+    push rdi
+    push rsi
+    push rcx
+    push r8
+    push r9
+    xor ecx, ecx
+    mov r8, -1                    ; best (min) use
+    xor r9d, r9d                  ; best slot
+cf_look:
+    cmp rcx, 16
+    jae cf_scan
+    mov rax, rcx
+    shl rax, 3
+    lea rdx, [cpg]
+    mov rdx, [rdx + rax]
+    mov rax, [rsp + 32]           ; wanted pgno
+    cmp rdx, rax
+    je cf_update                  ; already cached: refresh in place
+    inc rcx
+    jmp cf_look
+cf_update:
+    mov r9, rcx
+    jmp cf_have
+cf_scan:
+    cmp rcx, 16
+    jae cf_have
+    mov rax, rcx
+    shl rax, 3
+    lea rdx, [cuse]
+    mov rdx, [rdx + rax]
+    cmp rdx, r8
+    jae cf_next
+    mov r8, rdx
+    mov r9, rcx
+cf_next:
+    inc rcx
+    jmp cf_scan
+cf_have:
+    mov rax, r9
+    shl rax, 3
+    lea rdx, [cpg]
+    mov rcx, [rsp + 32]           ; saved pgno
+    mov [rdx + rax], rcx
+    mov rax, r9
+    shl rax, 12
+    lea rdx, [cdata]
+    add rdx, rax                  ; dst slot
+    mov rsi, [rsp + 24]           ; saved src
+    mov rdi, rdx
+    mov ecx, 512
+    rep movsq
+    inc qword [ctick]
+    mov rcx, [ctick]
+    mov rax, r9
+    shl rax, 3
+    lea rdx, [cuse]
+    mov [rdx + rax], rcx
+    pop r9
+    pop r8
+    pop rcx
+    pop rsi
+    pop rdi
+cf_ret:
+    ret
+
+; cache_flush: empty all slots. Preserves rbx,rbp,r12-r15.
+cache_flush:
+    push rax
+    push rcx
+    push rdi
+    lea rdi, [cpg]
+    xor eax, eax
+    mov ecx, 16
+    rep stosq
+    pop rdi
+    pop rcx
+    pop rax
+    ret
+
+; Usage table: 256 slots of (key, hits). key = rowid | kind<<56.
+; Saturating hits, min-evict on full. Powers usage-ranked search.
+; Both preserve rbx,rbp,r12-r15; clobber rax,rcx,rdx,rsi,rdi,r8-r11.
+use_bump:
+    push rbx
+    push rcx
+    push rdx
+    push r8
+    push r9
+    mov rbx, rsi
+    mov rcx, rdi
+    shl rcx, 56
+    or rbx, rcx                  ; key
+    mov rax, rsi
+    imul rax, rax, 1597334677
+    add rax, rdi
+    and eax, 255
+    mov r8d, eax
+    xor r9d, r9d
+    mov r10, -1                  ; evict ptr
+    mov r11, -1                  ; evict hits
+ub_probe:
+    cmp r9, 16
+    jae ub_evict
+    mov rax, r8
+    and eax, 255
+    shl rax, 4
+    lea rdx, [utab]
+    add rdx, rax
+    mov rax, [rdx]
+    test rax, rax
+    jz ub_insert
+    cmp rax, rbx
+    je ub_hit
+    mov rax, [rdx + 8]
+    cmp rax, r11
+    jae ub_next
+    mov r11, rax
+    mov r10, rdx
+ub_next:
+    inc r8
+    inc r9
+    jmp ub_probe
+ub_hit:
+    mov rax, [rdx + 8]
+    cmp rax, -1
+    jae ub_done
+    inc qword [rdx + 8]
+ub_done:
+    pop r9
+    pop r8
+    pop rdx
+    pop rcx
+    pop rbx
+    ret
+ub_insert:
+    mov [rdx], rbx
+    mov qword [rdx + 8], 1
+    pop r9
+    pop r8
+    pop rdx
+    pop rcx
+    pop rbx
+    ret
+ub_evict:
+    mov rdx, r10
+    mov [rdx], rbx
+    mov qword [rdx + 8], 1
+    pop r9
+    pop r8
+    pop rdx
+    pop rcx
+    pop rbx
+    ret
+
+; use_get(rdi=kind, rsi=rowid): rax = hits (0 unknown). Same contract.
+use_get:
+    push rbx
+    push rcx
+    push rdx
+    push r8
+    push r9
+    mov rbx, rsi
+    mov rcx, rdi
+    shl rcx, 56
+    or rbx, rcx
+    mov rax, rsi
+    imul rax, rax, 1597334677
+    add rax, rdi
+    and eax, 255
+    mov r8d, eax
+    xor r9d, r9d
+ug_probe:
+    cmp r9, 16
+    jae ug_miss
+    mov rax, r8
+    and eax, 255
+    shl rax, 4
+    lea rdx, [utab]
+    add rdx, rax
+    mov rax, [rdx]
+    test rax, rax
+    jz ug_miss
+    cmp rax, rbx
+    je ug_hit
+    inc r8
+    inc r9
+    jmp ug_probe
+ug_hit:
+    mov rax, [rdx + 8]
+    pop r9
+    pop r8
+    pop rdx
+    pop rcx
+    pop rbx
+    ret
+ug_miss:
+    pop r9
+    pop r8
+    pop rdx
+    pop rcx
+    pop rbx
+    xor eax, eax
+    ret
+
+; pg_read_nc(rdi=pgno, rsi=buf): probe, else pread. No fill (scan paths).
+pg_read_nc:
+    push rdi
+    push rsi
+    call cache_probe
+    test rax, rax
+    pop rsi
+    pop rdi
+    jz pgr_ok
     mov r10, rdi
     dec r10
     shl r10, 12
@@ -2182,8 +2451,45 @@ pgr_ok:
     xor eax, eax
     ret
 
-; pg_write(rdi=pgno, rsi=buf): rax 0 ok / 1 err. Journals pre-image first.
+; pg_read(rdi=pgno, rsi=buf): rax 0 ok / 1 err. Cache-served, fills on miss.
+pg_read:
+    push rbx
+    mov rbx, rdi                ; pgno
+    push rdi
+    push rsi
+    call cache_probe
+    test rax, rax
+    pop rsi
+    pop rdi
+    jz pgr_hit
+    mov r10, rbx
+    dec r10
+    shl r10, 12
+    mov rdi, [dbfd]
+    mov edx, 4096
+    mov eax, 17
+    syscall
+    cmp rax, 4096
+    jne pgr_err
+    mov rdi, rbx
+    call cache_fill             ; rsi still buf
+    pop rbx
+    xor eax, eax
+    ret
+pgr_hit:
+    pop rbx
+    xor eax, eax
+    ret
+pgr_err:
+    pop rbx
+    mov eax, 1
+    ret
+
+; pg_write(rdi=pgno, rsi=buf): rax 0 ok / 1 err. Journals pre-image first,
+; write-throughs the page cache on success.
 pg_write:
+    push rbx
+    mov rbx, rdi                ; pgno
     push rdi
     push rsi
     call jwrite
@@ -2191,7 +2497,7 @@ pg_write:
     pop rdi
     test rax, rax
     jnz pgw_err
-    mov r10, rdi
+    mov r10, rbx
     dec r10
     shl r10, 12
     mov rdi, [dbfd]
@@ -2199,13 +2505,18 @@ pg_write:
     mov eax, 18
     syscall
     cmp rax, 4096
-    je pgw_ok
-    mov eax, 1
+    jne pgw_err
+    mov rdi, rbx
+    call cache_fill             ; rsi still buf
+    pop rbx
+    xor eax, eax
     ret
 pgw_ok:
+    pop rbx
     xor eax, eax
     ret
 pgw_err:
+    pop rbx
     mov eax, 1
     ret
 
@@ -2632,6 +2943,25 @@ do_open:
     mov eax, dword [dbstat + 28]
     cmp eax, ecx
     jne do_closeerr
+    ; cache generation: same ino/size/mtime as our last close -> warm
+    mov rax, qword [dbstat + 8]
+    cmp rax, [cino]
+    jne oc_new
+    mov rax, qword [dbstat + 48]
+    cmp rax, [csize]
+    jne oc_new
+    mov rax, qword [dbstat + 88]
+    cmp rax, [cmtim]
+    jne oc_new
+    mov rax, qword [dbstat + 96]
+    cmp rax, [cmtim + 8]
+    jne oc_new
+    mov qword [cskip], 1
+    jmp oc_checked
+oc_new:
+    call cache_flush
+    mov qword [cskip], 0
+oc_checked:
     mov rax, qword [dbstat + 48]
     test rax, rax
     jz do_create
@@ -2671,6 +3001,8 @@ do_create:
     test rax, rax
     jnz do_closeerr
 do_ensure:
+    cmp qword [cskip], 0        ; warm: roots/maxrowid/taskseq already live
+    jne do_cached
     call ensure_tables           ; new tables for old DBs; fills f_root_*
     test rax, rax
     jnz do_closeerr
@@ -2678,6 +3010,7 @@ do_ensure:
     call scan_max                ; conclusions max rowid
     test rax, rax
     jnz do_closeerr
+do_cached:
     xor eax, eax
     ret
 do_closeerr:
@@ -2693,11 +3026,11 @@ do_err:
 ; db_close: commit (fsync, drop journal, dirsync), unlock, close. preserves rax.
 db_close:
     push rax
+    cmp qword [jactive], 0
+    je dc_nojourn               ; read-only: disk untouched, skip fsync
     mov eax, 74
     mov rdi, [dbfd]
     syscall
-    cmp qword [jactive], 0
-    je dc_nojourn
     mov eax, 87                 ; unlink journal: commit point
     lea rdi, [jpath]
     syscall
@@ -2721,6 +3054,21 @@ dc_unlinked:
     mov qword [jfd], 0
     mov qword [jorig], 0
 dc_nojourn:
+    mov eax, 5                  ; re-stat: arm cache identity for next open
+    mov rdi, [dbfd]
+    lea rsi, [dbstat]
+    syscall
+    test rax, rax
+    js dc_nostat
+    mov rax, qword [dbstat + 8]
+    mov [cino], rax
+    mov rax, qword [dbstat + 48]
+    mov [csize], rax
+    mov rax, qword [dbstat + 88]
+    mov [cmtim], rax
+    mov rax, qword [dbstat + 96]
+    mov [cmtim + 8], rax
+dc_nostat:
     mov eax, 73
     mov rdi, [dbfd]
     mov esi, 8                  ; LOCK_UN
@@ -3126,7 +3474,7 @@ sm_page:
     add rsi, rax
     mov rdi, [rsi]
     lea rsi, [pagebuf]
-    call pg_read
+    call pg_read_nc               ; full scan: probe ok, no fill (keep hot set)
     test rax, rax
     jnz sm_next
     cmp byte [pagebuf], 0x0D
@@ -5327,6 +5675,9 @@ op_fread:
     cmp rax, 1
     jne of_miss
     call db_close
+    mov edi, 2                    ; fact use -> learn
+    mov rsi, [growid]
+    call use_bump
     ; inner {"rowid":N,"name":"R","body":"B"}
     lea rax, [jsontmp]
     mov [outptr], rax
@@ -6375,6 +6726,7 @@ or_dupret:
 ; rax 0 ok / 1 walk-fail.
 search_table:
     push rbx
+    mov qword [sncol], 0          ; rank within this table's hits
     mov rdi, [sroot]
     call walk_leaves
     test rax, rax
@@ -6388,8 +6740,9 @@ st_page:
     shl rax, 3
     add rsi, rax
     mov rdi, [rsi]
+    mov [scurpg], rdi
     lea rsi, [pagebuf]
-    call pg_read
+    call pg_read_nc               ; full scan: probe ok, no fill (keep hot set)
     test rax, rax
     jnz st_nextpg
     cmp byte [pagebuf], 0x0D
@@ -6406,6 +6759,7 @@ st_cell:
     shl rax, 1
     add rsi, rax
     call be16_ld
+    mov [stcoff], rax               ; cell offset for ranked re-emit
     lea rsi, [pagebuf]
     add rsi, rax
     call parse_row
@@ -6443,12 +6797,125 @@ st_m1:
 st_hit:
     test rax, rax
     jz st_nextcell
-    ; emit if budget
-    mov rax, [scount]
-    cmp rax, [slim]
-    jae st_done
+    ; collect (score,mode,pgno,celloff) for usage-ranked emission
+    mov rax, [sncol]
+    cmp rax, 64
+    jae st_sortemit              ; buffer full: rank + emit now
+    mov rdi, [smode]
+    mov rsi, [growid]
+    call use_get                ; rax = hits
+    mov rcx, [sncol]
+    shl rcx, 5
+    lea rdx, [sbuf]
+    add rdx, rcx
+    mov [rdx], rax
+    mov rcx, [smode]
+    mov [rdx + 8], rcx
+    mov rcx, [scurpg]
+    mov [rdx + 16], rcx
+    mov rcx, [stcoff]
+    mov [rdx + 24], rcx
+    inc qword [sncol]
+    jmp st_nextcell
+st_sortemit:
+    ; insertion sort sbuf[0..sncol) by score desc, stable (ties keep walk order)
+    mov qword [sidx], 1
+ss_outer:
+    mov rax, [sidx]
+    cmp rax, [sncol]
+    jae ss_emit
+    mov rcx, rax
+    shl rcx, 5
+    lea rsi, [sbuf]
+    add rsi, rcx
+    lea rdi, [sbtmp]
+    mov ecx, 4
+    rep movsq
+    mov rax, [sidx]
+ss_inner:
+    test rax, rax
+    jz ss_place
+    mov rcx, rax
+    dec rcx
+    shl rcx, 5
+    lea rdx, [sbuf]
+    add rdx, rcx
+    mov rcx, [rdx]
+    mov rsi, qword [sbtmp]
+    cmp rcx, rsi
+    jge ss_place
+    mov rsi, rdx
+    mov rcx, rax
+    shl rcx, 5
+    lea rdi, [sbuf]
+    add rdi, rcx
+    mov ecx, 4
+    rep movsq
+    dec rax
+    jmp ss_inner
+ss_place:
+    shl rax, 5
+    lea rdi, [sbuf]
+    add rdi, rax
+    lea rsi, [sbtmp]
+    mov ecx, 4
+    rep movsq
+    inc qword [sidx]
+    jmp ss_outer
+ss_emit:
+    mov rax, [slim]
+    sub rax, [scount]               ; remaining across the 3 table passes
+    jb ss_nonemit
+    cmp rax, [sncol]
+    cmova rax, [sncol]              ; nemit = min(remaining, collected)
+    mov [nemit], rax
+    mov qword [sidx], 0
+    jmp se_loop
+ss_nonemit:
+    xor eax, eax
+    mov [nemit], rax
+    mov qword [sidx], 0
+    jmp se_loop
+se_loop:
+    mov rax, [sidx]
+    cmp rax, [nemit]
+    jae se_done
     cmp qword [outlen], 60000
-    ja st_done
+    ja se_done
+    mov rcx, rax
+    shl rcx, 5
+    lea rdx, [sbuf]
+    add rdx, rcx
+    mov rcx, [rdx + 8]
+    mov [smode], rcx
+    mov rcx, [rdx + 16]
+    mov [scurpg], rcx
+    mov rcx, [rdx + 24]
+    mov [stcoff], rcx
+    mov rdi, [scurpg]
+    lea rsi, [pagebuf]
+    call pg_read                ; cache-hot re-read
+    test rax, rax
+    jnz se_next
+    cmp byte [pagebuf], 0x0D
+    jne se_next
+    lea rsi, [pagebuf]
+    add rsi, [stcoff]
+    call parse_row
+    test rax, rax
+    jnz se_next
+    mov rdi, [smode]
+    mov rsi, [growid]
+    call use_bump               ; surfaced -> learn
+    call st_emit
+se_next:
+    inc qword [sidx]
+    jmp se_loop
+se_done:
+    pop rbx
+    xor eax, eax
+    ret
+st_emit:
     cmp byte [hfirst], 1
     je st_first
     mov al, ','
@@ -6501,6 +6968,7 @@ st_tend:
     mov al, '}'
     call out_byte
     inc qword [scount]
+    ret                         ; end st_emit
 st_nextcell:
     inc qword [stcell]
     jmp st_cell
@@ -6508,9 +6976,7 @@ st_nextpg:
     inc qword [stci]
     jmp st_page
 st_done:
-    pop rbx
-    xor eax, eax
-    ret
+    jmp st_sortemit              ; scan complete: rank + emit collected
 st_err:
     pop rbx
     mov eax, 1
@@ -8438,6 +8904,18 @@ jfd dq 0
 jn dq 0
 jactive dq 0
 jorig dq 0
+cskip dq 0
+cino dq 0
+csize dq 0
+cmtim dq 0, 0
+ctick dq 0
+cpg dq 16 dup (0)
+cuse dq 16 dup (0)
+sncol dq 0
+stcoff dq 0
+scurpg dq 0
+sidx dq 0
+nemit dq 0
 sroot dq 0
 smode dq 0
 scount dq 0
@@ -8527,6 +9005,10 @@ jpath rb 1104
 jbuf rb 4096
 jbuf2 rb 8
 jpages rb 256
+cdata rb 65536
+utab rb 4096
+sbuf rb 2048
+sbtmp rb 32
 pagebuf rb 4096
 leafbuf rb 4096
 ipage rb 4096

@@ -3,7 +3,7 @@ tinythink - thinking + memory MCP server in pure x86-64 assembly
 
 Sequential-thinking mimic plus a conclusion tool and a small memory
 core, backed by a real SQLite database written in pure asm (no includes,
-no libc). One ~39K statically-linked Linux binary.
+no libc). One ~41K statically-linked Linux binary.
 
 Needs: fasm (flat assembler) 1.73+, Linux x86-64 with x86-64-v3
 microarchitecture (AVX/AVX2/FMA/BMI1/BMI2/LZCNT; check
@@ -87,7 +87,26 @@ page size 4096, UTF-8, sqlite_master + data tables, rowid leaf pages,
 size-ordered leaf splits, root interior on first split, dead space on
   the freelist, whole-db flock, fsync per write txn. No overflow pages;
   rollback journal (TJRR) with recovery + truncate on open, commit
-  (fsync, unlink, dirsync) on close.
+  (fsync, unlink, dirsync) on close. Read-only txns skip fsync entirely.
+
+Connection-warm caches (per-process, generation-guarded by db
+ino/size/mtime, write-through, flushed on mismatch):
+  - 16-slot LRU page cache (64KB): repeated reads serve from RAM.
+    Full-scan loops (scan_max, search) probe but never fill, so scans
+    cannot evict the hot set. Journal pre-images bypass the cache.
+  - Open-state skip: unchanged DBs skip ensure_tables/scan_max walks;
+    roots/maxrowid/taskseq are already live (writes maintain them).
+  Measured (ZFS, persistent connection): 100 hot reads 200.4ms ->
+  1.4ms (~140x, fsync removal + cache); pread count on a
+  read+read+search mix 37 -> 9 (~4x). Cold single-shot and write
+  throughput unchanged (writes stay fsync-bound by design).
+
+Learning: usage-ranked search_nodes. Direct reads (read_fact) and
+surfaced results bump per-row use counts (256-slot table, saturating,
+min-evict). Searches collect up to 64 hits, stable-sort by score
+descending (ties keep walk order, so cold behavior is unchanged), and
+emit the top of the slim budget. Verified: alpha_one/two/three walk
+order before use, alpha_three first after 10 reads.
 
 Value cap: no single TEXT value over 1024 bytes (fact bodies included).
 Max cell ~1.2KB < page/3, so both split halves always fit; oversize
