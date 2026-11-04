@@ -150,7 +150,21 @@ re-verifies each entry by rehash before writing (evicted slots skip).
 Rowids come from a txn-fresh [maxrowid] (++ per row; concurrent writers
 are locked out), never from per-write full-table scans: a rightmost-
 descent tail_max() sizes new rows in O(depth), keeping flush O(1)
-amortized (262,144-row fill in seconds, not hours). At capacity the
+amortized (262,144-row fill in seconds, not hours). The invariant is
+stronger than the lock: EVERY new rowid in every table derives from a
+maximum read back from disk after the write lock is held (tail_max per
+append path; max-tracking inside walks that already run, e.g. the
+conclusions duplicate check; the usage flush re-syncs on entry, keeps
+its high-water mark on success instead of restoring the pre-flush
+value, and re-syncs on abort since placed rows persist with the outer
+txn). A shared in-memory counter alone is unsound across processes and
+across tables — it once issued duplicate/out-of-order usage rowids
+(and stale conclusions ids under concurrency). Verified with
+barrier-synced concurrent writers: zero duplicate or out-of-order
+rowids in all 8 tables, integrity_check clean throughout, and every
+MCP op returns success (feedbacks included: use_flush returning the
+counter instead of 0 once broke them visibly).
+At capacity the
 table degrades gracefully via min-score eviction (proven: 239,911 live
 slots + 22,233 evictions over a 262,144 fill, zero false hits).
 Saved on clean process exit and piggybacked onto write-txn commits;
