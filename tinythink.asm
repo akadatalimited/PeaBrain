@@ -3573,10 +3573,11 @@ use_flush:
     lea rdi, [svstate + 224]
     mov ecx, 8
     rep movsq
-    mov rdi, [f_root_use]
-    call scan_max
-    test rax, rax
-    jnz uf_abort
+    ; No scan_max here (it was O(rows) per flush -> O(n^2) total once every
+    ; write flushes): [maxrowid] is already txn-fresh (scanned at open,
+    ; our own inserts ++ it, concurrent writers are locked out by our EX
+    ; lock), so ++maxrowid rowids cannot collide. A scan remains only for
+    ; cold opens, not per-flush.
 uf_slot:
     mov rax, [uq_head]
     cmp rax, [uq_tail]
@@ -5178,6 +5179,72 @@ sm_done:
     xor eax, eax
     ret
 sm_err:
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    mov eax, 1
+    ret
+; tail_max(rdi=root): [maxrowid] = last rowid of the rightmost leaf
+; (0 when empty). O(depth): rowids are append-ordered and rows are never
+; physically deleted, so the global max is always last-rightmost. Same
+; contract as scan_max for the per-op newrowid chain; replaces its O(n)
+; full walk at write-time call sites (the cold-open scan stays).
+; Preserves rbx,rbp,r12-r15; clobbers rax,rcx,rdx,rsi,rdi,r8-r11.
+tail_max:
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    call rightmost_leaf
+    test rax, rax
+    jnz tm_err
+    mov rdi, [curpg]
+    lea rsi, [pagebuf]
+    call pg_read
+    test rax, rax
+    jnz tm_err
+    cmp byte [pagebuf], 0x0D
+    jne tm_err
+    lea rsi, [pagebuf + 3]
+    call be16_ld
+    test rax, rax
+    jz tm_empty
+    dec rax
+    shl rax, 1
+    lea rsi, [pagebuf + 8]
+    add rsi, rax
+    call be16_ld
+    lea rsi, [pagebuf]
+    add rsi, rax
+    lea rdx, [pagebuf + 4096]
+    call varint_get
+    test rcx, rcx
+    jz tm_err
+    mov rsi, rcx
+    call varint_get
+    test rcx, rcx
+    jz tm_err
+    mov [maxrowid], rax
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    xor eax, eax
+    ret
+tm_empty:
+    mov qword [maxrowid], 0
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    xor eax, eax
+    ret
+tm_err:
+    pop r15
     pop r14
     pop r13
     pop r12
@@ -8238,7 +8305,7 @@ op_fwrite:
     cmp rax, 2
     je ow_dbclose
     mov rdi, [f_root_facts]
-    call scan_max
+    call tail_max
     test rax, rax
     jnz ow_dbclose
     mov rax, [maxrowid]
@@ -8493,7 +8560,7 @@ olf_tail:
 ; Call with db open; updates [newrowid] chain via [obsseq].
 insert_obs:
     mov rdi, [f_root_obs]
-    call scan_max
+    call tail_max
     test rax, rax
     jnz iob_err
     mov rax, [maxrowid]
@@ -8615,7 +8682,7 @@ om_noproj:
     cmp rax, 2
     je om_corrupt
     mov rdi, [f_root_ent]
-    call scan_max
+    call tail_max
     test rax, rax
     jnz om_dbclose
     mov rax, [maxrowid]
@@ -8859,7 +8926,7 @@ op_addobs:
     je oa_have
     ; stub entity
     mov rdi, [f_root_ent]
-    call scan_max
+    call tail_max
     test rax, rax
     jnz om_dbclose
     mov rax, [maxrowid]
@@ -9193,7 +9260,7 @@ or_nodup:
     test rbx, rbx
     jnz or_dupret
     mov rdi, [f_root_rel]
-    call scan_max
+    call tail_max
     test rax, rax
     jnz om_dbclose
     mov rax, [maxrowid]
@@ -9591,7 +9658,7 @@ tomb_insert:
     mov [tombnm], rsi
     mov [tombnl], rdx
     mov rdi, [f_root_tomb]
-    call scan_max
+    call tail_max
     test rax, rax
     jnz ti_err
     mov rax, [maxrowid]
@@ -11295,7 +11362,7 @@ omt_nopri:
     call ultoa
     mov [rllen], rcx
     mov rdi, [f_root_tasks]
-    call scan_max
+    call tail_max
     test rax, rax
     jnz om_dbclose
     mov rax, [maxrowid]
@@ -11986,7 +12053,7 @@ ou_s5:
     mov [innerlen], rax
     ; now persist the new version
     mov rdi, [f_root_tasks]
-    call scan_max
+    call tail_max
     test rax, rax
     jnz om_dbclose
     mov rax, [maxrowid]

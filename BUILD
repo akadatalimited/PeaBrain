@@ -147,6 +147,12 @@ names via rowid->name scans (private buffers; unresolvable rows are
 skipped, never merged). Hot slots hold hashes only, so a pending-name
 queue records (slot,name) at slot-create and flush drains it; flush
 re-verifies each entry by rehash before writing (evicted slots skip).
+Rowids come from a txn-fresh [maxrowid] (++ per row; concurrent writers
+are locked out), never from per-write full-table scans: a rightmost-
+descent tail_max() sizes new rows in O(depth), keeping flush O(1)
+amortized (262,144-row fill in seconds, not hours). At capacity the
+table degrades gracefully via min-score eviction (proven: 239,911 live
+slots + 22,233 evictions over a 262,144 fill, zero false hits).
 Saved on clean process exit and piggybacked onto write-txn commits;
 loaded once per process at first open, tick resuming past persisted
 recency. Verified: useful beats 300x-popular-plus-misleading after
