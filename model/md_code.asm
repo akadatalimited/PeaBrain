@@ -1997,6 +1997,7 @@ op_modinit:
     call md_model_init
     test rax, rax
     jnz .modmem
+    mov qword [rk_owned], 1
     lea rax, [jsontmp]
     mov [outptr], rax
     mov qword [outlen], 0
@@ -2369,6 +2370,7 @@ op_modload:
     jne .iofail
     call md_fetch_addrs
     mov qword [md_ready], 1
+    mov qword [rk_owned], 1
     mov dword [md_hasloss], 0
     lea rax, [jsontmp]
     mov [outptr], rax
@@ -2402,6 +2404,7 @@ op_modstatus:
     test rax, rax
     jz dc_params
     mov [ap], rax
+    call rank_try_weights
     lea rax, [jsontmp]
     mov [outptr], rax
     mov qword [outlen], 0
@@ -2477,6 +2480,7 @@ end if
     call out_cstr
     lea rsi, [md_jn_gpu]
     call out_cstr
+    call rank_status_emit
     mov al, '}'
     call out_byte
     jmp oc_envelope

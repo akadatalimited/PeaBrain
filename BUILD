@@ -238,6 +238,35 @@ training resumes from checkpoint step. GPU unavailable by review (no
 libcuda; CPU reference is the supported backend). model/ holds the
 stage prototypes (arena/matmul/mlp/quant) and the MODEL verdict note.
 
+Continual-learning ranker (shadow mode, deterministic order authoritative)
+--------------------------------------------------------------------------
+  Retrieval snapshots per search hit (kind/key/h2/x0/x1/det-score/tick,
+  256-entry ring): x0 = clamp(pos-neg,-8,8)/8, x1 = .5*recency +
+  .25*access/32 + .25*conf/64 from live usage counters. Explicit
+  useful/misleading feedback joins the newest fresh (<4096 ticks) snapshot;
+  misses counted (no_snapshot/stale/tombstone/invalid). Training consumes
+  ONLY snapshot-time features — counters are never re-read after feedback.
+  Examples persist in append-only rankex table
+  (name,kind,seq,x0,x1,target,det,rev; x0/x1 as f32-bit decimals; cap 4096,
+  then store_full rejects), independent of PBMD. Bounded incremental train
+  piggybacks feedback: newest-first window skipping held-out, batch <= 128,
+  H=4 leaky fixed, lr 0.05, 5 steps, momentum path reused; weights
+  auto-saved to rank.pbmd (best effort) and auto-loaded at boot/on demand.
+  Ownership safeguard: any successful model_init/model_load sets rank_owned;
+  rank automation (init/load/train/save/infer) then goes dormant with
+  model_owned rejects — a user model is never overwritten. Rank weights
+  live only in rank.pbmd, never peabrain.pbmd. Held-out is identity-grouped
+  (((key>>4)+(h2>>4)+kind)%10==0; obs via ukey_rowid; same memory always
+  one side; held never trained). model_status gains additive
+  rank{owner,examples,heldout,revision,rejected[6],lift} where lift =
+  held-out pairwise concordance (neural minus deterministic); explain_rank
+  gains additive neural shadow score (null when no ranker model). 27-tool
+  contracts otherwise unchanged (status/explain additive fields only).
+  No reorder until lift demonstrates improvement: measured lift on 40
+  mixed examples is negative, so deterministic ranking stays authoritative.
+  Live DB untouched by development (scratch-only under /scratch/tmp);
+  first boot with this binary creates the empty rankex table (one page).
+
 Smoke test
 ----------
   printf '%s\n' \

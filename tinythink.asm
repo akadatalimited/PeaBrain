@@ -4633,6 +4633,7 @@ do_ensure:
     jnz do_closeerr
     call use_load               ; learned prefs, once per process (self-guarded)
 do_cached:
+    call rank_boot               ; rankex examples + rank.pbmd, self-guarded
     xor eax, eax
     ret
 ; do_escalate: SH holder needs mutation. UN then EX (never upgrade: two
@@ -6978,6 +6979,1396 @@ etm_err:
     xor eax, eax
     ret
 
+; ---- continual-learning ranker (shadow mode) ----
+; Design: snapshot deterministic features at RETRIEVAL time (rank_snap_hook);
+; explicit useful/misleading feedback joins the snapshot (rank_capture) into a
+; labelled example persisted in the rankex table (rank_persist) and trained
+; incrementally (rank_train). Training consumes ONLY snapshot-time features:
+; slot counters are never re-read after feedback, so the model cannot learn
+; from the answer it is supposed to predict. All routines best-effort: they
+; never fail the outer op. Reject reasons (rk_rej): 0 no_snapshot, 1 stale,
+; 2 tombstone, 3 invalid, 4 store_full, 5 model_owned.
+; Ownership (safeguard): rank automation runs only while [rk_owned]==0.
+; Any successful model_init/model_load sets rk_owned=1: the ranker then
+; trains nothing, loads nothing, saves nothing, infers nothing.
+
+; rank_feat(rdx=slot): eax=x0bits, edx=x1bits (f32).
+; x0 = clamp(pos-neg,-8,8)/8 (net endorsement).
+; x1 = .5*recency + .25*access/32 + .25*conf/64 (freshness/standing).
+; Clobbers rax,rcx,xmm0-2. Destroys rdx (edx is the x1 return).
+rank_feat:
+    mov eax, dword [utick]
+    sub eax, [rdx + 24]
+    cmp eax, 1024
+    jae rkf_rec0
+    mov ecx, 1024
+    sub ecx, eax
+    cvtsi2ss xmm1, ecx
+    divss xmm1, [rk_f1024]
+    jmp rkf_recok
+rkf_rec0:
+    xorps xmm1, xmm1
+rkf_recok:
+    mulss xmm1, [rk_f05]
+    mov eax, [rdx + 12]
+    mov ecx, 32
+    cmp eax, ecx
+    cmovae eax, ecx
+    cvtsi2ss xmm0, eax
+    divss xmm0, [rk_f32]
+    mulss xmm0, [rk_f025]
+    addss xmm1, xmm0
+    movzx eax, word [rdx + 28]
+    mov ecx, 64
+    cmp eax, ecx
+    cmovae eax, ecx
+    cvtsi2ss xmm0, eax
+    divss xmm0, [rk_f64]
+    mulss xmm0, [rk_f025]
+    addss xmm1, xmm0
+    mov eax, [rdx + 16]
+    sub eax, [rdx + 20]
+    mov ecx, 8
+    cmp eax, ecx
+    cmovg eax, ecx
+    mov ecx, -8
+    cmp eax, ecx
+    cmovl eax, ecx
+    cvtsi2ss xmm0, eax
+    divss xmm0, [rk_f8]
+    movd eax, xmm0
+    movd edx, xmm1
+    ret
+
+; rank_snap_hook(): snapshot the current search hit. Inputs [rksmode]
+; (0/1/2 table mode), [rkscore], [scurpg], [stcoff]. Re-parses the current
+; cell (pagebuf holds the restored scan page here) so it depends on no stale
+; scan state. Identity-grouped holdout: held=((key>>4)+(h2>>4)+kind)%10==0,
+; stable per memory across restarts. (Shifted: FNV-1a64 and FNV-1-32 share
+; the same mod-2 recurrence, so raw low bits are always even.) Preserves
+; ALL general registers.
+rank_snap_hook:
+    push rax
+    push rbx
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    push rbp
+    push r8
+    push r9
+    push r10
+    push r11
+    push r12
+    push r13
+    push r14
+    push r15
+    sub rsp, 48
+    lea rsi, [pagebuf]
+    add rsi, [stcoff]
+    call parse_row
+    test rax, rax
+    jnz rksh_done
+    cmp qword [rksmode], 1
+    je rksh_obs
+    cmp qword [gcols], 1
+    jb rksh_done
+    mov rsi, qword [gfo]
+    mov rdx, qword [gfl]
+    cmp rdx, 1
+    jb rksh_done
+    cmp rdx, 128
+    ja rksh_done
+    mov [rsp], rsi
+    mov [rsp + 8], rdx
+    mov rax, [rksmode]
+    mov [rsp + 16], rax
+    mov rdi, rax
+    call ukey_name
+    mov [rsp + 24], rbx
+    mov [rsp + 32], r8d
+    mov rax, rbx
+    shr rax, 4
+    mov ecx, [rsp + 32]
+    shr ecx, 4
+    add rax, rcx
+    add rax, [rsp + 16]
+    xor edx, edx
+    mov rcx, 10
+    div rcx
+    test rdx, rdx
+    setz al
+    mov [rsp + 36], al
+    mov rdi, [rsp + 16]
+    mov rsi, [rsp]
+    mov rdx, [rsp + 8]
+    call use_slot_name
+    jmp rksh_feat
+rksh_obs:
+    mov rax, [growid]
+    test rax, rax
+    jz rksh_done
+    mov rdi, 1
+    mov rsi, rax
+    call ukey_rowid
+    mov [rsp + 24], rbx
+    mov [rsp + 32], r8d
+    mov qword [rsp + 16], 1
+    mov rax, rbx
+    shr rax, 4
+    mov ecx, r8d
+    shr ecx, 4
+    add rax, rcx
+    add rax, 1
+    xor edx, edx
+    mov rcx, 10
+    div rcx
+    test rdx, rdx
+    setz al
+    mov [rsp + 36], al
+    mov rdi, 1
+    mov rsi, [growid]
+    call use_slot_id
+rksh_feat:
+    test rax, rax
+    jz rksh_nofeat
+    call rank_feat
+    jmp rksh_storefeat
+rksh_nofeat:
+    xor eax, eax
+    xor edx, edx
+rksh_storefeat:
+    mov [rsp + 40], eax
+    mov [rsp + 44], edx
+    mov rcx, [rk_snaphead]
+    and rcx, 255
+    imul rcx, rcx, 48
+    lea rdi, [rk_snap]
+    add rdi, rcx
+    mov rax, [rsp + 16]
+    mov [rdi], rax
+    mov rax, [rsp + 24]
+    mov [rdi + 8], rax
+    mov eax, [rsp + 32]
+    mov [rdi + 16], eax
+    mov al, [rsp + 36]
+    mov [rdi + 20], al
+    mov eax, [rsp + 40]
+    mov [rdi + 24], eax
+    mov eax, [rsp + 44]
+    mov [rdi + 28], eax
+    mov rax, [rkscore]
+    mov [rdi + 32], rax
+    mov eax, dword [utick]
+    mov [rdi + 40], rax
+    inc qword [rk_snaphead]
+rksh_done:
+    add rsp, 48
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop r11
+    pop r10
+    pop r9
+    pop r8
+    pop rbp
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
+    pop rax
+    ret
+
+; rank_join_scan(rdi=kind, r9=key, r10d=h2): newest-first ring scan.
+; rax=1 hit ([rk_jx0],[rk_jx1],[rk_jdet],[rk_jheld] set) else 0 (rej counted).
+rank_join_scan:
+    push rbx
+    push rcx
+    push rdx
+    mov rcx, [rk_snaphead]
+    mov ebx, 256
+rkjs_loop:
+    test ebx, ebx
+    jz rkjs_miss
+    dec rcx
+    mov rax, rcx
+    and rax, 255
+    imul rax, rax, 48
+    lea rdx, [rk_snap]
+    add rdx, rax
+    cmp [rdx], rdi
+    jne rkjs_next
+    cmp [rdx + 8], r9
+    jne rkjs_next
+    cmp [rdx + 16], r10d
+    jne rkjs_next
+    mov eax, dword [utick]
+    sub eax, [rdx + 40]
+    cmp eax, 4096
+    ja rkjs_stale
+    mov eax, [rdx + 24]
+    mov dword [rk_jx0], eax
+    mov eax, [rdx + 28]
+    mov dword [rk_jx1], eax
+    mov rax, [rdx + 32]
+    mov [rk_jdet], rax
+    mov al, [rdx + 20]
+    mov [rk_jheld], al
+    mov eax, 1
+    pop rdx
+    pop rcx
+    pop rbx
+    ret
+rkjs_next:
+    dec ebx
+    jmp rkjs_loop
+rkjs_miss:
+    inc qword [rk_rej]
+    xor eax, eax
+    pop rdx
+    pop rcx
+    pop rbx
+    ret
+rkjs_stale:
+    inc qword [rk_rej + 8]
+    xor eax, eax
+    pop rdx
+    pop rcx
+    pop rbx
+    ret
+
+; rank_join_name(rdi=kind, rsi=name, rdx=len): join helper. rax as scan.
+rank_join_name:
+    push rbx
+    push rcx
+    push rsi
+    push rdi
+    push r8
+    push r9
+    push r10
+    push r11
+    mov r11, rdi
+    call ukey_name
+    mov r9, rbx
+    mov r10d, r8d
+    mov rdi, r11
+    call rank_join_scan
+    pop r11
+    pop r10
+    pop r9
+    pop r8
+    pop rdi
+    pop rsi
+    pop rcx
+    pop rbx
+    ret
+
+; rank_join_obs(rsi=rowid): join helper for observations. rax as scan.
+rank_join_obs:
+    push rbx
+    push rcx
+    push rdx
+    push rdi
+    push r8
+    push r9
+    push r10
+    push r11
+    mov rdi, 1
+    call ukey_rowid
+    mov r9, rbx
+    mov r10d, r8d
+    mov rdi, 1
+    call rank_join_scan
+    pop r11
+    pop r10
+    pop r9
+    pop r8
+    pop rdi
+    pop rdx
+    pop rcx
+    pop rbx
+    ret
+
+; rank_capture(): join feedback identity to a retrieval snapshot and persist
+; the labelled example. Called after use_flush (DB open, op state restored).
+; Uses [fbkind],[fbsig],[rsnbuf]/[rsnlen]/[fbobsid]. Preserves all registers.
+rank_capture:
+    push rax
+    push rbx
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    push rbp
+    push r8
+    push r9
+    push r10
+    push r11
+    push r12
+    push r13
+    push r14
+    push r15
+    cmp qword [rk_owned], 1
+    je rkap_owned
+    cmp qword [fbkind], 1
+    je rkap_obs
+    mov rdi, [fbkind]
+    lea rsi, [rsnbuf]
+    mov rdx, [rsnlen]
+    call rank_join_name
+    jmp rkap_joined
+rkap_obs:
+    mov rsi, [fbobsid]
+    call rank_join_obs
+rkap_joined:
+    test rax, rax
+    jz rkap_done
+    call rank_persist
+    test rax, rax
+    jnz rkap_full
+    mov rax, [rk_next]
+    mov rcx, rax
+    and rcx, 4095
+    imul rcx, rcx, 24
+    lea rdi, [rk_mem]
+    add rdi, rcx
+    mov eax, dword [rk_jx0]
+    mov [rdi], eax
+    mov eax, dword [rk_jx1]
+    mov [rdi + 4], eax
+    mov rax, [rk_jdet]
+    mov [rdi + 8], rax
+    cmp qword [fbsig], 1
+    jne rkap_t0
+    mov eax, 0x3F800000
+    jmp rkap_tok
+rkap_t0:
+    xor eax, eax
+rkap_tok:
+    mov [rdi + 16], eax
+    mov al, [rk_jheld]
+    mov [rdi + 20], al
+    test al, al
+    jz rkap_noheld
+    inc qword [rk_held]
+rkap_noheld:
+    inc qword [rk_next]
+    jmp rkap_done
+rkap_full:
+    inc qword [rk_rej + 32]
+    jmp rkap_done
+rkap_owned:
+    inc qword [rk_rej + 40]
+rkap_done:
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop r11
+    pop r10
+    pop r9
+    pop r8
+    pop rbp
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
+    pop rax
+    ret
+
+; rank_persist(): append one rankex row
+; (name,kind,seq,x0,x1,target,det,rev) from feedback memory. DB must be
+; open+locked. Saves/restores op state via svstate (same pattern as
+; use_flush; sequential use, never nested). rax 0 ok / 1 fail.
+rank_persist:
+    cmp qword [rk_dbcount], 4096
+    jae rkp_fullret
+    mov rax, [newrowid]
+    mov qword [svstate], rax
+    mov rax, [maxrowid]
+    mov qword [svstate + 8], rax
+    mov rax, [splitroot]
+    mov qword [svstate + 16], rax
+    mov rax, [ncols]
+    mov qword [svstate + 24], rax
+    lea rsi, [colp]
+    lea rdi, [svstate + 32]
+    mov ecx, 8
+    rep movsq
+    lea rsi, [coll]
+    lea rdi, [svstate + 96]
+    mov ecx, 8
+    rep movsq
+    lea rsi, [gfo]
+    lea rdi, [svstate + 160]
+    mov ecx, 8
+    rep movsq
+    lea rsi, [gfl]
+    lea rdi, [svstate + 224]
+    mov ecx, 8
+    rep movsq
+    mov rdi, [f_root_rankex]
+    call tail_max
+    test rax, rax
+    jnz rkp_abort
+    lea rax, [rsnbuf]
+    mov qword [colp], rax
+    mov rax, [rsnlen]
+    mov qword [coll], rax
+    mov rax, [fbkind]
+    lea rdi, [ukind1]
+    call u64_dec
+    lea rax, [ukind1]
+    mov qword [colp + 8], rax
+    mov qword [coll + 8], rdx
+    mov rax, [rk_next]
+    lea rdi, [unum0]
+    call u64_dec
+    lea rax, [unum0]
+    mov qword [colp + 16], rax
+    mov qword [coll + 16], rdx
+    mov eax, dword [rk_jx0]
+    lea rdi, [unum1]
+    call u64_dec
+    lea rax, [unum1]
+    mov qword [colp + 24], rax
+    mov qword [coll + 24], rdx
+    mov eax, dword [rk_jx1]
+    lea rdi, [unum2]
+    call u64_dec
+    lea rax, [unum2]
+    mov qword [colp + 32], rax
+    mov qword [coll + 32], rdx
+    mov rax, [fbsig]
+    lea rdi, [unum3]
+    call u64_dec
+    lea rax, [unum3]
+    mov qword [colp + 40], rax
+    mov qword [coll + 40], rdx
+    mov rax, [rk_jdet]
+    lea rdi, [unum4]
+    call u64_dec
+    lea rax, [unum4]
+    mov qword [colp + 48], rax
+    mov qword [coll + 48], rdx
+    mov rax, [rk_rev]
+    lea rdi, [rk_num5]
+    call u64_dec
+    lea rax, [rk_num5]
+    mov qword [colp + 56], rax
+    mov qword [coll + 56], rdx
+    mov qword [ncols], 8
+    mov rax, [maxrowid]
+    inc rax
+    mov [newrowid], rax
+    mov [maxrowid], rax
+    call build_record_text
+    mov rax, [f_root_rankex]
+    mov [splitroot], rax
+    call place_cell
+    test rax, rax
+    jnz rkp_abort
+    call hdr_touch
+    test rax, rax
+    jnz rkp_abort
+    inc qword [rk_dbcount]
+    push rax
+    mov rax, [maxrowid]
+    mov qword [svstate + 8], rax
+    jmp rkp_restore
+rkp_abort:
+    mov rdi, [f_root_rankex]
+    call tail_max
+    test rax, rax
+    jnz rkp_abortkeep
+    mov rax, [maxrowid]
+    mov qword [svstate + 8], rax
+rkp_abortkeep:
+    push rax
+    mov rax, 1
+    mov [rsp], rax
+rkp_restore:
+    lea rsi, [svstate + 224]
+    lea rdi, [gfl]
+    mov ecx, 8
+    rep movsq
+    lea rsi, [svstate + 160]
+    lea rdi, [gfo]
+    mov ecx, 8
+    rep movsq
+    lea rsi, [svstate + 96]
+    lea rdi, [coll]
+    mov ecx, 8
+    rep movsq
+    lea rsi, [svstate + 32]
+    lea rdi, [colp]
+    mov ecx, 8
+    rep movsq
+    mov rax, qword [svstate + 24]
+    mov [ncols], rax
+    mov rax, qword [svstate + 16]
+    mov [splitroot], rax
+    mov rax, qword [svstate + 8]
+    mov [maxrowid], rax
+    mov rax, qword [svstate]
+    mov [newrowid], rax
+    pop rax
+    ret
+rkp_fullret:
+    mov eax, 1
+    ret
+
+; rank_train(): bounded incremental training from the in-memory example
+; window (newest-first, skipping held-out). Auto-inits H=4 leaky only when
+; no model is loaded and no user model owns the singleton. Saves weights to
+; rank.pbmd (best effort). Preserves all registers.
+rank_train:
+    push rax
+    push rbx
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    push rbp
+    push r8
+    push r9
+    push r10
+    push r11
+    push r12
+    push r13
+    push r14
+    push r15
+    cmp qword [rk_owned], 1
+    je rktr_done
+    cmp qword [md_ready], 1
+    je rktr_have
+    mov rcx, 4
+    mov rdx, [rk_seed]
+    mov r8d, 1
+    call md_model_init
+    test rax, rax
+    jnz rktr_memfail
+rktr_have:
+    mov rax, [rk_next]
+    test rax, rax
+    jz rktr_done
+    mov r11, rax
+    cmp r11, 4096
+    jbe rktr_b0
+    sub r11, 4096
+    jmp rktr_b1
+rktr_b0:
+    xor r11d, r11d
+rktr_b1:
+    xor r14d, r14d
+    mov r12, [rk_next]
+    dec r12
+rktr_seq:
+    cmp r12, r11
+    jb rktr_batchok
+    cmp r14, 128
+    jae rktr_batchok
+    mov rax, r12
+    and rax, 4095
+    imul rax, rax, 24
+    lea rsi, [rk_mem]
+    add rsi, rax
+    cmp byte [rsi + 20], 0
+    jne rktr_seqnext
+    mov eax, [rsi]
+    mov ebx, [rsi + 4]
+    mov rcx, r14
+    shl rcx, 3
+    lea rdi, [md_Xbuf]
+    add rdi, rcx
+    mov [rdi], eax
+    mov [rdi + 4], ebx
+    mov eax, [rsi + 16]
+    test eax, eax
+    jz rktr_t0
+    mov eax, 0x3F800000
+    jmp rktr_tok
+rktr_t0:
+    xor eax, eax
+rktr_tok:
+    lea rdi, [md_Tbuf]
+    mov rcx, r14
+    shl rcx, 2
+    add rdi, rcx
+    mov [rdi], eax
+    inc r14
+rktr_seqnext:
+    cmp r12, r11
+    je rktr_batchok
+    dec r12
+    jmp rktr_seq
+rktr_batchok:
+    test r14, r14
+    jz rktr_done
+    mov [md_tn], r14
+    movss xmm0, [rk_lr]
+    movss [md_lr], xmm0
+    mov r15d, 5
+rktr_step:
+    test r15, r15
+    jz rktr_stepsdone
+    lea rdi, [md_Xbuf]
+    lea rsi, [md_Tbuf]
+    mov rdx, r14
+    call md_fwd
+    lea rdi, [md_Xbuf]
+    lea rsi, [md_Tbuf]
+    mov rdx, r14
+    call md_backward
+    call md_sgd
+    inc qword [md_step]
+    dec r15
+    jmp rktr_step
+rktr_stepsdone:
+    mov dword [md_hasloss], 1
+    inc qword [rk_rev]
+    lea rsi, [rk_pbpath]
+    call md_save
+rktr_done:
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop r11
+    pop r10
+    pop r9
+    pop r8
+    pop rbp
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
+    pop rax
+    ret
+rktr_memfail:
+    inc qword [rk_rej + 40]
+    jmp rktr_done
+
+; rank_try_weights(): file-only auto-load of rank.pbmd iff no model is loaded
+; and no user model owns the singleton. Once per process. No DB needed.
+; Preserves all registers.
+rank_try_weights:
+    push rax
+    push rbx
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    push rbp
+    push r8
+    push r9
+    push r10
+    push r11
+    push r12
+    push r13
+    push r14
+    push r15
+    cmp qword [md_ready], 1
+    je rktw_done
+    cmp qword [rk_owned], 1
+    je rktw_done
+    cmp qword [rk_wtried], 1
+    je rktw_done
+    mov qword [rk_wtried], 1
+    mov eax, 257
+    mov rdi, -100
+    lea rsi, [rk_pbpath]
+    mov edx, 0x80000
+    xor r10d, r10d
+    syscall
+    test rax, rax
+    js rktw_done
+    push rax
+    mov rdi, rax
+    mov eax, 3
+    syscall
+    pop rax
+    call md_arena_init
+    test rax, rax
+    jnz rktw_done
+    lea rsi, [rk_pbpath]
+    call md_load
+    test rax, rax
+    jnz rktw_done
+    cmp qword [md_nreg], 8
+    jne rktw_done
+    call md_fetch_addrs
+    mov qword [md_ready], 1
+rktw_done:
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop r11
+    pop r10
+    pop r9
+    pop r8
+    pop rbp
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
+    pop rax
+    ret
+
+; rank_boot(): once-per-process: refill the example window from rankex, then
+; auto-load rank.pbmd iff no model is loaded and no user model owns the
+; singleton. Called from the db-open path (DB open, tables ensured).
+rank_boot:
+    push rax
+    push rbx
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    push rbp
+    push r8
+    push r9
+    push r10
+    push r11
+    push r12
+    push r13
+    push r14
+    push r15
+    cmp qword [rk_bootdone], 1
+    je rkb_done0
+    mov qword [rk_bootdone], 1
+    cmp qword [f_root_rankex], 0
+    je rkb_weights
+    mov rdi, [f_root_rankex]
+    call walk_leaves
+    test rax, rax
+    jnz rkb_weights
+    xor r14d, r14d
+rkb_page:
+    cmp r14, [childn]
+    jae rkb_weights
+    lea rsi, [childtab]
+    mov rax, r14
+    shl rax, 3
+    add rsi, rax
+    mov rdi, [rsi]
+    lea rsi, [pagebuf]
+    call pg_read_nc
+    test rax, rax
+    jnz rkb_nextpg
+    cmp byte [pagebuf], 0x0D
+    jne rkb_nextpg
+    lea rsi, [pagebuf + 3]
+    call be16_ld
+    mov r15, rax
+    xor r13d, r13d
+rkb_cell:
+    cmp r13, r15
+    jae rkb_nextpg
+    lea rsi, [pagebuf + 8]
+    mov rax, r13
+    shl rax, 1
+    add rsi, rax
+    call be16_ld
+    lea rsi, [pagebuf]
+    add rsi, rax
+    call parse_row
+    test rax, rax
+    jnz rkb_incc
+    cmp qword [gcols], 8
+    jne rkb_incc
+    sub rsp, 64
+    mov rsi, qword [gfo]
+    mov rdx, qword [gfl]
+    cmp rdx, 1
+    jb rkb_cellbad
+    cmp rdx, 128
+    ja rkb_cellbad
+    mov [rsp], rsi
+    mov [rsp + 8], rdx
+    mov rsi, qword [gfo + 8]
+    mov rdx, qword [gfl + 8]
+    call dec_parse
+    test rax, rax
+    jnz rkb_cellbad
+    cmp rdx, 3
+    ja rkb_cellbad
+    mov [rsp + 16], rdx
+    mov rsi, qword [gfo + 16]
+    mov rdx, qword [gfl + 16]
+    call dec_parse
+    test rax, rax
+    jnz rkb_cellbad
+    mov [rsp + 24], rdx
+    mov rsi, qword [gfo + 24]
+    mov rdx, qword [gfl + 24]
+    call dec_parse
+    test rax, rax
+    jnz rkb_cellbad
+    mov rax, rdx
+    shr rax, 32
+    jnz rkb_cellbad
+    mov [rsp + 32], edx
+    mov rsi, qword [gfo + 32]
+    mov rdx, qword [gfl + 32]
+    call dec_parse
+    test rax, rax
+    jnz rkb_cellbad
+    mov rax, rdx
+    shr rax, 32
+    jnz rkb_cellbad
+    mov [rsp + 36], edx
+    mov eax, [rsp + 32]
+    mov dword [rk_num5], eax
+    mov eax, [rsp + 36]
+    mov dword [rk_num5 + 4], eax
+    lea rsi, [rk_num5]
+    mov rcx, 2
+    call md_checkmag
+    test rax, rax
+    jnz rkb_cellbad
+    mov rsi, qword [gfo + 40]
+    mov rdx, qword [gfl + 40]
+    call dec_parse
+    test rax, rax
+    jnz rkb_cellbad
+    cmp rdx, 1
+    ja rkb_cellbad
+    mov [rsp + 40], rdx
+    mov rsi, qword [gfo + 48]
+    mov rdx, qword [gfl + 48]
+    call dec_parse
+    test rax, rax
+    jnz rkb_cellbad
+    mov rax, rdx
+    shr rax, 32
+    jnz rkb_cellbad
+    mov [rsp + 44], rdx
+    cmp qword [rsp + 16], 1
+    je rkb_obsrow
+    mov rdi, [rsp + 16]
+    mov rsi, [rsp]
+    mov rdx, [rsp + 8]
+    call ukey_name
+    mov r11, rbx
+    mov r10d, r8d
+    jmp rkb_havekey
+rkb_obsrow:
+    mov rsi, [rsp]
+    mov rdx, [rsp + 8]
+    call dec_parse
+    test rax, rax
+    jnz rkb_cellbad
+    test rdx, rdx
+    jz rkb_cellbad
+    mov rsi, rdx
+    mov rdi, 1
+    call ukey_rowid
+    mov r11, rbx
+    mov r10d, r8d
+rkb_havekey:
+    mov rax, r11
+    shr rax, 4
+    mov ecx, r10d
+    shr ecx, 4
+    add rax, rcx
+    add rax, [rsp + 16]
+    xor edx, edx
+    mov rcx, 10
+    div rcx
+    test rdx, rdx
+    setz r12b
+    mov rax, [rsp + 24]
+    cmp rax, [rk_next]
+    jbe rkb_seqok
+    mov [rk_next], rax
+rkb_seqok:
+    cmp qword [rk_dbcount], 4096
+    jae rkb_dbcap
+    mov rcx, [rk_next]
+    and rcx, 4095
+    imul rcx, rcx, 24
+    lea rdi, [rk_mem]
+    add rdi, rcx
+    mov eax, [rsp + 32]
+    mov [rdi], eax
+    mov eax, [rsp + 36]
+    mov [rdi + 4], eax
+    mov rax, [rsp + 44]
+    mov [rdi + 8], rax
+    mov rax, [rsp + 40]
+    test rax, rax
+    jz rkb_bt0
+    mov eax, 0x3F800000
+    jmp rkb_btok
+rkb_bt0:
+    xor eax, eax
+rkb_btok:
+    mov [rdi + 16], eax
+    mov [rdi + 20], r12b
+    test r12b, r12b
+    jz rkb_bnoheld
+    inc qword [rk_held]
+rkb_bnoheld:
+    inc qword [rk_next]
+    inc qword [rk_dbcount]
+    add rsp, 64
+    jmp rkb_incc
+rkb_dbcap:
+    inc qword [rk_bootskip]
+    add rsp, 64
+    jmp rkb_incc
+rkb_cellbad:
+    inc qword [rk_bootskip]
+    add rsp, 64
+rkb_incc:
+    inc r13
+    jmp rkb_cell
+rkb_nextpg:
+    inc r14
+    jmp rkb_page
+rkb_weights:
+    call rank_try_weights
+rkb_done:
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop r11
+    pop r10
+    pop r9
+    pop r8
+    pop rbp
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
+    pop rax
+    xor eax, eax
+    ret
+rkb_done0:
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop r11
+    pop r10
+    pop r9
+    pop r8
+    pop rbp
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
+    pop rax
+    xor eax, eax
+    ret
+
+; rank_predict1: eax=x0bits, edx=x1bits -> xmm0=prediction. Caller must
+; ensure md_ready==1 and rk_owned==0. Clobbers per md_fwd + xmm0.
+rank_predict1:
+    mov dword [rk_X1], eax
+    mov dword [rk_X1 + 4], edx
+    movss xmm0, [md_lastloss]
+    movss [md_tmpf], xmm0
+    lea rdi, [rk_X1]
+    lea rsi, [rk_T1]
+    mov edx, 1
+    call md_fwd
+    movss xmm0, [md_tmpf]
+    movss [md_lastloss], xmm0
+    movss xmm0, dword [md_Y]
+    ret
+
+; rank_eval: held-out concordance lift (neural minus deterministic) over the
+; newest 128 held-out examples. rax=1 + [rk_liftf] set, else rax=0 (null).
+; Saves/restores md_lastloss. Preserves all general registers.
+rank_eval:
+    push rax
+    push rbx
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    push rbp
+    push r8
+    push r9
+    push r10
+    push r11
+    push r12
+    push r13
+    push r14
+    push r15
+    call rank_try_weights
+    cmp qword [md_ready], 1
+    jne rkev_null
+    cmp qword [rk_owned], 1
+    je rkev_null
+    movss xmm0, [md_lastloss]
+    movss [md_tmpf], xmm0
+    sub rsp, 3072
+    xor r14d, r14d
+    mov r12, [rk_next]
+    test r12, r12
+    jz rkev_empty
+    dec r12
+    mov r13, [rk_next]
+    cmp r13, 4096
+    jbe rkev_b0
+    sub r13, 4096
+    jmp rkev_b1
+rkev_b0:
+    xor r13d, r13d
+rkev_b1:
+rkev_gather:
+    cmp r12, r13
+    jb rkev_got
+    cmp r14, 128
+    jae rkev_got
+    mov rax, r12
+    and rax, 4095
+    imul rax, rax, 24
+    lea rsi, [rk_mem]
+    add rsi, rax
+    cmp byte [rsi + 20], 0
+    je rkev_gnext
+    mov eax, [rsi]
+    mov dword [rk_X1], eax
+    mov eax, [rsi + 4]
+    mov dword [rk_X1 + 4], eax
+    lea rdi, [rk_X1]
+    lea rsi, [rk_T1]
+    mov edx, 1
+    call md_fwd
+    movss xmm0, dword [md_Y]
+    mov rax, r14
+    shl rax, 2
+    lea rdi, [rk_evalbuf]
+    add rdi, rax
+    movss [rdi], xmm0
+    mov rax, r12
+    and rax, 4095
+    imul rax, rax, 24
+    lea rsi, [rk_mem]
+    add rsi, rax
+    mov rax, [rsi + 8]
+    mov rdx, r14
+    shl rdx, 4
+    lea rdi, [rsp + 1024]
+    add rdi, rdx
+    mov [rdi], rax
+    mov eax, [rsi + 16]
+    mov [rdi + 8], eax
+    inc r14
+rkev_gnext:
+    cmp r12, r13
+    je rkev_got
+    dec r12
+    jmp rkev_gather
+rkev_got:
+    cmp r14, 2
+    jb rkev_empty
+    xor r12d, r12d
+    xor r13d, r13d
+    xor r15d, r15d
+    xor ebx, ebx
+rkev_ploop:
+    cmp rbx, r14
+    jae rkev_pdone
+    mov r10d, ebx
+    inc r10d
+rkev_qloop:
+    cmp r10, r14
+    jae rkev_qnext
+    mov rax, rbx
+    shl rax, 4
+    lea rsi, [rsp + 1024]
+    add rsi, rax
+    mov rax, r10
+    shl rax, 4
+    lea rdi, [rsp + 1024]
+    add rdi, rax
+    mov eax, [rsi + 8]
+    cmp eax, [rdi + 8]
+    je rkev_qinc
+    inc r12d
+    mov rax, rbx
+    shl rax, 2
+    lea rsi, [rk_evalbuf]
+    add rsi, rax
+    movss xmm0, [rsi]
+    mov rax, r10
+    shl rax, 2
+    lea rdi, [rk_evalbuf]
+    add rdi, rax
+    movss xmm1, [rdi]
+    mov rax, rbx
+    shl rax, 4
+    lea rsi, [rsp + 1024]
+    add rsi, rax
+    mov rax, r10
+    shl rax, 4
+    lea rdi, [rsp + 1024]
+    add rdi, rax
+    mov eax, [rsi + 8]
+    cmp eax, [rdi + 8]
+    jg rkev_tpos
+    ucomiss xmm0, xmm1
+    jb rkev_nmatch
+    jmp rkev_ndone
+rkev_tpos:
+    ucomiss xmm0, xmm1
+    ja rkev_nmatch
+    jmp rkev_ndone
+rkev_nmatch:
+    inc r13d
+rkev_ndone:
+    mov rax, [rsi]
+    cmp rax, [rdi]
+    je rkev_qinc
+    mov eax, [rsi + 8]
+    cmp eax, [rdi + 8]
+    jg rkev_dpos
+    cmp rax, [rdi]
+    jb rkev_dmatch
+    jmp rkev_qinc
+rkev_dpos:
+    cmp rax, [rdi]
+    ja rkev_dmatch
+    jmp rkev_qinc
+rkev_dmatch:
+    inc r15d
+rkev_qinc:
+    inc r10
+    jmp rkev_qloop
+rkev_qnext:
+    inc rbx
+    jmp rkev_ploop
+rkev_pdone:
+    test r12d, r12d
+    jz rkev_empty
+    cvtsi2ss xmm0, r13d
+    cvtsi2ss xmm1, r12d
+    divss xmm0, xmm1
+    cvtsi2ss xmm1, r15d
+    cvtsi2ss xmm2, r12d
+    divss xmm1, xmm2
+    subss xmm0, xmm1
+    movss dword [rk_liftf], xmm0
+    movss xmm0, [md_tmpf]
+    movss [md_lastloss], xmm0
+    add rsp, 3072
+    mov eax, 1
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop r11
+    pop r10
+    pop r9
+    pop r8
+    pop rbp
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
+    pop rax
+    mov eax, 1
+    ret
+rkev_empty:
+    movss xmm0, [md_tmpf]
+    movss [md_lastloss], xmm0
+    add rsp, 3072
+rkev_null:
+    xor eax, eax
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop r11
+    pop r10
+    pop r9
+    pop r8
+    pop rbp
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
+    pop rax
+    xor eax, eax
+    ret
+
+; rank_status_emit(): additive rank fields for model_status. Preserves regs.
+rank_status_emit:
+    push rax
+    push rbx
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    push rbp
+    push r8
+    push r9
+    push r10
+    push r11
+    push r12
+    push r13
+    push r14
+    push r15
+    lea rsi, [md_jn_rank]
+    call out_cstr
+    cmp qword [rk_owned], 1
+    je rkse_user
+    cmp qword [md_ready], 1
+    je rkse_ranker
+    lea rsi, [rk_v_none]
+    call out_cstr
+    jmp rkse_counts
+rkse_user:
+    lea rsi, [rk_v_user]
+    call out_cstr
+    jmp rkse_counts
+rkse_ranker:
+    lea rsi, [rk_v_ranker]
+    call out_cstr
+rkse_counts:
+    lea rsi, [md_jn_rex]
+    call out_cstr
+    mov rax, [rk_next]
+    call out_uint
+    lea rsi, [md_jn_rheld]
+    call out_cstr
+    mov rax, [rk_held]
+    call out_uint
+    lea rsi, [md_jn_rrev]
+    call out_cstr
+    mov rax, [rk_rev]
+    call out_uint
+    lea rsi, [md_jn_rej]
+    call out_cstr
+    mov r14d, 0
+    mov [rk_idx], r14
+rkse_rej:
+    mov rax, [rk_idx]
+    cmp rax, 6
+    jae rkse_rejdone
+    shl rax, 3
+    lea rsi, [rk_rej]
+    add rsi, rax
+    mov rax, [rsi]
+    call out_uint
+    cmp qword [rk_idx], 5
+    je rkse_rejnext
+    mov al, ','
+    call out_byte
+rkse_rejnext:
+    inc qword [rk_idx]
+    jmp rkse_rej
+rkse_rejdone:
+    mov al, ']'
+    call out_byte
+    lea rsi, [md_jn_rlift]
+    call out_cstr
+    call rank_eval
+    test rax, rax
+    jz rkse_lnull
+    movss xmm0, dword [rk_liftf]
+    call md_out_f32e6
+    jmp rkse_end
+rkse_lnull:
+    lea rsi, [jnull]
+    call out_cstr
+rkse_end:
+    mov al, '}'
+    call out_byte
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop r11
+    pop r10
+    pop r9
+    pop r8
+    pop rbp
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
+    pop rax
+    ret
+
+; rank_explain_neural(): emit neural shadow score or null. Preserves regs.
+rank_explain_neural:
+    push rax
+    push rbx
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    push rbp
+    push r8
+    push r9
+    push r10
+    push r11
+    push r12
+    push r13
+    push r14
+    push r15
+    call rank_try_weights
+    cmp qword [md_ready], 1
+    jne rkex_null
+    cmp qword [rk_owned], 1
+    je rkex_null
+    cmp qword [fbkind], 1
+    je rkex_obs
+    mov rdi, [fbkind]
+    lea rsi, [rsnbuf]
+    mov rdx, [rsnlen]
+    call use_slot_name
+    jmp rkex_got
+rkex_obs:
+    mov rdi, 1
+    mov rsi, [fbobsid]
+    call use_slot_id
+rkex_got:
+    test rax, rax
+    jz rkex_null
+    call rank_feat
+    call rank_predict1
+    call md_out_f32e6
+    jmp rkex_done
+rkex_null:
+    lea rsi, [jnull]
+    call out_cstr
+rkex_done:
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop r11
+    pop r10
+    pop r9
+    pop r8
+    pop rbp
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
+    pop rax
+    ret
+
 ; ensure_tables: create missing memory tables; fills f_root_*.
 ; conclusions with root 2 must exist (else foreign db -> err). rax 0/1.
 ensure_tables:
@@ -7151,6 +8542,28 @@ et_uok:
 et_tf2:
     mov [f_root_tomb], rax
 et_tok:
+    ; rankex (continual-learning examples; plain append, reader-tolerant)
+    lea rsi, [t_rankex_n]
+    mov edx, 6
+    call find_table
+    test rax, rax
+    js et_err
+    jnz et_rxf
+    lea rax, [t_rankex_n]
+    mov [m_name], rax
+    mov qword [m_namelen], 6
+    lea rax, [t_rankex_sql]
+    mov [m_sql], rax
+    mov rax, t_rankex_sqllen
+    mov [m_sqllen], rax
+    call et_mk
+    test rax, rax
+    jz et_err
+    mov [f_root_rankex], rax
+    jmp et_rok
+et_rxf:
+    mov [f_root_rankex], rax
+et_rok:
     xor eax, eax
     ret
 et_err:
@@ -9527,6 +10940,10 @@ stc_store:
     mov [rdx + 16], rcx
     mov rcx, [stcoff]
     mov [rdx + 24], rcx
+    mov [rkscore], rax
+    mov rax, [smode]
+    mov [rksmode], rax
+    call rank_snap_hook
     inc qword [sncol]
     mov rdi, [scurpg]               ; tomb walk reused pagebuf: restore
     lea rsi, [pagebuf]
@@ -10456,7 +11873,7 @@ ofb_open:
     mov rdx, [rsnlen]
     call dec_parse               ; observations: decimal rowid identity
     test rax, rax
-    jz dc_params
+    jnz dc_params
     test rdx, rdx
     jz dc_params
     mov [fbobsid], rdx
@@ -10488,7 +11905,9 @@ ofb_flush:
     call use_flush               ; durable on return: no silent loss
     test rax, rax
     jnz om_dbclose
+    call rank_capture
     call db_close
+    call rank_train
     lea rax, [jsontmp]
     mov [outptr], rax
     mov qword [outlen], 0
@@ -10515,6 +11934,7 @@ ofb_flush:
     jmp oc_envelope
 ofb_tomb:
     call db_close
+    inc qword [rk_rej + 16]
     lea rax, [jsontmp]
     mov [outptr], rax
     mov qword [outlen], 0
@@ -10623,7 +12043,7 @@ oex_db:
     mov rdx, [rsnlen]
     call dec_parse
     test rax, rax
-    jz dc_params
+    jnz dc_params
     test rdx, rdx
     jz dc_params
     mov [fbobsid], rdx
@@ -10713,6 +12133,9 @@ oex_close:
     call out_cstr
     mov rax, [exscore]
     call out_uint
+    lea rsi, [jn_neural]
+    call out_cstr
+    call rank_explain_neural
     lea rsi, [jn_weights]
     call out_cstr
     mov rax, U_WA
@@ -12659,6 +14082,9 @@ t_tomb_sqllen = $ - t_tomb_sql - 1
 t_use_n db 'usage', 0
 t_use_sql db 'CREATE TABLE usage(name TEXT, kind TEXT, access TEXT, pos TEXT, neg TEXT, last TEXT, conf TEXT, v TEXT)', 0
 t_use_sqllen = $ - t_use_sql - 1
+t_rankex_n db 'rankex', 0
+t_rankex_sql db 'CREATE TABLE rankex(name TEXT, kind TEXT, seq TEXT, x0 TEXT, x1 TEXT, target TEXT, det TEXT, rev TEXT)', 0
+t_rankex_sqllen = $ - t_rankex_sql - 1
 
 dbmagic db 'SQLite format 3', 0
 dbsql db 'CREATE TABLE conclusions(reason TEXT, thought TEXT, conclusion TEXT, valid INTEGER)', 0
@@ -12706,6 +14132,7 @@ jn_last db ',"last_tick":', 0
 jn_now db ',"now_tick":', 0
 jn_conf db ',"confidence":', 0
 jn_score db ',"score":', 0
+jn_neural db ',"neural":', 0
 jn_weights db ',"weights":{"a":', 0
 jn_wp db ',"p":', 0
 jn_wn db ',"n":', 0
@@ -13010,6 +14437,7 @@ f_root_rel dq 0
 f_root_tasks dq 0
 f_root_use dq 0
 f_root_tomb dq 0
+f_root_rankex dq 0
 hfirst db 0
 v_num dq 0
 v_total dq 0
@@ -13070,6 +14498,16 @@ ddepth dq 0
 ppg dq 0
 ; PeaBrain on-board model consts (initialized, before trailing BSS).
 include 'model/md_consts.asm'
+; Continual-learning ranker consts (initialized, before trailing BSS).
+rk_lr dd 0.05
+rk_f8 dd 8.0
+rk_f32 dd 32.0
+rk_f64 dd 64.0
+rk_f1024 dd 1024.0
+rk_f05 dd 0.5
+rk_f025 dd 0.25
+rk_seed dq 0x12345678ABCDEF01
+rk_pbpath db 'rank.pbmd', 0
 sob rb 128
 ktab rb 768
 stab rb 64
@@ -13121,6 +14559,31 @@ obsbuf rb 1024
 fseen rb 16512
 tseetab rb 4096
 thslots rb 137216
+; Continual-learning ranker BSS (uninitialised, trailing: NOBITS).
+rk_snap rb 12288
+rk_snaphead rq 1
+rk_mem rb 98304
+rk_next rq 1
+rk_rev rq 1
+rk_rej rb 48
+rk_owned rq 1
+rk_bootdone rq 1
+rk_dbcount rq 1
+rk_bootskip rq 1
+rk_held rq 1
+rk_idx rq 1
+rk_wtried rq 1
+rk_liftf rb 4
+rk_X1 rb 8
+rk_T1 rb 4
+rk_evalbuf rb 512
+rkscore rq 1
+rksmode rq 1
+rk_jx0 rb 4
+rk_jx1 rb 4
+rk_jdet rq 1
+rk_jheld rb 1
+rk_num5 rb 24
 
 ; PeaBrain on-board model data (consts, then ALL rb trailing: NOBITS).
 include 'model/md_data.asm'

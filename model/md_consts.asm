@@ -56,3 +56,12 @@ md_jn_alloc db ',"allocated":', 0
 md_jn_commit db ',"committed":', 0
 md_jn_backend db ',"backend":"', 0
 md_jn_gpu   db '","gpu":"unavailable","gpu_reason":"no libcuda; CPU reference is the supported backend (see MODEL)"', 0
+md_jn_rank  db ',"rank":{"owner":"', 0
+rk_v_none   db 'none', 0
+rk_v_ranker db 'ranker', 0
+rk_v_user   db 'user', 0
+md_jn_rex   db '","examples":', 0
+md_jn_rheld db ',"heldout":', 0
+md_jn_rrev  db ',"revision":', 0
+md_jn_rej   db ',"rejected":[', 0
+md_jn_rlift db ',"lift":', 0
