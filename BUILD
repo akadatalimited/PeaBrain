@@ -293,6 +293,34 @@ Canonical state directory (PEABRAIN_STATE_DIR, else ~/.local/share/peabrain)
   files, boot-verify (usage_tracked, examples, step, predictions, restart
   training), then repoint. Rollback: restore archives + prior exe.
 
+Per-query tombstone snapshot (branch feat/tomb-index, unmerged)
+------------------------------------------------------------------------------
+  search_table st_hit + op_flist ofl called is_tombstoned per hit (full
+  210-page/11K-row tomb walk + childtab spill/restore + page re-read each);
+  the 16-slot page cache cannot hold the facts+tomb working sets, so every
+  hit re-read from disk with zero cross-query amortization (probe/lim20:
+  0.93s warm, 1.3M pread64).
+  Fix: tix_build snapshots tombstones once per read query after db_open
+  (same SH hold as the walks) into a 32768-slot open-address table (FNV-1a,
+  full key compare; 512KB) + 1MB name pool; cell rules mirror
+  scan_key_latest (TEXT-only col0; len>128 skipped as provably unmatchable).
+  ANY anomaly or capacity overflow (>24576 entries / pool full) abandons the
+  build and the legacy path runs (bit-identical fallback, never wrong).
+  tix_lookup is a pure predicate: no pagebuf/childtab clobber, so the spill/
+  restore + restore-pread are skipped on the index path. Read-ops only
+  (search, flist); never in tomb-writing loops. +1.5MB BSS (~+0.85MB RSS).
+  Measured (scratch copies): probe 0.975s->0.014s (70x), syscalls
+  1,304,553->6,253 (209x); hitless queries +1..5ms (build cost, no regression
+  risk). Oracle: 16/16 byte-identical vs shipped binary; 500/500 names vs
+  stock SQLite ground truth; corrupt-page and 25K-tomb overflow both agree
+  with legacy byte-for-byte (incl. a pre-existing legacy OOB crash on garbage
+  ncell, out of scope). Suites green AVX2+scalar with PEABRAIN_STATE_DIR
+  isolation (memtest/advtest/thinktest/conctest/mdtest2, state battery).
+  Lesson: stale-era harnesses that assume exe-relative stores MUST export
+  PEABRAIN_STATE_DIR, else they write to live canonical (one such incident
+  occurred during verification; repaired: test rows deleted, step-120 weights
+  restored from pristine copy, integrity ok, full disclosure in checkpoint).
+
 Timing instrumentation (opt-in: PEABRAIN_TIMING=1 in environ, branch only)
 --------------------------------------------------------------------------
   CLOCK_MONOTONIC via clock_gettime; diagnostics to stderr (fd 2) with

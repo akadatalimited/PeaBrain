@@ -4693,6 +4693,309 @@ is_tombstoned:
     call scan_key_latest
     ret
 
+; tix_build: snapshot tombstones into the per-query index. Call once per
+; read query right after db_open (same SH hold as the walks: snapshot and
+; emission are atomic against writers, which need EX). Sets tix_ready=1 on
+; a fully clean table, else 0 (caller uses is_tombstoned: exact fallback).
+; Cell rules mirror scan_key_latest one-for-one: TEXT-only col0 (serial 0
+; = empty name; 1..12 and even serials never match, so are skipped, not
+; stored); structural faults (bad varints, hdrsize >= 128, header/serial
+; mismatch, oversize ptr array, zero-serial rows whose legacy outcome
+; depends on stale gfo/gfl) ABANDON the build rather than risk divergence.
+; Names longer than 128 are skipped: both lookup sites reject len > 128
+; before consulting the index, so they can never match (proven, not heuristic).
+; Clobbers pagebuf, childtab/childn. Preserves rbx,rbp,r12-r15.
+tix_build:
+    push rbx
+    push rbp
+    push r12
+    push r13
+    push r14
+    push r15
+    mov qword [tix_ready], 0
+    mov rdi, [f_root_tomb]
+    test rdi, rdi
+    jz tx_done                   ; no table: legacy path owns the outcome
+    lea rdi, [tix_tab]
+    mov ecx, 32768
+    xor eax, eax
+tx_zero:
+    mov [rdi], rax                ; empty = hash 0 (len/pool stale, unread)
+    add rdi, 16
+    dec ecx
+    jnz tx_zero
+    mov qword [tix_n], 0
+    mov qword [tix_pooln], 0
+    mov rdi, [f_root_tomb]
+    call walk_leaves
+    test rax, rax
+    jnz tx_done                  ; walk failed: legacy reproduces the error
+    xor r12d, r12d               ; pi: leaf index (set semantics: any order)
+tx_page:
+    cmp r12, [childn]
+    jae tx_ok
+    lea rsi, [childtab]
+    mov rax, r12
+    shl rax, 3
+    add rsi, rax
+    mov rdi, [rsi]
+    lea rsi, [pagebuf]
+    call pg_read_nc              ; single pass: probe ok, evict nothing
+    test rax, rax
+    jnz tx_nextpg                ; unreadable page: legacy skips it too
+    cmp byte [pagebuf], 0x0D
+    jne tx_nextpg
+    lea rsi, [pagebuf + 3]
+    call be16_ld
+    test rax, rax
+    jz tx_nextpg
+    cmp rax, 2048                ; ptr array must fit the page; legacy would
+    ja tx_done                   ; misread it, so abandon (fallback is exact)
+    mov r13, rax                 ; ncell
+    xor r14d, r14d               ; ci
+tx_cell:
+    cmp r14, r13
+    jae tx_nextpg
+    lea rsi, [pagebuf + 8]
+    mov rax, r14
+    shl rax, 1
+    add rsi, rax
+    call be16_ld                 ; coff
+    lea rsi, [pagebuf]
+    add rsi, rax
+    lea rdx, [pagebuf + 4096]
+    call varint_get              ; plen
+    test rcx, rcx
+    jz tx_done
+    mov rsi, rcx
+    call varint_get              ; rowid (value ignored, validity required)
+    test rcx, rcx
+    jz tx_done
+    mov rsi, rcx
+    call varint_get              ; hdrsize
+    test rcx, rcx
+    jz tx_done
+    cmp rax, 128
+    jae tx_done
+    mov [tx_sptr], rcx
+    lea rdx, [rcx]
+    add rdx, rax
+    dec rdx
+    mov [tx_body], rdx           ; body = sptr + hval - 1 (hval < 128: 1 byte)
+    mov qword [tx_cnt], 0
+    mov qword [tx_s0], 0
+    mov byte [tx_first], 1
+tx_ser:
+    cmp qword [tx_cnt], 5
+    jae tx_serdone
+    mov rsi, [tx_sptr]
+    cmp rsi, [tx_body]
+    jae tx_serdone
+    lea rdx, [pagebuf + 4096]
+    call varint_get
+    test rcx, rcx
+    jz tx_done
+    cmp byte [tx_first], 0
+    je tx_sernext
+    mov [tx_s0], rax
+    mov byte [tx_first], 0
+tx_sernext:
+    mov [tx_sptr], rcx
+    inc qword [tx_cnt]
+    jmp tx_ser
+tx_serdone:
+    mov rax, [tx_sptr]
+    cmp rax, [tx_body]
+    jne tx_done                  ; serials must exactly fill header
+    cmp qword [tx_cnt], 0
+    je tx_done                   ; zero-serial row: legacy reads stale gfo/gfl;
+                                 ; abandon so the fallback preserves it exactly
+    mov rax, [tx_s0]
+    test rax, rax
+    jz tx_store0                 ; serial 0: empty name, usable
+    cmp rax, 13
+    jb tx_nextcell               ; 1..12 incl. BLOB-0: never match, skip
+    test al, 1
+    jz tx_nextcell               ; even serials (BLOB): never match, skip
+    sub rax, 13
+    shr rax, 1                   ; TEXT len
+    jmp tx_store1
+tx_store0:
+    xor eax, eax
+tx_store1:
+    mov rbx, rax                 ; len (rbx survives helpers)
+    cmp rbx, 128
+    ja tx_nextcell               ; unmatchable at both lookup sites: skip
+    mov rax, [tx_body]
+    add rax, rbx
+    lea rdx, [pagebuf + 4096]
+    cmp rax, rdx
+    ja tx_nextcell               ; out of page: legacy skips the row too
+    mov r15, [tx_body]           ; name ptr (r15 survives fnv1a64)
+    cmp qword [tix_n], 24576
+    jae tx_done                  ; table cap: abandon (fallback stays exact;
+                                 ; 24576 < 32768 keeps an empty slot, so every
+                                 ; lookup probe provably terminates)
+    mov rax, [tix_pooln]
+    add rax, rbx
+    cmp rax, 1048576
+    ja tx_done                   ; pool cap: abandon, same guarantee
+    mov rsi, r15
+    mov rdx, rbx
+    call fnv1a64
+    mov rbp, rax                 ; hash (rbp free: serial loop is done)
+    test rbp, rbp
+    jnz tx_hok
+    mov rbp, 1                   ; hash 0 is the empty mark: remap (lookup
+tx_hok:                          ; applies the identical mapping)
+    mov eax, ebp
+    and eax, 32767
+    mov r11d, eax                ; slot cursor (r11 free until memcmp)
+tx_probe:
+    lea r10, [tix_tab]
+    mov eax, r11d
+    shl rax, 4
+    add r10, rax                  ; r10 = slot
+    cmp [r10], rbp
+    jne tx_maybeempty            ; different hash: empty or keep probing
+    cmp [r10 + 8], ebx            ; len match?
+    jne tx_nextslot
+    test rbx, rbx
+    jz tx_nextcell               ; two empty names are equal: duplicate
+    push rsi                     ; full key compare: collisions cost probes,
+    push rdi                     ; never wrong results
+    push rcx
+    mov rsi, r15
+    mov eax, [r10 + 12]
+    lea rdi, [tix_pool]
+    add rdi, rax
+    mov rcx, rbx
+    repe cmpsb
+    pop rcx
+    pop rdi
+    pop rsi
+    je tx_nextcell               ; duplicate: already stored, skip
+    jmp tx_nextslot
+tx_maybeempty:
+    cmp qword [r10], 0
+    jne tx_nextslot              ; occupied: keep probing
+    mov [r10], rbp               ; empty slot: store hash/len/pool-off
+    mov [r10 + 8], ebx
+    mov rax, [tix_pooln]
+    mov [r10 + 12], eax
+    push rsi
+    push rdi
+    push rcx
+    mov rsi, r15
+    mov eax, [r10 + 12]
+    lea rdi, [tix_pool]
+    add rdi, rax
+    mov rcx, rbx
+    rep movsb
+    pop rcx
+    pop rdi
+    pop rsi
+    add [tix_pooln], rbx
+    inc qword [tix_n]
+    jmp tx_nextcell
+tx_nextslot:
+    inc r11d
+    and r11d, 32767
+    jmp tx_probe
+tx_nextcell:
+    inc r14
+    jmp tx_cell
+tx_nextpg:
+    inc r12
+    jmp tx_page
+tx_ok:
+    mov qword [tix_ready], 1
+tx_done:
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbp
+    pop rbx
+    ret
+
+; tix_lookup(rsi=name, rdx=len): rax 1 member / 0 absent. Call only when
+; tix_ready=1. Pure predicate: touches only tix_tab/tix_pool, never
+; pagebuf, childtab, gfo/gfl or growid, so the caller's walk continues
+; undisturbed (no spill/restore, no page re-read on either outcome).
+; Termination is structural: a ready index holds at most 24576 entries in
+; 32768 slots, so an empty slot always ends the probe. Preserves
+; rbx,rbp,r12-r15,rsi,rdi; clobbers rax,rcx,rdx,r8-r11.
+tix_lookup:
+    push rbx
+    push rbp
+    push r12
+    push r13
+    push r14
+    push r15
+    push rsi
+    push rdi
+    cmp rdx, 128
+    ja lx_no                    ; longer than any stored name: exact absent
+    mov rbx, rdx                ; len (survives fnv1a64)
+    mov r15, rsi                ; name (survives fnv1a64)
+    call fnv1a64
+    mov rbp, rax
+    test rbp, rbp
+    jnz lx_hok
+    mov rbp, 1                  ; identical remap as the build side
+lx_hok:
+    mov eax, ebp
+    and eax, 32767
+    mov r11d, eax
+lx_probe:
+    lea r10, [tix_tab]
+    mov eax, r11d
+    shl rax, 4
+    add r10, rax
+    cmp [r10], rbp
+    jne lx_maybeempty
+    cmp [r10 + 8], ebx
+    jne lx_next
+    test rbx, rbx
+    jz lx_yes                   ; two empty names are equal
+    push rsi
+    push rdi
+    push rcx
+    mov rsi, r15
+    mov eax, [r10 + 12]
+    lea rdi, [tix_pool]
+    add rdi, rax
+    mov rcx, rbx
+    repe cmpsb                  ; full key: a collision can never hide a miss
+    pop rcx                     ; nor invent a hit
+    pop rdi
+    pop rsi
+    je lx_yes
+    jmp lx_next
+lx_maybeempty:
+    cmp qword [r10], 0
+    je lx_no                    ; empty slot ends the probe: absent
+lx_next:
+    inc r11d
+    and r11d, 32767
+    jmp lx_probe
+lx_yes:
+    mov eax, 1
+    jmp lx_out
+lx_no:
+    xor eax, eax
+lx_out:
+    pop rdi
+    pop rsi
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbp
+    pop rbx
+    ret
+
 ; db_open: shared/read (LOCK_SH). db_open_ex: exclusive/write (LOCK_EX).
 ; Readers never block each other; any journal/creation/missing-table case
 ; escalates a reader to EX (UN then EX, never upgrade) before mutating.
@@ -11552,6 +11855,7 @@ op_flist:
     call db_open
     test rax, rax
     jnz oc_db
+    call tix_build              ; same per-query snapshot (ready=0 -> legacy)
     mov rdi, [f_root_facts]
     call walk_leaves
     test rax, rax
@@ -11660,6 +11964,15 @@ olf_add:
     mov rcx, r10
     rep movsb
     mov [rsnlen], r10
+    cmp qword [tix_ready], 1
+    jne ofl_tomblegacy
+    lea rsi, [rsnbuf]
+    mov rdx, [rsnlen]
+    call tix_lookup             ; pure predicate: pagebuf intact either way
+    cmp rax, 1
+    je olf_nextcell             ; hidden: no restore needed
+    jmp ofl_live                ; live: skip the restore pread, emit
+ofl_tomblegacy:
     lea rsi, [rsnbuf]
     mov rdx, [rsnlen]
     call is_tombstoned
@@ -11672,6 +11985,7 @@ olf_add:
     call pg_read
     test rax, rax
     jnz olf_nextcell
+ofl_live:
     cmp byte [hfirst], 1
     je olf_first
     mov al, '\'
@@ -12585,6 +12899,15 @@ st_hit:
     ; childn (restored here), growid (overwritten only on match, which
     ; always skips — visible rows keep theirs); gfo/gfl/gcols/stab are
     ; untouched (tomb walk parses manually into tmprow).
+    cmp qword [tix_ready], 1
+    jne st_tomblegacy
+    lea rsi, [rsnbuf]           ; same aside bytes the legacy call would use
+    mov rdx, [rsnlen]
+    call tix_lookup             ; pure predicate: walk state undisturbed
+    cmp rax, 1
+    je st_nextcell              ; hidden: pagebuf/childtab intact, no restore
+    jmp st_collect              ; live: pagebuf intact, no restore
+st_tomblegacy:
     mov rcx, [childn]
     mov [sk_cn], rcx
     lea rsi, [childtab]
@@ -14052,6 +14375,8 @@ os_nolim:
     call db_open                ; search shares one recency timestamp
     test rax, rax
     jnz oc_db
+    call tix_build              ; snapshot tombstones once per query (same SH
+                                ; hold as the walks; ready=0 -> legacy path)
     lea rax, [jsontmp]
     mov [outptr], rax
     call out_reset
@@ -16412,6 +16737,22 @@ st_pbmd rb 272
 st_rkpb rb 272
 st_ebulen rq 1
 sk_cn rq 1
+; Per-query tombstone membership snapshot (exact, read-only, transient).
+; Built once per read query under the same SH hold as the walks (no writer
+; can interleave: writers need EX). tix_ready=1 only on a fully clean
+; table; ANY anomaly abandons the build and the legacy per-candidate
+; is_tombstoned path runs instead (bit-identical fallback, never wrong).
+; Slots: hash qword (0 = empty; FNV 0 is stored as 1), len dword, pool dword.
+tix_tab rb 524288
+tix_pool rb 1048576
+tix_ready rq 1
+tix_n rq 1
+tix_pooln rq 1
+tx_sptr rq 1
+tx_body rq 1
+tx_s0 rq 1
+tx_cnt rq 1
+tx_first rb 1
 
 ; PeaBrain on-board model data (consts, then ALL rb trailing: NOBITS).
 include 'model/md_data.asm'
