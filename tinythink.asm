@@ -11916,9 +11916,30 @@ st_hit:
     rep movsb
     mov rax, qword [gfl]
     mov [rsnlen], rax
+    ; The tomb walk below reuses pagebuf AND walks childtab/childn: spill
+    ; the outer walk's leaf list first (mirror rname_of's chsave pattern;
+    ; sequential use only, never nested). Without this every tomb-checked
+    ; hit derails the rest of the table scan into tomb pages.
+    ; Audited clobber set: pagebuf (restored below as before), childtab/
+    ; childn (restored here), growid (overwritten only on match, which
+    ; always skips — visible rows keep theirs); gfo/gfl/gcols/stab are
+    ; untouched (tomb walk parses manually into tmprow).
+    mov rcx, [childn]
+    mov [sk_cn], rcx
+    lea rsi, [childtab]
+    lea rdi, [chsave]
+    rep movsq
     lea rsi, [rsnbuf]
     mov rdx, [rsnlen]
     call is_tombstoned
+    push rax
+    mov rcx, [sk_cn]
+    lea rsi, [chsave]
+    lea rdi, [childtab]
+    rep movsq
+    mov rax, [sk_cn]
+    mov [childn], rax
+    pop rax
     cmp rax, 1
     je st_skip
     cmp rax, 2
@@ -15695,6 +15716,7 @@ tm_opname rb 40
 tm_tmp rb 32
 tm_buf rb 256
 tm_ebuf rb 4100
+sk_cn rq 1
 
 ; PeaBrain on-board model data (consts, then ALL rb trailing: NOBITS).
 include 'model/md_data.asm'

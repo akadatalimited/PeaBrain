@@ -308,6 +308,28 @@ Reverse-identity index for legacy usage rows (boot, read-only)
   (rindex 0, legacy path) identical, full db/model/learning/concurrency
   suites green on both backends. BOOT line gains additive rindex_ok.
   Requires fasm -m 65536 (BSS outgrew the default 16MB assembler limit).
+Search-truncation fix (nested walk clobbers outer walk state)
+---------------------------------------------------------------
+  Pathology (pre-existing since v1.0.0): is_tombstoned -> scan_key_latest
+  -> walk_leaves overwrote the outer search walk's childtab/childn with
+  tomb-table leaves. Every tomb-checked hit (visible or correctly skipped)
+  derailed the rest of that table's scan into tomb pages: late matches
+  silently missing (proven: six tombstoned deploy-probe-N rows hid a live
+  probe; traced scan covered ~515 pages of 1,192 facts leaves), plus ~200
+  wasted page reads per hit. Small DBs dodge it (single-page tables).
+  Fix: spill childtab/childn to chsave around the check (mirror rname_of's
+  sequential-use pattern), single restore site preserving rax. Audited all
+  17 walk_leaves sites + 12 is_tombstoned sites: exactly one proven defect
+  (op_flist accidentally safe via descending order + tomb self-skips +
+  caps; op_open/collect_prefix/query/insert paths hold no live walk;
+  use_load/rname_of already guarded). Tomb walk never touches gfo/gfl/
+  gcols/stab (manual parse into tmprow); growid overwritten only on match,
+  which always skips. Cost: ~9KB memcpy per hit; multi-match search +1.0s
+  for a COMPLETE scan (old: instant but truncated to 1 row) on live-shaped
+  data. Verified: placement matrix (old hides all 12, new finds all 12),
+  7 malformed + sparse + fallback identical, 32,625-explain sweep on
+  tomb-free data identical, full suites green both backends.
+
 
 Smoke test
 ----------
