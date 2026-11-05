@@ -268,6 +268,31 @@ Continual-learning ranker (shadow mode, deterministic order authoritative)
   Live DB untouched by development (scratch-only under /scratch/tmp);
   first boot with this binary creates the empty rankex table (one page).
 
+Canonical state directory (PEABRAIN_STATE_DIR, else ~/.local/share/peabrain)
+------------------------------------------------------------------------------
+  Replaces historical executable-relative database resolution (readlink
+  /proc/self/exe with CWD fallback), which silently split state across
+  launch directories: the DB followed the exe/CWD while rank.pbmd followed
+  the CWD, producing divergent weight lineages (repo step 10 vs live
+  step 120) and forked empty stores.
+  Contract: explicit PEABRAIN_STATE_DIR wins, else ~/.local/share/peabrain;
+  tinythink.db + rank.pbmd resolve from the same dir; dirs 0700, files
+  0600 (db open already enforces 0600+owner; creations use 0600+fchmod).
+  Explicit user-model paths (model_save/load {path}) stay CWD-relative.
+  Fresh-install guard: populated legacy store (exe-dir or CWD, any size>0)
+  + empty canonical => loud refusal naming both paths (never silent fork);
+  nothing anywhere => create fresh. Missing/inaccessible configured state
+  fails clearly (exit 1 + reason); never falls back, never fabricates.
+  Independent stores via separate explicit overrides (verified isolated).
+  Test harnesses must export PEABRAIN_STATE_DIR per workdir.
+  Verified: fresh/default/refuse/denied/explicit-path/isolation/retrain/
+  perms/CWD-ignored battery green; full suites green via override.
+  Migration (separate approval): quiesce writers, snapshot (cp -p, record
+  fingerprints, require no journal or recover first), copy (never move)
+  db + authoritative weights to canonical, archive (never delete) legacy
+  files, boot-verify (usage_tracked, examples, step, predictions, restart
+  training), then repoint. Rollback: restore archives + prior exe.
+
 Timing instrumentation (opt-in: PEABRAIN_TIMING=1 in environ, branch only)
 --------------------------------------------------------------------------
   CLOCK_MONOTONIC via clock_gettime; diagnostics to stderr (fd 2) with

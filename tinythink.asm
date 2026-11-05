@@ -94,6 +94,7 @@ v3_fail:
 v3_ok:
     cld
     call tm_init
+    call st_resolve
     lea rax, [outbuf]
     mov [outptr], rax
 
@@ -4702,40 +4703,8 @@ db_open_ex:
     mov edi, 1
 do_open_body:
     mov [dbwmode], rdi
-    mov eax, 89                 ; readlink /proc/self/exe
-    lea rdi, [dbexe]
-    lea rsi, [exebuf]
-    mov edx, 1024
-    syscall
-    cmp rax, 0
-    jle do_cwd
-    mov rcx, rax
-    lea r10, [exebuf]             ; base in reg: PIE-safe (no label+index)
-do_sl:
-    dec rcx
-    js do_cwd
-    cmp byte [r10 + rcx], '/'
-    jne do_sl
-    inc rcx
-    cmp rcx, 1024
-    ja do_cwd
-    mov [dblen], rcx
-    lea rsi, [exebuf]
-    lea rdi, [dbpath]
-    rep movsb
-    lea rsi, [dbfile]
-    mov ecx, 12
-    rep movsb
-    mov byte [rdi], 0
-    add qword [dblen], 12
-    jmp do_paths
-do_cwd:
-    lea rsi, [dbfile]
-    lea rdi, [dbpath]
-    mov ecx, 12
-    rep movsb
-    mov byte [rdi], 0
-    mov qword [dblen], 12
+    ; dbpath/jpath/dbdirb arrive pre-resolved from st_resolve (boot);
+    ; legacy exe-dir/CWD locations are never opened, only STATed there.
 do_paths:
     ; jpath = dbpath + "-journal"; dbdirb = dirname (for dirsync)
     mov rax, [dblen]
@@ -8039,7 +8008,668 @@ tmfs_out:
     pop rbx
     ret
 
-; ---- continual-learning ranker (shadow mode) ----; Design: snapshot deterministic features at RETRIEVAL time (rank_snap_hook);
+; ---- canonical state directory (PEABRAIN_STATE_DIR, else ~/.local/share/peabrain) ----
+; Resolved once at boot (st_resolve); dbpath/jpath/dbdirb + default model
+; paths derive from it. Legacy exe-dir/CWD locations are only STATed for
+; the fresh-install guard — never opened. Fatal errors exit(1) with a
+; stderr message; success preserves all GP registers and flags.
+ST_SMAX = 240
+
+; st_fatal(rsi=msg cstr, rdx=path or 0, rcx=pathlen): stderr + exit(1).
+st_fatal:
+    sub rsp, 32
+    mov [rsp], rsi
+    mov [rsp + 8], rdx
+    mov [rsp + 16], rcx
+    lea rsi, [st_e_prefix]
+    call st_wcstr
+    mov rsi, [rsp]
+    call st_wcstr
+    mov rdx, [rsp + 8]
+    test rdx, rdx
+    jz stf_nl
+    mov byte [st_brk], ' '
+    mov byte [st_brk + 1], '['
+    mov eax, 1
+    mov edi, 2
+    lea rsi, [st_brk]
+    mov edx, 2
+    syscall
+    mov rsi, [rsp + 8]
+    mov rdx, [rsp + 16]
+    mov eax, 1
+    mov edi, 2
+    syscall
+    mov byte [st_brk], ']'
+    mov eax, 1
+    mov edi, 2
+    lea rsi, [st_brk]
+    mov edx, 1
+    syscall
+stf_nl:
+    mov eax, 1
+    mov edi, 2
+    lea rsi, [st_e_nl]
+    mov edx, 1
+    syscall
+    mov eax, 60
+    mov edi, 1
+    syscall
+; st_wcstr(rsi=cstr): stderr bytes. Clobbers rax,rcx,rdx,rdi.
+st_wcstr:
+    push rsi
+    xor ecx, ecx
+stw_len:
+    cmp byte [rsi + rcx], 0
+    je stw_go
+    inc rcx
+    jmp stw_len
+stw_go:
+    mov rdx, rcx
+    pop rsi
+    mov eax, 1
+    mov edi, 2
+    syscall
+    ret
+; st_strlen(rsi): rdx=len (to NUL, cap 1104). Preserves all but rdx/rcx.
+st_strlen:
+    push rax
+    push rcx
+    push rsi
+    xor edx, edx
+sts_loop:
+    cmp edx, 1104
+    jae sts_done
+    cmp byte [rsi + rdx], 0
+    je sts_done
+    inc rdx
+    jmp sts_loop
+sts_done:
+    pop rsi
+    pop rcx
+    pop rax
+    ret
+; st_findkey(rsi=key cstr with '=', rcx=keylen): anchored environ search.
+; rax=1 found (rsi=val, rdx=vallen, possibly 0) else rax=0. Preserves all
+; GP except rax,rsi,rdx,rcx.
+st_findkey:
+    push rbx
+    push rdi
+    push r8
+    push r9
+    push r10
+    mov r8, rsi
+    mov r9, rcx
+    lea rbx, [st_ebuf]
+    mov r10, [st_ebulen]
+    test r10, r10
+    jz stk_miss
+    lea r10, [rbx + r10]
+stk_entry:
+    cmp rbx, r10
+    jae stk_miss
+    mov rsi, rbx
+    mov rdi, r8
+    mov rcx, r9
+    repe cmpsb
+    jne stk_next
+    mov rsi, rbx
+    add rsi, r9
+    mov rdx, rsi
+stk_vlen:
+    cmp rdx, r10
+    jae stk_vdone
+    cmp byte [rdx], 0
+    je stk_vdone
+    inc rdx
+    jmp stk_vlen
+stk_vdone:
+    sub rdx, rsi
+    mov eax, 1
+    pop r10
+    pop r9
+    pop r8
+    pop rdi
+    pop rbx
+    ret
+stk_next:
+    mov rsi, rbx
+stk_skip:
+    cmp rsi, r10
+    jae stk_miss
+    cmp byte [rsi], 0
+    je stk_adv
+    inc rsi
+    jmp stk_skip
+stk_adv:
+    lea rbx, [rsi + 1]
+    jmp stk_entry
+stk_miss:
+    xor eax, eax
+    pop r10
+    pop r9
+    pop r8
+    pop rdi
+    pop rbx
+    ret
+; st_checkdir(rdi=fd): verify dir fd is owner-only 0700. rax 0 ok / 1 bad.
+; Preserves all GP except rax,rcx,rdx.
+st_checkdir:
+    push rbx
+    mov eax, 5
+    lea rsi, [st_statb]
+    syscall
+    test rax, rax
+    js stc_bad
+    mov eax, 102
+    syscall
+    mov ebx, eax
+    mov eax, dword [st_statb + 28]
+    cmp eax, ebx
+    jne stc_bad
+    mov eax, dword [st_statb + 24]
+    and eax, 0xFFF
+    cmp eax, 448
+    jne stc_bad
+    xor eax, eax
+    pop rbx
+    ret
+stc_bad:
+    mov eax, 1
+    pop rbx
+    ret
+; st_resolve: canonical state directory, once at boot. dbpath/jpath/dbdirb
+; + default model paths derive from it. Legacy locations are only STATed
+; for the fresh-install guard, never opened. Fatal errors exit(1).
+; Preserves all GP registers and flags on success.
+st_resolve:
+    push rax
+    push rbx
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    push rbp
+    push r8
+    push r9
+    push r10
+    push r11
+    push r12
+    push r13
+    push r14
+    push r15
+    pushfq
+    mov eax, 257
+    mov rdi, -100
+    lea rsi, [tm_envpath]
+    xor edx, edx
+    xor r10d, r10d
+    syscall
+    test rax, rax
+    js str_noenv
+    mov r12d, eax
+    xor r13d, r13d
+str_envrd:
+    cmp r13d, 4100
+    jae str_envdone
+    mov eax, 0
+    mov rdi, r12
+    lea rsi, [st_ebuf]
+    add rsi, r13
+    mov edx, 4100
+    sub edx, r13d
+    syscall
+    test rax, rax
+    jle str_envdone
+    add r13d, eax
+    jmp str_envrd
+str_envdone:
+    mov eax, 3
+    mov rdi, r12
+    syscall
+    mov [st_ebulen], r13
+    jmp str_envok
+str_noenv:
+    mov qword [st_ebulen], 0
+str_envok:
+    lea rsi, [st_key_state]
+    mov ecx, st_key_statelen
+    call st_findkey
+    test rax, rax
+    jz str_home
+    test rdx, rdx
+    jz str_home
+    cmp rdx, ST_SMAX
+    ja str_toolong
+    lea rdi, [st_dir]
+    mov rcx, rdx
+    rep movsb
+    mov [st_dirlen], rdx
+    jmp str_havedir
+str_home:
+    lea rsi, [st_key_home]
+    mov ecx, st_key_homelen
+    call st_findkey
+    test rax, rax
+    jz str_nohome
+    test rdx, rdx
+    jz str_nohome
+    mov rbx, rdx
+    add rbx, st_suffixlen
+    cmp rbx, ST_SMAX
+    ja str_toolong
+    lea rdi, [st_dir]
+    mov rcx, rdx
+    rep movsb
+    lea rsi, [st_suffix]
+    mov rcx, st_suffixlen
+    rep movsb
+    mov [st_dirlen], rbx
+    jmp str_havedir
+str_nohome:
+    lea rsi, [st_e_nohome]
+    xor edx, edx
+    call st_fatal
+str_toolong:
+    lea rsi, [st_e_toolong]
+    xor edx, edx
+    call st_fatal
+str_havedir:
+    mov rax, [st_dirlen]
+    cmp rax, 1
+    jbe str_opendir
+    lea rsi, [st_dir]
+    cmp byte [rsi + rax - 1], '/'
+    jne str_opendir
+    dec rax
+    mov [st_dirlen], rax
+    mov byte [rsi + rax], 0
+    jmp str_opendir
+str_opendir:
+    mov rax, [st_dirlen]
+    lea rsi, [st_dir]
+    mov byte [rsi + rax], 0
+    mov eax, 257
+    mov rdi, -100
+    lea rsi, [st_dir]
+    mov edx, 0x10000
+    xor r10d, r10d
+    syscall
+    test rax, rax
+    js str_maybe_create
+    mov rdi, rax
+    push rax
+    call st_checkdir
+    test rax, rax
+    jnz str_badexisting
+    pop rax
+    push rax
+    mov eax, 3
+    pop rdi
+    syscall
+    jmp str_builddb
+str_badexisting:
+    pop rax
+    push rax
+    mov eax, 3
+    pop rdi
+    syscall
+    lea rsi, [st_e_perm]
+    lea rdx, [st_dir]
+    mov rcx, [st_dirlen]
+    call st_fatal
+str_maybe_create:
+    neg rax
+    cmp rax, 2
+    jne str_denied
+    call st_legacy_guard
+    lea rsi, [st_dir]
+    call st_mkdir_each
+    mov eax, 257
+    mov rdi, -100
+    lea rsi, [st_dir]
+    mov edx, 0x10000
+    xor r10d, r10d
+    syscall
+    test rax, rax
+    js str_denied2
+    mov rdi, rax
+    push rax
+    call st_checkdir
+    test rax, rax
+    jnz str_permfail
+    pop rax
+    push rax
+    mov eax, 3
+    pop rdi
+    syscall
+    jmp str_builddb
+str_denied:
+    neg rax
+    push rax
+    lea rsi, [st_e_denied]
+    lea rdx, [st_dir]
+    mov rcx, [st_dirlen]
+    call st_fatal
+str_denied2:
+    lea rsi, [st_e_denied]
+    lea rdx, [st_dir]
+    mov rcx, [st_dirlen]
+    call st_fatal
+str_permfail:
+    pop rax
+    push rax
+    mov eax, 3
+    pop rdi
+    syscall
+    lea rsi, [st_e_perm]
+    lea rdx, [st_dir]
+    mov rcx, [st_dirlen]
+    call st_fatal
+; st_mkdir_each(rsi=NUL-term dir): mkdir -p with mode 0700. Fatal (mkfail)
+; on any real error; EEXIST is fine. Preserves all GP except rax,rcx,rdx.
+st_mkdir_each:
+    push rbx
+    push rsi
+    push rdi
+    push r8
+    push r9
+    lea r8, [st_tmp]
+    mov r9, rsi
+stmk_copy:
+    mov al, [rsi]
+    mov [r8], al
+    test al, al
+    jz stmk_walk
+    inc rsi
+    inc r8
+    jmp stmk_copy
+stmk_walk:
+    lea r8, [st_tmp]
+    cmp byte [r8], '/'
+    jne stmk_next
+    inc r8
+stmk_next:
+    cmp byte [r8], 0
+    je stmk_full
+    cmp byte [r8], '/'
+    jne stmk_adv
+    mov byte [r8], 0
+    mov eax, 83
+    lea rdi, [st_tmp]
+    mov esi, 448
+    syscall
+    test rax, rax
+    js stmk_maybe
+    mov byte [r8], '/'
+    jmp stmk_adv2
+stmk_maybe:
+    neg rax
+    cmp rax, 17
+    je stmk_restore
+    lea rsi, [st_e_mkfail]
+    lea rdx, [st_tmp]
+    mov rcx, r8
+    lea r9, [st_tmp]
+    sub rcx, r9
+    call st_fatal
+stmk_restore:
+    mov byte [r8], '/'
+stmk_adv2:
+    inc r8
+    jmp stmk_next
+stmk_adv:
+    inc r8
+    jmp stmk_next
+stmk_full:
+    mov eax, 83
+    lea rdi, [st_tmp]
+    mov esi, 448
+    syscall
+    test rax, rax
+    js stmk_fullmaybe
+    pop r9
+    pop r8
+    pop rdi
+    pop rsi
+    pop rbx
+    xor eax, eax
+    ret
+stmk_fullmaybe:
+    neg rax
+    cmp rax, 17
+    je stmk_ok
+    lea rsi, [st_e_mkfail]
+    lea rdi, [st_tmp]
+    mov rdx, rdi
+    call st_strlen
+    mov rcx, rdx
+    mov rdx, rdi
+    lea rsi, [st_e_mkfail]
+    call st_fatal
+stmk_ok:
+    pop r9
+    pop r8
+    pop rdi
+    pop rsi
+    pop rbx
+    xor eax, eax
+    ret
+str_builddb:
+    mov rax, [st_dirlen]
+    lea rsi, [st_dir]
+    lea rdi, [dbpath]
+    mov rcx, rax
+    rep movsb
+    mov byte [rdi], '/'
+    inc rdi
+    inc rax
+    lea rsi, [dbfile]
+    mov ecx, 12
+    rep movsb
+    mov byte [rdi], 0
+    add rax, 12
+    mov [dblen], rax
+    mov eax, 4
+    lea rdi, [dbpath]
+    lea rsi, [st_statb]
+    syscall
+    test rax, rax
+    jz str_pbmdpaths
+    neg rax
+    cmp rax, 2
+    jne str_dbdenied
+    call st_legacy_guard
+    jmp str_pbmdpaths
+str_dbdenied:
+    lea rsi, [dbpath]
+    call st_strlen
+    mov rcx, rdx
+    lea rdx, [dbpath]
+    lea rsi, [st_e_denied]
+    call st_fatal
+str_pbmdpaths:
+    lea rsi, [st_dir]
+    lea rdi, [st_pbmd]
+    mov rcx, [st_dirlen]
+    rep movsb
+    mov byte [rdi], '/'
+    inc rdi
+    lea rsi, [md_defpath]
+    call st_wcstr2
+    lea rsi, [st_dir]
+    lea rdi, [st_rkpb]
+    mov rcx, [st_dirlen]
+    rep movsb
+    mov byte [rdi], '/'
+    inc rdi
+    lea rsi, [rk_pbpath]
+    call st_wcstr2
+    popfq
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop r11
+    pop r10
+    pop r9
+    pop r8
+    pop rbp
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
+    pop rax
+    ret
+; st_wcstr2(rsi=cstr, rdi=dst): copy incl NUL. Clobbers rax,rcx.
+st_wcstr2:
+    xor ecx, ecx
+stw2_loop:
+    mov al, [rsi + rcx]
+    mov [rdi + rcx], al
+    test al, al
+    jz stw2_done
+    inc rcx
+    jmp stw2_loop
+stw2_done:
+    ret
+; st_legacy_guard: refuse when a populated legacy store exists while the
+; canonical database is absent. Best-effort probes; preserves all GP.
+st_legacy_guard:
+    push rax
+    push rbx
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    push r8
+    push r9
+    push r10
+    push r11
+    push r12
+    push r13
+    push r14
+    push r15
+    pushfq
+    mov eax, 89
+    lea rdi, [dbexe]
+    lea rsi, [exebuf]
+    mov edx, 1024
+    syscall
+    cmp rax, 0
+    jle stlg_cwd
+    mov rcx, rax
+    lea r10, [exebuf]
+stlg_sl:
+    dec rcx
+    js stlg_cwd
+    cmp byte [r10 + rcx], '/'
+    jne stlg_sl
+    lea rsi, [exebuf]
+    lea rdi, [st_tmp]
+    mov rdx, rcx
+    inc rdx
+    mov rcx, rdx
+    rep movsb
+    lea rsi, [dbfile]
+    mov ecx, 13
+    rep movsb
+    lea rdi, [st_tmp]
+    mov eax, 4
+    lea rsi, [st_statb]
+    syscall
+    test rax, rax
+    jnz stlg_cwd
+    mov rax, qword [st_statb + 48]
+    test rax, rax
+    jz stlg_cwd
+    jmp stlg_found
+stlg_cwd:
+    mov eax, 79
+    lea rdi, [st_tmp]
+    mov esi, 1104
+    syscall
+    test rax, rax
+    js stlg_done
+    lea rsi, [st_tmp]
+    call st_strlen
+    lea rdi, [st_tmp]
+    add rdi, rdx
+    mov byte [rdi], '/'
+    inc rdi
+    inc rdx
+    lea rsi, [dbfile]
+    mov ecx, 13
+    rep movsb
+    lea rdi, [st_tmp]
+    mov eax, 4
+    lea rsi, [st_statb]
+    syscall
+    test rax, rax
+    jnz stlg_done
+    mov rax, qword [st_statb + 48]
+    test rax, rax
+    jz stlg_done
+stlg_found:
+    popfq
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop r11
+    pop r10
+    pop r9
+    pop r8
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
+    pop rax
+    lea rsi, [st_dir]
+    lea rdi, [st_ebuf]
+    mov rcx, [st_dirlen]
+    rep movsb
+    mov byte [rdi], ' '
+    mov byte [rdi + 1], '='
+    mov byte [rdi + 2], '>'
+    mov byte [rdi + 3], ' '
+    add rdi, 4
+    push rdi
+    lea rsi, [st_tmp]
+    call st_strlen
+    mov rcx, rdx
+    pop rdi
+    lea rsi, [st_tmp]
+    rep movsb
+    mov rax, [st_dirlen]
+    add rax, 4
+    add rax, rdx
+    mov rcx, rax
+    lea rdx, [st_ebuf]
+    lea rsi, [st_e_legacy]
+    call st_fatal
+stlg_done:
+    popfq
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop r11
+    pop r10
+    pop r9
+    pop r8
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
+    pop rax
+    ret
+
+; ---- continual-learning ranker (shadow mode) ----
+; Design: snapshot deterministic features at RETRIEVAL time (rank_snap_hook);
 ; explicit useful/misleading feedback joins the snapshot (rank_capture) into a
 ; labelled example persisted in the rankex table (rank_persist) and trained
 ; incrementally (rank_train). Training consumes ONLY snapshot-time features:
@@ -8690,7 +9320,7 @@ rktr_stepsdone:
     mov dword [md_hasloss], 1
     inc qword [rk_rev]
     call tm_save_start
-    lea rsi, [rk_pbpath]
+    lea rsi, [st_rkpb]
     call md_save
     push rax
     call tm_save_end
@@ -8744,7 +9374,7 @@ rank_try_weights:
     mov qword [rk_wtried], 1
     mov eax, 257
     mov rdi, -100
-    lea rsi, [rk_pbpath]
+    lea rsi, [st_rkpb]
     mov edx, 0x80000
     xor r10d, r10d
     syscall
@@ -8758,7 +9388,7 @@ rank_try_weights:
     call md_arena_init
     test rax, rax
     jnz rktw_done
-    lea rsi, [rk_pbpath]
+    lea rsi, [st_rkpb]
     call md_load
     test rax, rax
     jnz rktw_done
@@ -15609,6 +16239,22 @@ RK_IDX_ARENA = 2097152
 tm_envpath db '/proc/self/environ', 0
 tm_envkey db 'PEABRAIN_TIMING=1', 0
 tm_envkeylen = $ - tm_envkey - 1
+; Canonical state directory (PEABRAIN_STATE_DIR, else ~/.local/share/peabrain).
+st_key_state db 'PEABRAIN_STATE_DIR=', 0
+st_key_statelen = $ - st_key_state - 1
+st_key_home db 'HOME=', 0
+st_key_homelen = $ - st_key_home - 1
+st_suffix db '/.local/share/peabrain', 0
+st_suffixlen = $ - st_suffix - 1
+st_e_prefix db 'peabrain: state: ', 0
+st_e_nohome db 'no state directory: set PEABRAIN_STATE_DIR or HOME', 0
+st_e_toolong db 'state path too long (max 240): ', 0
+st_e_notdir db 'not a usable directory: ', 0
+st_e_denied db 'inaccessible state path: ', 0
+st_e_mkfail db 'cannot create state directory: ', 0
+st_e_legacy db 'refusing: populated store exists outside empty state dir (migrate it or set PEABRAIN_STATE_DIR): ', 0
+st_e_nl db 10, 0
+st_e_perm db 'directory must be 0700 and owner-only: ', 0
 tm_l_pb db 'PB pid=', 0
 tm_l_op db ' op=', 0
 tm_l_idle db ' idle_ms=', 0
@@ -15755,6 +16401,16 @@ tm_opname rb 40
 tm_tmp rb 32
 tm_buf rb 256
 tm_ebuf rb 4100
+; Canonical state directory (resolved once at boot; see st_resolve).
+st_dir rb 1056
+st_dirlen rq 1
+st_ebuf rb 4100
+st_tmp rb 1104
+st_brk rb 2
+st_statb rb 144
+st_pbmd rb 272
+st_rkpb rb 272
+st_ebulen rq 1
 sk_cn rq 1
 
 ; PeaBrain on-board model data (consts, then ALL rb trailing: NOBITS).

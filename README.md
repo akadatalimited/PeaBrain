@@ -90,9 +90,13 @@ chmod +x tinythink
 ```
 
 `tinythink` is an MCP stdio server: newline-delimited JSON-RPC on
-stdin/stdout. The database (`tinythink.db`) is created **next to the
-executable** on first write, so each copy of the binary is a separate
-store — copy it somewhere else for a scratch database. Minimal client
+stdin/stdout. Persistent state (`tinythink.db` + `rank.pbmd`) lives in
+one state directory: `$PEABRAIN_STATE_DIR` when set, otherwise
+`~/.local/share/peabrain` — independent of where the binary runs from
+(historically the database sat next to the executable, which silently
+split state across launch directories). A populated legacy store with an
+empty configured directory refuses to boot rather than forking; a
+genuinely fresh installation is created on first write. Minimal client
 config (opencode):
 
 ```json

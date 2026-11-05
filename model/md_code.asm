@@ -1850,7 +1850,7 @@ md_resolve_path:
     xor eax, eax
     ret
 .def:
-    lea rsi, [md_defpath]
+    lea rsi, [st_pbmd]
     pop rbx
     xor eax, eax
     ret
