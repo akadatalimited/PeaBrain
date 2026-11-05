@@ -63,16 +63,18 @@ PeaBrain.)
 ## Build
 
 ```sh
-fasm tinythink.asm tinythink        # vector build (default)
-fasm -dUSE_SCALAR=1 tinythink.asm tinythink-scalar   # portable fallback
+fasm -m 65536 tinythink.asm tinythink        # vector build (default)
+fasm -m 65536 -dUSE_SCALAR=1 tinythink.asm tinythink-scalar   # portable fallback
 ```
 
 Both builds are behaviorally identical (differential suites assert this).
+`-m 65536` raises FASM's heap past the default 16 MB: trailing BSS now
+exceeds it (NOBITS on disk, unaffected output).
 If the linker complains the target is busy (`ETXTBSY`), build to a temp
 file and rename over it:
 
 ```sh
-fasm tinythink.asm /tmp/tt0 && mv /tmp/tt0 tinythink
+fasm -m 65536 tinythink.asm /tmp/tt0 && mv /tmp/tt0 tinythink
 ```
 
 ## Run

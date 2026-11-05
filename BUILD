@@ -12,8 +12,9 @@ exit 1 on older CPUs) because FASM emits no runtime check.
 
 Build
 -----
-  fasm tinythink.asm tinythink            # v3 baseline binary
-  fasm -dUSE_SCALAR=1 tinythink.asm tinythink-scalar   # scalar A/B reference
+  fasm -m 65536 tinythink.asm tinythink            # v3 baseline binary
+  fasm -m 65536 -dUSE_SCALAR=1 tinythink.asm tinythink-scalar   # scalar A/B reference
+(-m 65536: trailing BSS outgrew FASM's default 16 MB heap.)
 
 Run (MCP stdio: newline-delimited JSON-RPC on stdin/stdout)
 -----
