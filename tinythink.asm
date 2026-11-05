@@ -2665,8 +2665,10 @@ uq_space:
     pop r12
     pop rbx
     ret
-; use_bump_name(rdi=kind, rsi=ptr, rdx=len): access++, tick, enqueue on
-; 0->1 dirty. Preserves rbx,rcx,rdx,rsi,rdi,r12-r15.
+; use_bump_name(rdi=kind, rsi=ptr, rdx=len, rcx=tick or 0=auto):
+; access++, tick, enqueue on 0->1 dirty. A nonzero tick is stored as-is
+; (shared query tick from search emission); 0 advances the global clock.
+; Preserves rbx,rcx,rdx,rsi,rdi,r12-r15.
 use_bump_name:
     push rbx
     push rcx
@@ -2687,8 +2689,14 @@ use_bump_name:
     mov dword [rdx + 12], 1
     mov dword [rdx + 16], 0
     mov dword [rdx + 20], 0
+    cmp dword [rsp + 24], 0
+    jne ubn_tickgiven0
     inc qword [utick]
     mov eax, dword [utick]
+    jmp ubn_tickdone0
+ubn_tickgiven0:
+    mov eax, dword [rsp + 24]
+ubn_tickdone0:
     mov [rdx + 24], eax
     mov word [rdx + 28], 0
     mov byte [rdx + 30], 1
@@ -2699,8 +2707,14 @@ ubn_hit:
     jae ubn_ticked
     inc dword [rdx + 12]
 ubn_ticked:
+    cmp dword [rsp + 24], 0
+    jne ubn_tickgiven1
     inc qword [utick]
     mov eax, dword [utick]
+    jmp ubn_tickdone1
+ubn_tickgiven1:
+    mov eax, dword [rsp + 24]
+ubn_tickdone1:
     mov [rdx + 24], eax
     cmp byte [rdx + 30], 0
     jne ubn_done
@@ -2717,9 +2731,10 @@ ubn_done:
     pop rcx
     pop rbx
     ret
-; use_bump_id(rdi=kind, rsi=rowid): same for rowid identities. Flush
-; coverage via decimal-name queue entries (u64_dec of the rowid into uqnum;
-; uenqueue copies): the loader re-derives the rowid the same way.
+; use_bump_id(rdi=kind, rsi=rowid, rcx=tick or 0=auto): same for rowid
+; identities. Flush coverage via decimal-name queue entries (u64_dec of
+; the rowid into uqnum; uenqueue copies): the loader re-derives the rowid
+; the same way.
 ; Preserves rbx,rcx,rdx,rsi,rdi,r12-r15.
 use_bump_id:
     push rbx
@@ -2737,8 +2752,14 @@ use_bump_id:
     mov dword [rdx + 12], 1
     mov dword [rdx + 16], 0
     mov dword [rdx + 20], 0
+    cmp dword [rsp + 24], 0
+    jne ubi_tickgiven0
     inc qword [utick]
     mov eax, dword [utick]
+    jmp ubi_tickdone0
+ubi_tickgiven0:
+    mov eax, dword [rsp + 24]
+ubi_tickdone0:
     mov [rdx + 24], eax
     mov word [rdx + 28], 0
     mov byte [rdx + 30], 1
@@ -2749,8 +2770,14 @@ ubi_hit:
     jae ubi_ticked
     inc dword [rdx + 12]
 ubi_ticked:
+    cmp dword [rsp + 24], 0
+    jne ubi_tickgiven1
     inc qword [utick]
     mov eax, dword [utick]
+    jmp ubi_tickdone1
+ubi_tickgiven1:
+    mov eax, dword [rsp + 24]
+ubi_tickdone1:
     mov [rdx + 24], eax
     cmp byte [rdx + 30], 0
     jne ubi_done
@@ -10714,6 +10741,7 @@ op_fread:
     mov edi, 2                    ; fact use -> learn (stable name identity)
     lea rsi, [rsnbuf]
     mov rdx, [rsnlen]
+    xor ecx, ecx                  ; single read: advance the global clock
     call use_bump_name
     ; inner {"rowid":N,"name":"R","body":"B"}
     lea rax, [jsontmp]
@@ -12098,11 +12126,13 @@ se_loop:
     mov rdi, [smode]
     mov rsi, qword [gfo]         ; col0 = name (facts, entities)
     mov rdx, qword [gfl]
+    mov rcx, [ulqtick]           ; shared query tick
     call use_bump_name           ; surfaced -> learn
     jmp se_emitted
 se_obs:
     mov rdi, 1
     mov rsi, [growid]
+    mov rcx, [ulqtick]           ; shared query tick
     call use_bump_id
 se_emitted:
     call st_emit
@@ -13383,7 +13413,10 @@ op_search:
     ja dc_params
     mov [slim], rax
 os_nolim:
-    call db_open
+    inc qword [utick]
+    mov rax, [utick]
+    mov [ulqtick], rax          ; query tick: every memory surfaced by this
+    call db_open                ; search shares one recency timestamp
     test rax, rax
     jnz oc_db
     lea rax, [jsontmp]
@@ -15261,7 +15294,8 @@ r_toolsarr db '[{"name":"sequential_thinking"'
        db ',{"name":"search_nodes"'
        db ',"description":"Substring search over entities, observations, facts."'
        db ',"inputSchema":{"type":"object","properties":{"query":{"type":"string"}'
-       db ',"limit":{"type":"integer"}},"required":["query"]}}'
+       db ',"limit":{"type":"integer","description":"1..20, default 10"}}'
+       db ',"required":["query"]}}'
        db ',{"name":"open_nodes"'
        db ',"description":"Open entities with observations and relations."'
        db ',"inputSchema":{"type":"object","properties":{"names":{"type":"array"'
@@ -15415,6 +15449,7 @@ uloaded dq 0
 ulkey dq 0
 ulhits dq 0
 utick dq 0
+ulqtick dq 0
 uq_head dq 0
 uq_tail dq 0
 udropped dq 0

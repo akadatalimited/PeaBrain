@@ -326,9 +326,26 @@ Search-truncation fix (nested walk clobbers outer walk state)
   gcols/stab (manual parse into tmprow); growid overwritten only on match,
   which always skips. Cost: ~9KB memcpy per hit; multi-match search +1.0s
   for a COMPLETE scan (old: instant but truncated to 1 row) on live-shaped
-  data. Verified: placement matrix (old hides all 12, new finds all 12),
+  data.   Verified: placement matrix (old hides all 12, new finds all 12),
   7 malformed + sparse + fallback identical, 32,625-explain sweep on
   tomb-free data identical, full suites green both backends.
+
+Shared recency tick per search emission (ranking-semantics correction)
+-----------------------------------------------------------------------
+  Pathology: every surfaced hit took its own utick during emit, so each
+  search inverted the recency gradient for the next one — repeated
+  identical searches oscillated (19..00, 00..19, 19..00, ...), and a
+  promoted row could not hold its position.
+  Fix: op_search stamps one query tick (ulqtick = ++utick) served to every
+  use_bump_name/id in its emission (tick passed in rcx, 0 = advance the
+  clock as before); access accounting untouched; feedback/confidence paths
+  keep individual ticks. Single-row reads (op_fread) pass 0 = auto.
+  Verified: repeats 2+ identical, feedback promotes and holds, tombstoned
+  absent, rest intact, order survives restart; old binary fails exactly
+  the stability checks. First searches agree byte-for-byte with old code
+  (genuine write-recency/feedback signals rank identically; 6/6 runs).
+  One unreproduced outlier (old disagreed with itself once) on record.
+  search_nodes schema now documents limit 1..20 (runtime unchanged).
 
 
 Smoke test
