@@ -93,10 +93,12 @@ v3_fail:
     syscall
 v3_ok:
     cld
+    call tm_init
     lea rax, [outbuf]
     mov [outptr], rax
 
 read_loop:
+    call tm_first_read
     mov eax, 0                ; read(stdin, inbuf, 4096)
     xor edi, edi
     lea rsi, [inbuf]
@@ -146,7 +148,9 @@ end_of_line:
     lea rsi, [line]
     mov rdx, [linelen]
     mov qword [linelen], 0
+    call tm_req_start
     call handle_line
+    call tm_req_end
     jmp byte_loop
 line_overflow:
     mov byte [discard], 1
@@ -392,6 +396,7 @@ wa_bad:
     ret
 
 emit:
+    call tm_op_end
     mov edi, 1                ; looped write: big history output may partial-write
     lea rsi, [outbuf]
     mov rdx, [outlen]
@@ -4121,9 +4126,8 @@ jw_full:
     syscall
     cmp rax, 4096
     jne jw_err
-    mov eax, 74                   ; fsync journal before the data write
     mov rdi, [jfd]
-    syscall
+    call tm_fsync                ; fsync journal before the data write
     test rax, rax
     js jw_err
     lea rax, [jpages]
@@ -4236,18 +4240,16 @@ jrc_next:
     jne jrc_err
     jmp jrc_next
 jrc_commit:
-    mov eax, 74                 ; fsync restored pages
     mov rdi, [dbfd]
-    syscall
+    call tm_fsync                ; fsync restored pages
     mov rax, r15
     shl rax, 12
     mov rsi, rax                ; len = orig*4096
     mov eax, 77                 ; ftruncate back (drops grown tail)
     mov rdi, [dbfd]
     syscall
-    mov eax, 74
     mov rdi, [dbfd]
-    syscall
+    call tm_fsync
     mov eax, 3
     mov rdi, r14
     syscall
@@ -4517,10 +4519,9 @@ do_open:
     js do_closeerr
     cmp qword [dbwmode], 0
     je do_shlock
-    mov eax, 73                 ; flock LOCK_EX (writers)
     mov rdi, [dbfd]
     mov esi, 2
-    syscall
+    call tm_flock                ; flock LOCK_EX (writers)
     test rax, rax
     js do_closeerr
     call jrecover               ; rollback torn txn if journal present
@@ -4528,10 +4529,9 @@ do_open:
     jnz do_closeerr
     jmp do_fstat
 do_shlock:
-    mov eax, 73                 ; flock LOCK_SH (readers share)
     mov rdi, [dbfd]
     mov esi, 1
-    syscall
+    call tm_flock                ; flock LOCK_SH (readers share)
     test rax, rax
     js do_closeerr
 do_fstat:
@@ -4624,32 +4624,45 @@ do_create:
 do_ensure:
     cmp qword [cskip], 0        ; warm: roots/maxrowid/taskseq already live
     jne do_cached
+    call tm_phase_start
     call ensure_tables           ; new tables for old DBs; fills f_root_*
+    push rax
+    lea rdi, [tm_ensure]
+    call tm_phase_end
+    pop rax
     test rax, rax
     jnz do_closeerr
     mov rdi, 2
     call scan_max                ; conclusions max rowid
     test rax, rax
     jnz do_closeerr
+    call tm_phase_start
     call use_load               ; learned prefs, once per process (self-guarded)
+    push rax
+    lea rdi, [tm_useload]
+    call tm_phase_end
+    pop rax
 do_cached:
+    call tm_phase_start
     call rank_boot               ; rankex examples + rank.pbmd, self-guarded
+    push rax
+    lea rdi, [tm_rankboot]
+    call tm_phase_end
+    pop rax
     xor eax, eax
     ret
 ; do_escalate: SH holder needs mutation. UN then EX (never upgrade: two
 ; simultaneous upgraders would deadlock), recover, redo from fstat as EX.
 do_escalate:
     mov qword [dbwmode], 1
-    mov eax, 73
     mov rdi, [dbfd]
     mov esi, 8
-    syscall
+    call tm_flock
     test rax, rax
     js do_closeerr
-    mov eax, 73
     mov rdi, [dbfd]
     mov esi, 2
-    syscall
+    call tm_flock
     test rax, rax
     js do_closeerr
     call jrecover
@@ -4675,9 +4688,8 @@ db_close:
     je dc_noflush
     call use_flush              ; piggyback learned prefs into this txn; best effort
 dc_noflush:
-    mov eax, 74
     mov rdi, [dbfd]
-    syscall
+    call tm_fsync
     mov eax, 87                 ; unlink journal: commit point
     lea rdi, [jpath]
     syscall
@@ -4688,9 +4700,8 @@ dc_noflush:
     mov rdi, [jfd]
     xor esi, esi
     syscall
-    mov eax, 74
     mov rdi, [jfd]
-    syscall
+    call tm_fsync
 dc_unlinked:
     call dirsync
     mov eax, 3
@@ -4741,8 +4752,7 @@ dirsync:
     test rax, rax
     js ds_done
     mov rdi, rax
-    mov eax, 74
-    syscall
+    call tm_fsync
     mov eax, 3
     syscall                     ; rdi still dirfd
 ds_done:
@@ -6979,8 +6989,768 @@ etm_err:
     xor eax, eax
     ret
 
-; ---- continual-learning ranker (shadow mode) ----
-; Design: snapshot deterministic features at RETRIEVAL time (rank_snap_hook);
+; ---- timing instrumentation (opt-in: PEABRAIN_TIMING=1 in environ) ----
+; CLOCK_MONOTONIC via clock_gettime(228); diagnostics to stderr (fd 2)
+; only; stdout stays pure MCP JSON-RPC. Every routine preserves all GP
+; registers and rflags unless a return value is documented; when disabled
+; each hook costs one cmp+branch. Line prefix PB/READY/BOOT/FB for grep.
+macro TM_PUSH {
+    push rax
+    push rbx
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    push rbp
+    push r8
+    push r9
+    push r10
+    push r11
+    push r12
+    push r13
+    push r14
+    push r15
+    pushfq
+}
+macro TM_POP {
+    popfq
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop r11
+    pop r10
+    pop r9
+    pop r8
+    pop rbp
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
+    pop rax
+}
+
+; tm_clock: [tm_cs],[tm_cn] = now. Preserves everything.
+tm_clock:
+    TM_PUSH
+    mov eax, 228
+    mov edi, 1
+    lea rsi, [tm_cs]
+    syscall
+    TM_POP
+    ret
+
+; tm_diff2(rsi=startpair, rdx=endpair): rax = ms(end-start), saturating 0.
+; Preserves everything except rax,rcx,rdx.
+tm_diff2:
+    push rbx
+    mov rax, [rdx]
+    sub rax, [rsi]
+    mov rcx, [rdx + 8]
+    mov rbx, [rsi + 8]
+    cmp rcx, rbx
+    jae tmd_noborrow
+    dec rax
+    add rcx, 1000000000
+tmd_noborrow:
+    sub rcx, rbx
+    test rax, rax
+    js tmd_zero
+    imul rax, rax, 1000
+    xor edx, edx
+    mov rbx, 1000000
+    xchg rax, rcx
+    div rbx
+    add rax, rcx
+    pop rbx
+    ret
+tmd_zero:
+    xor eax, eax
+    pop rbx
+    ret
+
+; tm_wbegin/tm_wcstr/tm_wu64/tm_wflush: assemble one stderr line in tm_buf.
+tm_wbegin:
+    push rax
+    mov qword [tm_cur], 0
+    pop rax
+    ret
+tm_wcstr:
+    push rax
+    push rcx
+    push rsi
+    push rdi
+    lea rdi, [tm_buf]
+    add rdi, [tm_cur]
+twc_loop:
+    mov al, [rsi]
+    test al, al
+    jz twc_done
+    mov [rdi], al
+    inc rsi
+    inc rdi
+    inc qword [tm_cur]
+    jmp twc_loop
+twc_done:
+    pop rdi
+    pop rsi
+    pop rcx
+    pop rax
+    ret
+tm_wu64:
+    push rax
+    push rdx
+    push rdi
+    push rsi
+    push rcx
+    lea rdi, [tm_tmp]
+    call u64_dec
+    lea rsi, [tm_tmp]
+    mov rdi, [tm_cur]
+    lea rdi, [tm_buf]
+    add rdi, [tm_cur]
+    mov rcx, rdx
+    rep movsb
+    add [tm_cur], rdx
+    pop rcx
+    pop rsi
+    pop rdi
+    pop rdx
+    pop rax
+    ret
+tm_wflush:
+    TM_PUSH
+    mov eax, 1
+    mov edi, 2
+    lea rsi, [tm_buf]
+    mov rdx, [tm_cur]
+    test rdx, rdx
+    jz tmw_ret
+tmw_loop:
+    syscall
+    cmp rax, 0
+    jle tmw_ret
+    add rsi, rax
+    sub rdx, rax
+    test rdx, rdx
+    jnz tmw_loop
+tmw_ret:
+    TM_POP
+    ret
+
+; tm_init: env probe, pid, t0, rusage t0. Called once at process start.
+tm_init:
+    TM_PUSH
+    mov eax, 39
+    syscall
+    mov [tm_pid], rax
+    call tm_clock
+    mov rax, [tm_cs]
+    mov [tm_t0s], rax
+    mov rax, [tm_cn]
+    mov [tm_t0n], rax
+    mov eax, 98
+    xor edi, edi
+    lea rsi, [tm_ru0]
+    syscall
+    mov eax, 257
+    mov rdi, -100
+    lea rsi, [tm_envpath]
+    xor edx, edx
+    xor r10d, r10d
+    syscall
+    test rax, rax
+    js tmi_done
+    mov r12d, eax
+    mov eax, 0
+    mov rdi, r12
+    lea rsi, [tm_ebuf]
+    mov edx, 4100
+    syscall
+    push rax
+    mov eax, 3
+    syscall
+    pop rax
+    test rax, rax
+    jle tmi_done
+    lea rsi, [tm_ebuf]
+    mov rdx, rax
+    sub rdx, tm_envkeylen
+    jb tmi_done
+    inc rdx
+tmi_scan:
+    lea rdi, [tm_envkey]
+    mov rcx, tm_envkeylen
+    push rsi
+    push rdx
+    repe cmpsb
+    pop rdx
+    pop rsi
+    je tmi_found
+    inc rsi
+    dec rdx
+    jnz tmi_scan
+    jmp tmi_done
+tmi_found:
+    mov qword [tm_on], 1
+tmi_done:
+    TM_POP
+    ret
+
+; tm_first_read: READY line once at first read_loop entry; arms read clock.
+tm_first_read:
+    TM_PUSH
+    cmp qword [tm_on], 0
+    je tmfr_ret
+    cmp qword [tm_bootrep], 0
+    jne tmfr_ret
+    mov qword [tm_bootrep], 1
+    call tm_clock
+    mov rax, [tm_cs]
+    mov [tm_rs], rax
+    mov rax, [tm_cn]
+    mov [tm_rn], rax
+    call tm_wbegin
+    lea rsi, [tm_l_ready]
+    call tm_wcstr
+    mov rax, [tm_pid]
+    call tm_wu64
+    lea rsi, [tm_l_ms]
+    call tm_wcstr
+    lea rsi, [tm_t0s]
+    lea rdx, [tm_cs]
+    call tm_diff2
+    call tm_wu64
+    lea rsi, [tm_l_nl]
+    call tm_wcstr
+    call tm_wflush
+tmfr_ret:
+    TM_POP
+    ret
+
+; tm_resolve_name: tm_opname = method, or tool for tools/call (mirrors
+; do_call: params.name at depth, decoys ignored by the same find_val).
+tm_resolve_name:
+    TM_PUSH
+    mov rax, [lp]
+    add rax, [ll]
+    mov [le], rax
+    lea rsi, [tm_l_unknown]
+    lea rdi, [tm_opname]
+    mov rcx, 8
+tmrn_cpy:
+    mov al, [rsi]
+    mov [rdi], al
+    inc rsi
+    inc rdi
+    dec rcx
+    jnz tmrn_cpy
+    mov qword [tm_opnamelen], 7
+    mov rsi, [lp]
+    lea rdi, [k_method]
+    mov ecx, 8
+    call find_val
+    test rax, rax
+    jz tmrn_fvfail
+    mov rsi, rax
+    lea rdi, [tm_opname]
+    mov ecx, 31
+    call parse_str
+    test rax, rax
+    jz tmrn_pfail
+    test rdx, rdx
+    jz tmrn_sanitize
+    cmp rdx, 31
+    ja tmrn_sanitize
+    mov [tm_opnamelen], rdx
+    lea rsi, [tm_opname]
+    mov rdx, [tm_opnamelen]
+    lea rdi, [m_call]
+    call cmp_name
+    test rax, rax
+    jz tmrn_sanitize
+    mov rsi, [lp]
+    lea rdi, [k_params]
+    mov ecx, 8
+    call find_val
+    test rax, rax
+    jz tmrn_sanitize
+    cmp rax, [le]
+    jae tmrn_sanitize
+    cmp byte [rax], '{'
+    jne tmrn_sanitize
+    mov rsi, rax
+    lea rdi, [k_name]
+    mov ecx, 6
+    call find_val
+    test rax, rax
+    jz tmrn_sanitize
+    cmp rax, [le]
+    jae tmrn_sanitize
+    cmp byte [rax], '"'
+    jne tmrn_sanitize
+    mov rsi, rax
+    lea rdi, [tm_opname]
+    mov ecx, 31
+    call parse_str
+    test rax, rax
+    jz tmrn_sanitize
+    test rdx, rdx
+    jz tmrn_sanitize
+    cmp rdx, 31
+    ja tmrn_sanitize
+    mov [tm_opnamelen], rdx
+    jmp tmrn_sanitize
+tmrn_fvfail:
+    mov byte [tm_opname], 'F'
+    mov byte [tm_opname + 1], 'V'
+    mov byte [tm_opname + 2], 'F'
+    mov byte [tm_opname + 3], 'A'
+    mov byte [tm_opname + 4], 'I'
+    mov byte [tm_opname + 5], 'L'
+    mov qword [tm_opnamelen], 6
+    jmp tmrn_sanitize
+tmrn_pfail:
+    mov byte [tm_opname], 'P'
+    mov byte [tm_opname + 1], 'F'
+    mov byte [tm_opname + 2], 'A'
+    mov byte [tm_opname + 3], 'I'
+    mov byte [tm_opname + 4], 'L'
+    mov byte [tm_opname + 5], 'X'
+    mov qword [tm_opnamelen], 6
+tmrn_sanitize:
+    lea rsi, [tm_opname]
+    mov rcx, [tm_opnamelen]
+tmrn_sloop:
+    test rcx, rcx
+    jz tmrn_ret
+    mov al, [rsi]
+    cmp al, 'a'
+    jb tmrn_notlower
+    cmp al, 'z'
+    jbe tmrn_next
+tmrn_notlower:
+    cmp al, 'A'
+    jb tmrn_notupper
+    cmp al, 'Z'
+    jbe tmrn_next
+tmrn_notupper:
+    cmp al, '0'
+    jb tmrn_notspecial
+    cmp al, '9'
+    jbe tmrn_next
+tmrn_notspecial:
+    cmp al, '_'
+    je tmrn_next
+    cmp al, '/'
+    je tmrn_next
+tmrn_q:
+    mov byte [rsi], '?'
+tmrn_next:
+    inc rsi
+    dec rcx
+    jmp tmrn_sloop
+tmrn_ret:
+    TM_POP
+    ret
+
+; tm_req_start(rsi=line, rdx=len): idle calc, serve stash, name, arm.
+tm_req_start:
+    TM_PUSH
+    cmp qword [tm_on], 0
+    je tmrs_ret
+    mov [lp], rsi
+    mov [ll], rdx
+    call tm_clock
+    lea rsi, [tm_rs]
+    lea rdx, [tm_cs]
+    call tm_diff2
+    mov [tm_idle], rax
+    mov rax, [tm_cs]
+    mov [tm_ss], rax
+    mov rax, [tm_cn]
+    mov [tm_sn], rax
+    mov qword [tm_lock], 0
+    mov qword [tm_fsynct], 0
+    call tm_resolve_name
+    mov qword [tm_armed], 1
+tmrs_ret:
+    TM_POP
+    ret
+
+; tm_req_end: read clock restarts after the response is fully written.
+tm_req_end:
+    TM_PUSH
+    cmp qword [tm_on], 0
+    je tmre_ret
+    call tm_clock
+    mov rax, [tm_cs]
+    mov [tm_rs], rax
+    mov rax, [tm_cn]
+    mov [tm_rn], rax
+tmre_ret:
+    TM_POP
+    ret
+
+; tm_op_end: serve calc + PB line (+ BOOT line once). Consumes arm.
+tm_op_end:
+    TM_PUSH
+    cmp qword [tm_on], 0
+    je tmoe_ret
+    cmp qword [tm_armed], 0
+    je tmoe_ret
+    mov qword [tm_armed], 0
+    call tm_clock
+    call tm_wbegin
+    lea rsi, [tm_l_pb]
+    call tm_wcstr
+    mov rax, [tm_pid]
+    call tm_wu64
+    lea rsi, [tm_l_op]
+    call tm_wcstr
+    lea rsi, [tm_opname]
+    mov rbx, [tm_opnamelen]
+    mov rcx, rbx
+    lea rdi, [tm_buf]
+    add rdi, [tm_cur]
+    rep movsb
+    add [tm_cur], rbx
+    lea rsi, [tm_l_idle]
+    call tm_wcstr
+    mov rax, [tm_idle]
+    call tm_wu64
+    lea rsi, [tm_l_serve]
+    call tm_wcstr
+    lea rsi, [tm_ss]
+    lea rdx, [tm_cs]
+    call tm_diff2
+    call tm_wu64
+    lea rsi, [tm_l_lock]
+    call tm_wcstr
+    mov rax, [tm_lock]
+    call tm_wu64
+    lea rsi, [tm_l_fsync]
+    call tm_wcstr
+    mov rax, [tm_fsynct]
+    call tm_wu64
+    lea rsi, [tm_l_nl]
+    call tm_wcstr
+    call tm_wflush
+    cmp qword [tm_bootdone], 0
+    jne tmoe_ret
+    mov qword [tm_bootdone], 1
+    mov eax, 98
+    xor edi, edi
+    lea rsi, [tm_ru1]
+    syscall
+    call tm_wbegin
+    lea rsi, [tm_l_boot]
+    call tm_wcstr
+    mov rax, [tm_pid]
+    call tm_wu64
+    lea rsi, [tm_l_firstop]
+    call tm_wcstr
+    lea rsi, [tm_ss]
+    lea rdx, [tm_cs]
+    call tm_diff2
+    call tm_wu64
+    lea rsi, [tm_l_ensure]
+    call tm_wcstr
+    mov rax, [tm_ensure]
+    call tm_wu64
+    lea rsi, [tm_l_useload]
+    call tm_wcstr
+    mov rax, [tm_useload]
+    call tm_wu64
+    lea rsi, [tm_l_rankboot]
+    call tm_wcstr
+    mov rax, [tm_rankboot]
+    call tm_wu64
+    lea rsi, [tm_l_user]
+    call tm_wcstr
+    mov rax, qword [tm_ru1]
+    sub rax, qword [tm_ru0]
+    mov rcx, qword [tm_ru1 + 8]
+    sub rcx, qword [tm_ru0 + 8]
+    jns tmoe_uok
+    dec rax
+    add rcx, 1000000
+tmoe_uok:
+    test rax, rax
+    js tmoe_uzero
+    push rcx
+    imul rax, rax, 1000
+    mov rbx, rax
+    mov rax, rcx
+    xor edx, edx
+    mov ecx, 1000
+    div ecx
+    add rax, rbx
+    pop rcx
+    jmp tmoe_uw
+tmoe_uzero:
+    xor eax, eax
+tmoe_uw:
+    call tm_wu64
+    lea rsi, [tm_l_sys]
+    call tm_wcstr
+    mov rax, qword [tm_ru1 + 16]
+    sub rax, qword [tm_ru0 + 16]
+    mov rcx, qword [tm_ru1 + 24]
+    sub rcx, qword [tm_ru0 + 24]
+    jns tmoe_sok
+    dec rax
+    add rcx, 1000000
+tmoe_sok:
+    test rax, rax
+    js tmoe_szero
+    push rcx
+    imul rax, rax, 1000
+    mov rbx, rax
+    mov rax, rcx
+    xor edx, edx
+    mov ecx, 1000
+    div ecx
+    add rax, rbx
+    pop rcx
+    jmp tmoe_sw
+tmoe_szero:
+    xor eax, eax
+tmoe_sw:
+    call tm_wu64
+    lea rsi, [tm_l_nl]
+    call tm_wcstr
+    call tm_wflush
+tmoe_ret:
+    TM_POP
+    ret
+
+; tm_phase_start / tm_phase_end(rdi=slot): boot-phase brackets.
+tm_phase_start:
+    TM_PUSH
+    cmp qword [tm_on], 0
+    je tmps_ret
+    cmp qword [tm_bootdone], 0
+    jne tmps_ret
+    call tm_clock
+    mov rax, [tm_cs]
+    mov [tm_as], rax
+    mov rax, [tm_cn]
+    mov [tm_an], rax
+tmps_ret:
+    TM_POP
+    ret
+tm_phase_end:
+    TM_PUSH
+    cmp qword [tm_on], 0
+    je tmpe_ret
+    cmp qword [tm_bootdone], 0
+    jne tmpe_ret
+    push rdi
+    call tm_clock
+    lea rsi, [tm_as]
+    lea rdx, [tm_cs]
+    call tm_diff2
+    pop rdi
+    add [rdi], rax
+tmpe_ret:
+    TM_POP
+    ret
+
+; tm_fb_t0 / tm_fb_t1: feedback persist/train split + FB line.
+tm_fb_t0:
+    TM_PUSH
+    cmp qword [tm_on], 0
+    je tmf0_ret
+    mov qword [tm_fbs], 0
+    call tm_clock
+    mov rax, [tm_cs]
+    mov [tm_fb0s], rax
+    mov rax, [tm_cn]
+    mov [tm_fb0n], rax
+tmf0_ret:
+    TM_POP
+    ret
+tm_fb_t1:
+    TM_PUSH
+    cmp qword [tm_on], 0
+    je tmf1_ret
+    call tm_clock
+    lea rsi, [tm_ss]
+    lea rdx, [tm_fb0s]
+    call tm_diff2
+    mov [tm_fbp], rax
+    lea rsi, [tm_fb0s]
+    lea rdx, [tm_cs]
+    call tm_diff2
+    mov [tm_fbt], rax
+    call tm_wbegin
+    lea rsi, [tm_l_fb]
+    call tm_wcstr
+    mov rax, [tm_pid]
+    call tm_wu64
+    lea rsi, [tm_l_persist]
+    call tm_wcstr
+    mov rax, [tm_fbp]
+    call tm_wu64
+    lea rsi, [tm_l_train]
+    call tm_wcstr
+    mov rax, [tm_fbt]
+    call tm_wu64
+    lea rsi, [tm_l_save]
+    call tm_wcstr
+    mov rax, [tm_fbs]
+    call tm_wu64
+    lea rsi, [tm_l_nl]
+    call tm_wcstr
+    call tm_wflush
+tmf1_ret:
+    TM_POP
+    ret
+
+; tm_save_start / tm_save_end: checkpoint-save bracket (rank_train only).
+tm_save_start:
+    TM_PUSH
+    cmp qword [tm_on], 0
+    je tmss_ret
+    call tm_clock
+    mov rax, [tm_cs]
+    mov [tm_fs], rax
+    mov rax, [tm_cn]
+    mov [tm_fn], rax
+tmss_ret:
+    TM_POP
+    ret
+tm_save_end:
+    TM_PUSH
+    cmp qword [tm_on], 0
+    je tmse_ret
+    call tm_clock
+    lea rsi, [tm_fs]
+    lea rdx, [tm_cs]
+    call tm_diff2
+    mov [tm_fbs], rax
+tmse_ret:
+    TM_POP
+    ret
+
+; tm_flock(rdi=fd, esi=op) / tm_fsync(rdi=fd): timed lock/sync.
+; rax=result. All GP except rax preserved; flags clobbered (all sites
+; re-test rax, as before).
+tm_flock:
+    push rbx
+    push rbp
+    push r12
+    push r13
+    push r14
+    push r15
+    push r8
+    push r9
+    push r10
+    push r11
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    mov ebx, edi
+    mov r10d, esi
+    cmp qword [tm_on], 0
+    je tmfl_plain
+    call tm_clock
+    mov rax, [tm_cs]
+    mov [tm_bs], rax
+    mov rax, [tm_cn]
+    mov [tm_bn], rax
+    mov eax, 73
+    mov rdi, rbx
+    mov esi, r10d
+    syscall
+    mov [tm_ret], rax
+    call tm_clock
+    lea rsi, [tm_bs]
+    lea rdx, [tm_cs]
+    call tm_diff2
+    add [tm_lock], rax
+    mov rax, [tm_ret]
+    jmp tmfl_out
+tmfl_plain:
+    mov eax, 73
+    mov rdi, rbx
+    mov esi, r10d
+    syscall
+tmfl_out:
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop r11
+    pop r10
+    pop r9
+    pop r8
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbp
+    pop rbx
+    ret
+tm_fsync:
+    push rbx
+    push rbp
+    push r12
+    push r13
+    push r14
+    push r15
+    push r8
+    push r9
+    push r10
+    push r11
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    mov ebx, edi
+    cmp qword [tm_on], 0
+    je tmfs_plain
+    call tm_clock
+    mov rax, [tm_cs]
+    mov [tm_bs], rax
+    mov rax, [tm_cn]
+    mov [tm_bn], rax
+    mov eax, 74
+    mov rdi, rbx
+    syscall
+    mov [tm_ret], rax
+    call tm_clock
+    lea rsi, [tm_bs]
+    lea rdx, [tm_cs]
+    call tm_diff2
+    add [tm_fsynct], rax
+    mov rax, [tm_ret]
+    jmp tmfs_out
+tmfs_plain:
+    mov eax, 74
+    mov rdi, rbx
+    syscall
+tmfs_out:
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop r11
+    pop r10
+    pop r9
+    pop r8
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbp
+    pop rbx
+    ret
+
+; ---- continual-learning ranker (shadow mode) ----; Design: snapshot deterministic features at RETRIEVAL time (rank_snap_hook);
 ; explicit useful/misleading feedback joins the snapshot (rank_capture) into a
 ; labelled example persisted in the rankex table (rank_persist) and trained
 ; incrementally (rank_train). Training consumes ONLY snapshot-time features:
@@ -7630,8 +8400,12 @@ rktr_step:
 rktr_stepsdone:
     mov dword [md_hasloss], 1
     inc qword [rk_rev]
+    call tm_save_start
     lea rsi, [rk_pbpath]
     call md_save
+    push rax
+    call tm_save_end
+    pop rax
 rktr_done:
     pop r15
     pop r14
@@ -11905,9 +12679,11 @@ ofb_flush:
     call use_flush               ; durable on return: no silent loss
     test rax, rax
     jnz om_dbclose
+    call tm_fb_t0
     call rank_capture
     call db_close
     call rank_train
+    call tm_fb_t1
     lea rax, [jsontmp]
     mov [outptr], rax
     mov qword [outlen], 0
@@ -14508,6 +15284,31 @@ rk_f05 dd 0.5
 rk_f025 dd 0.25
 rk_seed dq 0x12345678ABCDEF01
 rk_pbpath db 'rank.pbmd', 0
+; Timing instrumentation consts (opt-in via PEABRAIN_TIMING=1 in environ).
+tm_envpath db '/proc/self/environ', 0
+tm_envkey db 'PEABRAIN_TIMING=1', 0
+tm_envkeylen = $ - tm_envkey - 1
+tm_l_pb db 'PB pid=', 0
+tm_l_op db ' op=', 0
+tm_l_idle db ' idle_ms=', 0
+tm_l_serve db ' serve_ms=', 0
+tm_l_lock db ' lock_ms=', 0
+tm_l_fsync db ' fsync_ms=', 0
+tm_l_ready db 'READY pid=', 0
+tm_l_ms db ' ms=', 0
+tm_l_boot db 'BOOT pid=', 0
+tm_l_firstop db ' firstop_ms=', 0
+tm_l_ensure db ' ensure_ms=', 0
+tm_l_useload db ' useload_ms=', 0
+tm_l_rankboot db ' rankboot_ms=', 0
+tm_l_user db ' user_ms=', 0
+tm_l_sys db ' sys_ms=', 0
+tm_l_fb db 'FB pid=', 0
+tm_l_persist db ' persist_ms=', 0
+tm_l_train db ' train_ms=', 0
+tm_l_save db ' save_ms=', 0
+tm_l_nl db 10, 0
+tm_l_unknown db 'unknown', 0
 sob rb 128
 ktab rb 768
 stab rb 64
@@ -14584,6 +15385,46 @@ rk_jx1 rb 4
 rk_jdet rq 1
 rk_jheld rb 1
 rk_num5 rb 24
+; Timing instrumentation BSS (all zero; active only when tm_on==1).
+tm_on rq 1
+tm_pid rq 1
+tm_t0s rq 1
+tm_t0n rq 1
+tm_rs rq 1
+tm_rn rq 1
+tm_ss rq 1
+tm_sn rq 1
+tm_as rq 1
+tm_an rq 1
+tm_bs rq 1
+tm_bn rq 1
+tm_cs rq 1
+tm_cn rq 1
+tm_fs rq 1
+tm_fn rq 1
+tm_fb0s rq 1
+tm_fb0n rq 1
+tm_fbp rq 1
+tm_fbt rq 1
+tm_fbs rq 1
+tm_ensure rq 1
+tm_useload rq 1
+tm_rankboot rq 1
+tm_lock rq 1
+tm_fsynct rq 1
+tm_ret rq 1
+tm_cur rq 1
+tm_armed rq 1
+tm_bootrep rq 1
+tm_bootdone rq 1
+tm_idle rq 1
+tm_opnamelen rq 1
+tm_ru0 rb 144
+tm_ru1 rb 144
+tm_opname rb 40
+tm_tmp rb 32
+tm_buf rb 256
+tm_ebuf rb 4100
 
 ; PeaBrain on-board model data (consts, then ALL rb trailing: NOBITS).
 include 'model/md_data.asm'

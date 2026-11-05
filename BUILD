@@ -267,6 +267,28 @@ Continual-learning ranker (shadow mode, deterministic order authoritative)
   Live DB untouched by development (scratch-only under /scratch/tmp);
   first boot with this binary creates the empty rankex table (one page).
 
+Timing instrumentation (opt-in: PEABRAIN_TIMING=1 in environ, branch only)
+--------------------------------------------------------------------------
+  CLOCK_MONOTONIC via clock_gettime; diagnostics to stderr (fd 2) with
+  PB/READY/BOOT/FB prefixes; stdout stays pure MCP JSON-RPC. Disabled =
+  one cmp+branch per hook (suites green, wall-identical). Enabled lines:
+  READY (spawn->first-read ms), PB pid/op/idle/serve/lock/fsync ms per
+  response (op name mirrored from dispatch, incl. error paths), BOOT
+  (firstop/ensure/useload/rankboot/user/sys ms via getrusage), FB
+  (feedback persist/train/save ms split). flock/fsync sites wrapped as
+  tm_flock/tm_fsync (per-op lock/fsync totals; unlock paths untouched).
+  Same PID across PB lines proves a persistent server; one READY+BOOT per
+  process, so N of them across N calls proves per-call spawning.
+  Measured (live-shaped 19,896-row copy): full 6-op learning sequence
+  14.5s wall, ~14s of it first-op use_load (user ~2s, sys ~12s); steady
+  ops: write ~9ms (fsync ~7), search ~6ms, feedback ~13-15ms
+  (persist 3-5/train 9-10/save 3-4), status ~0ms. strace: 14.7M pread64
+  per boot. Root cause: ~10K legacy 2-col usage rows each trigger
+  rname_of = full facts/entities scan via pg_read_nc (probe+pread, never
+  fills cache) at every boot; in-memory utab is rebuilt per process by
+  design, so warm boots cost the same. No correction implemented;
+  no live modifications; no ranking changes.
+
 Smoke test
 ----------
   printf '%s\n' \
