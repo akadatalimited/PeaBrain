@@ -160,6 +160,32 @@ persisted; min-score eviction past capacity is exact (239,911 live +
 misleading one after a restart; legacy databases migrate with exact
 preserved counts.
 
+## Tests
+
+Yes, the Python under `tests/` looks out of place in a 100% assembly
+project — it is developer tooling, not part of PeaBrain. The server
+itself has zero dependencies (not even libc); nothing here is needed
+to build it (`fasm tinythink.asm`) or to run it (the static `tinythink`
+binary plus a state directory).
+
+What the scripts are: black-box verification harnesses. They spawn a
+built binary, speak MCP JSON-RPC at it, and check the answers —
+regression suites per tool area (`tests/suites/`: memory, adversarial
+inputs, concurrency, model training, restarts, payload edge cases),
+differentials that require two binaries to agree byte-for-byte
+(`rix-*`, `strunc-*`, `t_tick*`, `v3diff*`), independent oracles that
+compute expected results straight from the database with stock
+`sqlite3` rather than trusting the engine (`tix-stock`, `tix-quux`,
+`strunc-matrix`), and measurement tools (latency, syscall counts, RSS).
+
+Running them needs two things: a binary to test (most take it as an
+argument or a `BIN` constant) and an explicit scratch state directory
+exported as `PEABRAIN_STATE_DIR`. The PeaBrain harnesses refuse to run
+without one — they never touch your live `~/.local/share/peabrain`
+store. Each writes only under `/scratch/tmp` (fixed work paths plus
+per-run state directories); nothing outside the scratch area is
+touched.
+
 ## Repository
 
 - `tinythink` — the built PeaBrain application, committed so anyone can
@@ -171,6 +197,8 @@ preserved counts.
   trailing NOBITS); `model/MODEL` records the arena/matmul/MLP/quant
   prototypes and the GPU feasibility verdict.
 - `BUILD` — build notes, tool/capacity/security documentation.
+- `tests/` — Python verification harnesses (see Tests above).
+  Developer-only; not needed to build or run the server.
 - Databases (`tinythink.db*`) and backups (`*.bak-*`) are untracked by
   design (see `.gitignore`) — your memory stays yours.
 
