@@ -1,3 +1,4 @@
 # Live memory and scratch files stay out of git.
 tinythink.db*
 *.bak-*
+__pycache__/
