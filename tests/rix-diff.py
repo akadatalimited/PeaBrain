@@ -8,8 +8,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import pb_harness
 
 BASE = pb_harness.require_state()
-OLD = sys.argv[1] if len(sys.argv) > 1 else "/scratch/fasm-webserver/tinythink/tinythink"
-NEW = sys.argv[2] if len(sys.argv) > 2 else "/scratch/tmp/tixbuild"
+OLD = sys.argv[1] if len(sys.argv) > 1 else "/scratch/tmp/tixbuild"
+NEW = sys.argv[2] if len(sys.argv) > 2 else "/scratch/tmp/PeaBrain"
 fails = []
 def check(name, cond, extra=""):
     print(("PASS " if cond else "FAIL ") + name, flush=True)
@@ -24,6 +24,9 @@ def fresh(tag, binary, seed=True):
     st = pb_harness.new_state(f"rix-diff-{tag}")
     if seed:
         pb_harness.seed_from_live(st)
+        import shutil as _sh2
+        _sh2.copy(st + "/peabrain.db", st + "/tinythink.db")
+        _sh2.copy(st + "/peabrain-rank.pbmd", st + "/rank.pbmd")
     env = dict(os.environ, PEABRAIN_STATE_DIR=st)
     return subprocess.Popen([work + "/tt"], stdin=subprocess.PIPE,
                             stdout=subprocess.PIPE, cwd=work, text=True,
@@ -51,7 +54,7 @@ tn = hn.split('"usage_tracked":')[1].split(",")[0]
 check("health usage_tracked identical", to == tn, (to, tn))
 
 # 2. explain sweep over every fact name + entities, byte-identical
-con = sqlite3.connect(f"file:{sto}/tinythink.db?mode=ro", uri=True)
+con = sqlite3.connect(f"file:{sto}/peabrain.db?mode=ro", uri=True)
 names = [r[0] for r in con.execute("select name from facts")] + \
         [r[0] for r in con.execute("select name from entities")]
 con.close()

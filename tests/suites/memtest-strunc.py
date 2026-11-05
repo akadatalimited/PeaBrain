@@ -4,7 +4,7 @@ _pb_sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__)
 import pb_harness
 _PB_ST = pb_harness.require_state()
 
-SRC = "/scratch/tmp/rixbuild"
+SRC = sys.argv[1] if len(sys.argv) > 1 else "/scratch/tmp/rixbuild"
 WORK = "/scratch/tmp/rk-ttmem"
 os.system(f"rm -rf {WORK}")
 os.makedirs(WORK)

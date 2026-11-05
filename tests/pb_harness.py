@@ -68,15 +68,19 @@ def new_state(sub):
 
 
 def seed_from_live(dest):
-    """Read-only copy of canonical db+weights into dest (created 0700)."""
+    """Read-only copy of canonical db+weights into dest (created 0700),
+    renamed to current filenames (peabrain.db / peabrain-rank.pbmd)."""
     os.makedirs(dest, mode=0o700, exist_ok=True)
     os.chmod(dest, 0o700)
-    for f in ("tinythink.db", "rank.pbmd"):
-        src = os.path.join(LIVE_STATE, f)
-        if not os.path.isfile(src):
-            _refuse(f"live canonical file missing: {src}")
-        shutil.copy2(src, os.path.join(dest, f))
-        os.chmod(os.path.join(dest, f), 0o600)
+    for dst_name, candidates in (("peabrain.db", ("peabrain.db", "tinythink.db")),
+                              ("peabrain-rank.pbmd", ("peabrain-rank.pbmd", "rank.pbmd"))):
+        src = next((os.path.join(LIVE_STATE, c) for c in candidates
+                    if os.path.isfile(os.path.join(LIVE_STATE, c))), None)
+        if src is None:
+            _refuse(f"live canonical file missing (tried {candidates})")
+        assert src is not None
+        shutil.copy2(src, os.path.join(dest, dst_name))
+        os.chmod(os.path.join(dest, dst_name), 0o600)
     return dest
 
 

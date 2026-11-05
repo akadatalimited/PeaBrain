@@ -9,8 +9,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import pb_harness
 
 BASE = pb_harness.require_state()
-OLD = "/scratch/fasm-webserver/tinythink/tinythink"
-NEW = "/scratch/tmp/tixbuild"
+OLD = "/scratch/tmp/tixbuild"
+NEW = "/scratch/tmp/PeaBrain"
 
 S = pb_harness.new_state("tixquux")
 env = dict(os.environ, PEABRAIN_STATE_DIR=S)
@@ -32,17 +32,19 @@ for i in range(60):
     call("delete_fact", {"name": f"quux-tomb-{i}"})
 p.stdin.close(); p.wait(timeout=120)
 
-con = sqlite3.connect(f"file:{S}/tinythink.db?mode=ro", uri=True)
+con = sqlite3.connect(f"file:{S}/peabrain.db?mode=ro", uri=True)
 visible = {r[0] for r in con.execute(
     "SELECT name FROM facts WHERE name LIKE '%quux%' AND name NOT IN "
     "(SELECT name FROM tombstones)")}
 con.close()
 
 T = pb_harness.new_state("tixquux-twin")
-for f in ("tinythink.db", "rank.pbmd"):
+for f, alt in (("peabrain.db", "tinythink.db"),
+               ("peabrain-rank.pbmd", "rank.pbmd")):
     src_f = os.path.join(S, f)
     if os.path.exists(src_f):
         shutil.copy2(src_f, os.path.join(T, f))
+        shutil.copy2(src_f, os.path.join(T, alt))
 
 def query(binary, state):
     e2 = dict(os.environ, PEABRAIN_STATE_DIR=state)

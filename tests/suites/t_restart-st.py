@@ -4,7 +4,7 @@ _pb_sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__)
 import pb_harness
 _PB_ST = pb_harness.require_state()
 
-BIN = "/scratch/tmp/stbuild"
+BIN = sys.argv[1] if len(sys.argv) > 1 else "/scratch/tmp/stbuild"
 WORK = "/scratch/tmp/rank/t_restart"
 shutil.rmtree(WORK, ignore_errors=True)
 os.makedirs(WORK)
@@ -65,11 +65,11 @@ try: p.wait(timeout=5)
 except Exception: p.kill()
 
 # examples persisted independently of PBMD?
-con = sqlite3.connect(SA + "/tinythink.db")
+con = sqlite3.connect(SA + "/peabrain.db")
 rows = con.execute("select name,kind,seq,x0,x1,target,det,rev from rankex").fetchall()
 con.close()
 check("rankex rows durable", len(rows) == 6, rows)
-check("rank.pbmd exists", os.path.exists(SA + "/rank.pbmd"), os.listdir(SA))
+check("peabrain-rank.pbmd exists", os.path.exists(SA + "/peabrain-rank.pbmd"), os.listdir(SA))
 
 # ---- process B: restart, same dir ----
 # NOTE: no search before the first explain — search bumps access counters by
@@ -122,7 +122,7 @@ stC = text(r)
 check("C no rank training under user model", '"revision":0' in stC, stC[-300:])
 check("C model_owned rejects counted", '"rejected":[0,0,0,0,0,2]' in stC, stC[-300:])
 check("C still hidden 8", '"hidden":8' in stC, stC[-300:])
-check("C no rank.pbmd", not os.path.exists(SC + "/rank.pbmd"), os.listdir(SC))
+check("C no peabrain-rank.pbmd", not os.path.exists(SC + "/peabrain-rank.pbmd"), os.listdir(SC))
 m = re.search(r'"step":(\d+)', stC)
 check("C user step untouched", m and m.group(1) == "0", stC[-300:])
 p.stdin.close()
@@ -132,12 +132,12 @@ except Exception: p.kill()
 # ---- process D: fresh dir — public-tool round-trip of A's weights ----
 W3 = "/scratch/tmp/rank/t_file"
 shutil.rmtree(W3, ignore_errors=True); os.makedirs(W3); shutil.copy(BIN, W3 + "/tt")
-shutil.copy(SA + "/rank.pbmd", W3 + "/rank.pbmd")
+shutil.copy(SA + "/peabrain-rank.pbmd", W3 + "/peabrain-rank.pbmd")
 p = subprocess.Popen([W3 + "/tt"], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                      cwd=W3, text=True, bufsize=1)
 _i[0] = 200
-r = call(p, "model_load", {"path":"rank.pbmd"})
-check("D load rank.pbmd", f'"step":{stepA}' in text(r), text(r)[:160])
+r = call(p, "model_load", {"path":"peabrain-rank.pbmd"})
+check("D load peabrain-rank.pbmd", f'"step":{stepA}' in text(r), text(r)[:160])
 r = call(p, "model_predict", {"xs":[0.5],"ys":[0.5]})
 check("D predict equals A (bit-exact file round-trip)", text(r) == p1,
       f"{text(r)[:120]} vs {p1[:120]}")

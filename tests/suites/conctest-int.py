@@ -4,7 +4,7 @@ _pb_sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__)
 import pb_harness
 _PB_ST = pb_harness.require_state()
 
-BIN_SRC = "/scratch/tmp/int-master"
+BIN_SRC = sys.argv[1] if len(sys.argv) > 1 else "/scratch/tmp/int-master"
 WORK = "/scratch/tmp/rk-ttdb-test"
 os.system(f"rm -rf {WORK}")
 os.makedirs(WORK)
@@ -34,7 +34,7 @@ def close(p):
         pass
     p.wait(timeout=10)
 
-DB = os.path.join(WORK, "tinythink.db")
+DB = os.path.join(WORK, "peabrain.db")
 
 # 1 lazy create: no db file before first conclusion op
 check("no-db-before-use", not os.path.exists(DB))

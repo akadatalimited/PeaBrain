@@ -7,7 +7,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import pb_harness
 
 BASE = pb_harness.require_state()
-OLD = sys.argv[1] if len(sys.argv) > 1 else "/scratch/fasm-webserver/tinythink/tinythink"
+OLD = sys.argv[1] if len(sys.argv) > 1 else "/scratch/tmp/tixbuild"
 NEW = sys.argv[2] if len(sys.argv) > 2 else "/scratch/tmp/tixbuild"
 
 def fresh(tag, binpath):

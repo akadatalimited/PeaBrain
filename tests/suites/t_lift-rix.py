@@ -5,7 +5,7 @@ import pb_harness
 _PB_ST = pb_harness.require_state()
 
 NEW = "/scratch/tmp/rixbuild"
-MASTER = "/scratch/fasm-webserver/tinythink/tinythink"
+MASTER = "/scratch/tmp/tixbuild"
 WORKN = "/scratch/tmp/rank/t_lift_new"
 WORKM = "/scratch/tmp/rank/t_lift_master"
 fails = []

@@ -6,7 +6,7 @@ import sys as _pb_sys
 _pb_sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import pb_harness
 _PB_BASE = pb_harness.require_state()
-BIN = "/scratch/fasm-webserver/tinythink/tinythink"
+BIN = "/scratch/tmp/PeaBrain"
 QUERIES = [("a", 20), ("the", 20), ("probe", 20), ("quux-live-1", 5)]
 
 def fresh_copy(tag):

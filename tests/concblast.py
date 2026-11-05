@@ -2,7 +2,7 @@ import json, subprocess, sys, os, shutil
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import pb_harness
 _PB_BASE = pb_harness.require_state()
-BIN = sys.argv[1] if len(sys.argv) > 1 else "/scratch/tmp/tixbuild"
+BIN = sys.argv[1] if len(sys.argv) > 1 else "/scratch/tmp/PeaBrain"
 WORK = "/scratch/tmp/concblast-work"
 ST = pb_harness.new_state("concblast")  # one state shared by all 4 procs: real lock contention
 ENV = dict(os.environ, PEABRAIN_STATE_DIR=ST)

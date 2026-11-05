@@ -5,7 +5,7 @@ import json, subprocess, os, shutil, sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import pb_harness
 BASE = pb_harness.require_state()
-BIN = sys.argv[1] if len(sys.argv) > 1 else "/scratch/tmp/tixbuild"
+BIN = sys.argv[1] if len(sys.argv) > 1 else "/scratch/tmp/PeaBrain"
 WORK = "/scratch/tmp/tick-verify"
 fails = []
 def check(name, cond, extra=""):

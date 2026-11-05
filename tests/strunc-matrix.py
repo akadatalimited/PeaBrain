@@ -6,7 +6,7 @@ import json, subprocess, os, shutil, sys, sqlite3
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import pb_harness
 BASE = pb_harness.require_state()
-BIN = sys.argv[1] if len(sys.argv) > 1 else "/scratch/tmp/tixbuild"
+BIN = sys.argv[1] if len(sys.argv) > 1 else "/scratch/tmp/PeaBrain"
 WORK = "/scratch/tmp/strunc-matrix"
 fails = []
 def check(name, cond, extra=""):
@@ -60,7 +60,7 @@ try: p.wait(timeout=10)
 except Exception: p.kill()
 
 # ---- independent oracle from raw tables ----
-con = sqlite3.connect(f"file:{ST}/tinythink.db?mode=ro", uri=True)
+con = sqlite3.connect(f"file:{ST}/peabrain.db?mode=ro", uri=True)
 tombs = {r[0] for r in con.execute("select name from tombstones")}
 exp_facts = [(r[0], r[1]) for r in con.execute("select name,body from facts")
              if "zap" in (r[0] or "") or "zap" in (r[1] or "")]
@@ -103,8 +103,8 @@ import shutil as _sh
 try: p.stdin.close(); p.wait(timeout=10)
 except Exception: p.kill()
 ST_TWIN = pb_harness.new_state("strunc-matrix-twin")
-shutil.copy(ST + "/tinythink.db", ST_TWIN + "/tinythink.db")
-shutil.copy(ST + "/rank.pbmd", ST_TWIN + "/rank.pbmd") if os.path.exists(ST + "/rank.pbmd") else None
+shutil.copy(ST + "/peabrain.db", ST_TWIN + "/peabrain.db")
+shutil.copy(ST + "/peabrain-rank.pbmd", ST_TWIN + "/peabrain-rank.pbmd") if os.path.exists(ST + "/peabrain-rank.pbmd") else None
 ENV_TWIN = dict(os.environ, PEABRAIN_STATE_DIR=ST_TWIN)
 pb_harness.safe_rmtree(WORK + "-twin"); os.makedirs(WORK + "-twin")
 shutil.copy(WORK + "/tt", WORK + "-twin/tt")

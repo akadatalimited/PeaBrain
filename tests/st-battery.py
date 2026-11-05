@@ -54,7 +54,7 @@ outs, rc, err = run(W1, W1 + "/tt", {"PEABRAIN_STATE_DIR": S1},
                     [("write_fact", {"name": "s1", "text": "x"}),
                      ("health", {})])
 check("T1 boots+writes", rc == 0, (rc, err[-200:]))
-st = os.stat(S1 + "/tinythink.db")
+st = os.stat(S1 + "/peabrain.db")
 check("T1 db 0600", oct(st.st_mode & 0o777) == "0o600", oct(st.st_mode))
 check("T1 dir 0700", oct(os.stat(S1).st_mode & 0o777) == "0o700",
       oct(os.stat(S1).st_mode))
@@ -65,16 +65,16 @@ check("T1 health fresh", json.loads(text(outs[1]))["tables"] == 7,
 # (no stdout response by design: the server exits during boot).
 W2 = "/scratch/tmp/st-t2"
 fresh(W2)
-shutil.copy("/scratch/fasm-webserver/tinythink/tinythink.db.bak-20261105-rank",
-            W2 + "/tinythink.db")
+shutil.copy("/scratch/fasm-webserver/tinythink/peabrain.db.bak-20261105-rank",
+            W2 + "/peabrain.db")
 S2 = W2 + "/empty-state"
 outs, rc, err = run(W2, W2 + "/tt", {"PEABRAIN_STATE_DIR": S2},
                     [("health", {})])
 check("T2 refuses (nonzero exit)", rc not in (0, "killed"), rc)
 check("T2 no response (refused at boot)", outs == [None], outs)
-check("T2 names both paths", "empty-state" in err and "tinythink.db" in err,
+check("T2 names both paths", "empty-state" in err and "peabrain.db" in err,
       err[-300:])
-check("T2 creates nothing", not os.path.exists(S2 + "/tinythink.db") and
+check("T2 creates nothing", not os.path.exists(S2 + "/peabrain.db") and
       not os.path.exists(S2), (os.listdir(W2)))
 
 # T3: default path via fake HOME
@@ -90,7 +90,7 @@ p.stdin.write('{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"w
 p.stdin.flush(); json.loads(p.stdout.readline())
 try: p.stdin.close(); p.wait(timeout=15)
 except Exception: p.kill()
-check("T3 default path used", os.path.exists(FH + "/.local/share/peabrain/tinythink.db"))
+check("T3 default path used", os.path.exists(FH + "/.local/share/peabrain/peabrain.db"))
 check("T3 default dir 0700",
       oct(os.stat(FH + "/.local/share/peabrain").st_mode & 0o777) == "0o700")
 
@@ -125,19 +125,19 @@ outs, _, _ = run(WA, WA + "/tt", {"PEABRAIN_STATE_DIR": WA + "/sa"},
 outs, _, _ = run(WB, WB + "/tt", {"PEABRAIN_STATE_DIR": WB + "/sb"},
                  [("write_fact", {"name": "onlyB", "text": "b"})])
 import sqlite3
-na = sqlite3.connect(f"file:{WA}/sa/tinythink.db?mode=ro", uri=True).execute(
+na = sqlite3.connect(f"file:{WA}/sa/peabrain.db?mode=ro", uri=True).execute(
     "select name from facts").fetchall()
-nb = sqlite3.connect(f"file:{WB}/sb/tinythink.db?mode=ro", uri=True).execute(
+nb = sqlite3.connect(f"file:{WB}/sb/peabrain.db?mode=ro", uri=True).execute(
     "select name from facts").fetchall()
 check("T6 isolation", na == [("onlyA",)] and nb == [("onlyB",)], (na, nb))
 
-# T7: missing rank.pbmd + present examples -> trains from scratch
+# T7: missing peabrain-rank.pbmd + present examples -> trains from scratch
 W7 = "/scratch/tmp/st-t7"
 fresh(W7)
 S7 = W7 + "/s7"
 os.makedirs(S7, mode=0o700)
-shutil.copy("/scratch/fasm-webserver/tinythink/tinythink.db",
-            S7 + "/tinythink.db")
+shutil.copy("/scratch/fasm-webserver/tinythink/peabrain.db",
+            S7 + "/peabrain.db")
 outs, rc, err = run(W7, W7 + "/tt", {"PEABRAIN_STATE_DIR": S7},
                     [("search_nodes", {"query": "the", "limit": 5}),
                      ("model_status", {})])
@@ -164,15 +164,15 @@ W10 = "/scratch/tmp/st-t10"
 fresh(W10)
 S10 = W10 + "/s10"
 os.makedirs(S10, mode=0o700)
-shutil.copy("/scratch/fasm-webserver/tinythink/tinythink.db",
-            S10 + "/tinythink.db")
-shutil.copy("/scratch/fasm-webserver/tinythink/tinythink.db.bak-20261105-rank",
-            W10 + "/tinythink.db")
+shutil.copy("/scratch/fasm-webserver/tinythink/peabrain.db",
+            S10 + "/peabrain.db")
+shutil.copy("/scratch/fasm-webserver/tinythink/peabrain.db.bak-20261105-rank",
+            W10 + "/peabrain.db")
 import hashlib
-before = hashlib.md5(open(W10 + "/tinythink.db", "rb").read()).hexdigest()
+before = hashlib.md5(open(W10 + "/peabrain.db", "rb").read()).hexdigest()
 outs, rc, err = run(W10, W10 + "/tt", {"PEABRAIN_STATE_DIR": S10},
                     [("health", {})])
-after = hashlib.md5(open(W10 + "/tinythink.db", "rb").read()).hexdigest()
+after = hashlib.md5(open(W10 + "/peabrain.db", "rb").read()).hexdigest()
 check("T10 CWD copy untouched", before == after)
 served = json.loads(text(outs[0]))["usage_tracked"]
 check("T10 canonical served (live count, not backup)", served != 19203, served)

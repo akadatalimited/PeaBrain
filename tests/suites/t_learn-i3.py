@@ -4,7 +4,7 @@ _pb_sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__)
 import pb_harness
 _PB_ST = pb_harness.require_state()
 
-BIN = "/scratch/tmp/rixbuild"
+BIN = sys.argv[1] if len(sys.argv) > 1 else "/scratch/tmp/rixbuild"
 WORK = "/scratch/tmp/rank/t_learn"
 shutil.rmtree(WORK, ignore_errors=True)
 os.makedirs(WORK)
@@ -67,7 +67,7 @@ order_after = [n for n in ["rkalpha","rkbeta","rkgamma"] if n in res2]
 check("deterministic order unchanged", order_after == order_before,
       f"{order_before} vs {order_after}")
 
-check("rank.pbmd written", os.path.exists(WORK + "/rank.pbmd"),
+check("peabrain-rank.pbmd written", os.path.exists(WORK + "/peabrain-rank.pbmd"),
       os.listdir(WORK))
 
 # obs feedback path (dec_parse gate fix): observe, then feedback kind=observation.
@@ -77,7 +77,7 @@ r = call("add_observations", {"name":"rkalpha","observations":["obs one"]}, i); 
 d = text(r)
 check("add obs", "error" not in json.dumps(r), d[:200])
 import sqlite3
-con = sqlite3.connect(WORK + "/tinythink.db")
+con = sqlite3.connect(WORK + "/peabrain.db")
 oid = con.execute("select rowid from observations limit 1").fetchone()[0]
 con.close()
 check("obs rowid found", oid is not None and oid > 0, oid)

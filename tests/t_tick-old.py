@@ -5,7 +5,7 @@ import json, subprocess, os, shutil, sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import pb_harness
 BASE = pb_harness.require_state()
-BIN = "/scratch/fasm-webserver/tinythink/tinythink"
+BIN = "/scratch/tmp/tixbuild"
 WORK = "/scratch/tmp/tick-verify"
 fails = []
 def check(name, cond, extra=""):

@@ -4,7 +4,7 @@ _pb_sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import pb_harness
 _PB_ST = pb_harness.require_state()
 
-OLD = "/scratch/fasm-webserver/tinythink/tinythink"
+OLD = "/scratch/tmp/tixbuild"
 NEW = "/scratch/tmp/rixbuild"
 fails = []
 def check(name, cond, extra=""):
@@ -38,7 +38,7 @@ def case(tag, setup_fn, extra_names=()):
     call(p, "create_entities", {"name": "edgeent", "observations": ["edge obs"]})
     call(p, "delete_fact", {"name": "edgefact"})
     stop(p)
-    con = sqlite3.connect(wd + "/tinythink.db")
+    con = sqlite3.connect(wd + "/peabrain.db")
     frow = con.execute("select rowid from facts where name='edgefact'").fetchone()[0]
     orow = con.execute("select rowid from observations limit 1").fetchone()[0]
     K = lambda kind, rid: str((kind << 56) | rid)

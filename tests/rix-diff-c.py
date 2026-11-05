@@ -8,7 +8,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import pb_harness
 
 BASE = pb_harness.require_state()
-OLD = "/scratch/fasm-webserver/tinythink/tinythink"   # shipped Master (no index)
+OLD = "/scratch/tmp/tixbuild"   # shipped Master (no index)
 NEW = "/scratch/tmp/comb-b1"                          # feat/rindex
 fails = []
 def check(name, cond, extra=""):
@@ -51,7 +51,7 @@ tn = hn.split('"usage_tracked":')[1].split(",")[0]
 check("health usage_tracked identical", to == tn, (to, tn))
 
 # 2. explain sweep over every fact name + entities, byte-identical
-con = sqlite3.connect(f"file:{sto}/tinythink.db?mode=ro", uri=True)
+con = sqlite3.connect(f"file:{sto}/peabrain.db?mode=ro", uri=True)
 names = [r[0] for r in con.execute("select name from facts")] + \
         [r[0] for r in con.execute("select name from entities")]
 con.close()

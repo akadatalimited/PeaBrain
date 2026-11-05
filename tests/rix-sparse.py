@@ -5,8 +5,8 @@ import json, subprocess, os, shutil, sys, sqlite3, struct
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import pb_harness
 BASE = pb_harness.require_state()
-OLD = sys.argv[1] if len(sys.argv) > 1 else "/scratch/fasm-webserver/tinythink/tinythink"
-NEW = sys.argv[2] if len(sys.argv) > 2 else "/scratch/tmp/tixbuild"
+OLD = sys.argv[1] if len(sys.argv) > 1 else "/scratch/tmp/tixbuild"
+NEW = sys.argv[2] if len(sys.argv) > 2 else "/scratch/tmp/PeaBrain"
 fails = []
 def check(name, cond, extra=""):
     print(("PASS " if cond else "FAIL ") + name, flush=True)
@@ -141,7 +141,7 @@ def build_case(tag, bigrowid):
     nm = f"sparse-target-with-long-name-{tag}"
     call(p, "write_fact", {"name": nm, "text": "sparse body here"})
     stop(p)
-    db = st + "/tinythink.db"
+    db = st + "/peabrain.db"
     con = sqlite3.connect(db)
     frow = con.execute("select rowid from facts where name=?", (nm,)).fetchone()[0]
     con.execute("insert into facts(rowid,name,body) values(?,?,?)",
@@ -166,6 +166,7 @@ def run_case(tag, bigrowid, expect_ok):
         work = f"/scratch/tmp/rix-{tag}-{label}"
         pb_harness.safe_rmtree(work); os.makedirs(work)
         st = pb_harness.new_state(f"rix-{tag}-{label}")
+        shutil.copy(db, st + "/peabrain.db")
         shutil.copy(db, st + "/tinythink.db")
         p = spawn(work, binary, st, timing=(label == "new"))
         h = text(call(p, "health", {}))

@@ -4,7 +4,7 @@ _pb_sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__)
 import pb_harness
 _PB_ST = pb_harness.require_state()
 
-BIN_SRC = "/scratch/tmp/rankbuild"
+BIN_SRC = sys.argv[1] if len(sys.argv) > 1 else "/scratch/tmp/rankbuild"
 WORK = "/scratch/tmp/rk-ttadvwork"
 shutil.rmtree(WORK, ignore_errors=True)
 os.makedirs(WORK)

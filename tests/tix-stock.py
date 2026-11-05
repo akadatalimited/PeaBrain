@@ -7,11 +7,13 @@ import sys as _pb_sys
 _pb_sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import pb_harness
 _PB_BASE = pb_harness.require_state()
-LIVE = os.path.expanduser("~/.local/share/peabrain")  # ground-truth READS only
-NEW = "/scratch/tmp/tixbuild"
+_LD = os.path.expanduser("~/.local/share/peabrain")  # ground-truth READS only
+LIVE = _LD
+LIVE_DB = next((_LD + "/" + c for c in ("peabrain.db", "tinythink.db") if os.path.isfile(_LD + "/" + c)))
+NEW = "/scratch/tmp/PeaBrain"
 
 random.seed(20261105)
-con = sqlite3.connect(f"file:{LIVE}/tinythink.db?mode=ro", uri=True)
+con = sqlite3.connect(f"file:{LIVE_DB}?mode=ro", uri=True)
 tombs = [r[0] for r in con.execute("SELECT name FROM tombstones")]
 lives = [r[0] for r in con.execute("SELECT DISTINCT name FROM facts "
                                   "WHERE name NOT IN (SELECT name FROM tombstones) LIMIT 4000")]

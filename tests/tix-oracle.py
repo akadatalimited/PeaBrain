@@ -6,8 +6,8 @@ import sys as _pb_sys
 _pb_sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import pb_harness
 _PB_BASE = pb_harness.require_state()
-OLD = "/scratch/fasm-webserver/tinythink/tinythink"
-NEW = "/scratch/tmp/tixbuild"
+OLD = "/scratch/tmp/tixbuild"
+NEW = "/scratch/tmp/PeaBrain"
 
 CASES = [
     ("search_nodes", {"query": "probe", "limit": 20}),
@@ -29,7 +29,11 @@ CASES = [
 
 def fresh(tag):
     d = pb_harness.new_state(f"tixoracle-{tag}")
-    return pb_harness.seed_from_live(d)
+    pb_harness.seed_from_live(d)
+    import shutil as _sh2
+    _sh2.copy(d + "/peabrain.db", d + "/tinythink.db")
+    _sh2.copy(d + "/peabrain-rank.pbmd", d + "/rank.pbmd")
+    return d
 
 def run(binpath, work, reqs):
     env = dict(os.environ, PEABRAIN_STATE_DIR=work)

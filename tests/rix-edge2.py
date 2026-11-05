@@ -5,8 +5,8 @@ import json, subprocess, os, shutil, sys, sqlite3, struct
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import pb_harness
 BASE = pb_harness.require_state()
-OLD = sys.argv[1] if len(sys.argv) > 1 else "/scratch/fasm-webserver/tinythink/tinythink"
-NEW = sys.argv[2] if len(sys.argv) > 2 else "/scratch/tmp/tixbuild"
+OLD = sys.argv[1] if len(sys.argv) > 1 else "/scratch/tmp/tixbuild"
+NEW = sys.argv[2] if len(sys.argv) > 2 else "/scratch/tmp/PeaBrain"
 fails = []
 def check(name, cond, extra=""):
     print(("PASS " if cond else "FAIL ") + name, flush=True)
@@ -150,7 +150,7 @@ def build_src():
         call(p, "feedback", {"name": n, "signal": "useful"})
     call(p, "delete_fact", {"name": names[0]})
     stop(p)
-    db = st + "/tinythink.db"
+    db = st + "/peabrain.db"
     con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
     assert con.execute("pragma integrity_check").fetchone()[0] == "ok"
     frow = {r[0]: r[1] for r in
@@ -188,6 +188,7 @@ con.close()
 def run_all(binary, work, tag):
     pb_harness.safe_rmtree(work); os.makedirs(work)
     st = pb_harness.new_state(f"rix-edge2-{tag}")
+    shutil.copy(db, st + "/peabrain.db")
     shutil.copy(db, st + "/tinythink.db")
     shutil.copy(binary, work + "/tt")
     p = spawn(work, binary, st)

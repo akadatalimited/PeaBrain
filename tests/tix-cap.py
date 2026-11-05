@@ -7,8 +7,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import pb_harness
 
 BASE = pb_harness.require_state()
-OLD = sys.argv[1] if len(sys.argv) > 1 else "/scratch/fasm-webserver/tinythink/tinythink"
-NEW = sys.argv[2] if len(sys.argv) > 2 else "/scratch/tmp/tixbuild"
+OLD = sys.argv[1] if len(sys.argv) > 1 else "/scratch/tmp/tixbuild"
+NEW = sys.argv[2] if len(sys.argv) > 2 else "/scratch/tmp/PeaBrain"
 NPAIRS = int(sys.argv[3]) if len(sys.argv) > 3 else 14000
 fails = []
 def check(name, cond, extra=""):
@@ -33,15 +33,17 @@ for n in range(NPAIRS):
                                        "arguments": {"name": nm}}}))
 p = subprocess.run([NEW], input="\n".join(reqs) + "\n", capture_output=True, text=True,
                    timeout=3000, cwd="/tmp", env=env)
-ntombs = sqlite3.connect(f"file:{grow}/tinythink.db?mode=ro", uri=True).execute(
+ntombs = sqlite3.connect(f"file:{grow}/peabrain.db?mode=ro", uri=True).execute(
     "select count(*) from tombstones").fetchone()[0]
 print(f"tombs after growth: {ntombs}", flush=True)
 check("over index cap", ntombs > 24576, ntombs)
 
 def snap(src, tag):
     d = pb_harness.new_state(f"tixcap-{tag}")
-    for f in ("tinythink.db", "rank.pbmd"):
+    for f, alt in (("peabrain.db", "tinythink.db"),
+                   ("peabrain-rank.pbmd", "rank.pbmd")):
         shutil.copy2(os.path.join(src, f), os.path.join(d, f))
+        shutil.copy2(os.path.join(src, f), os.path.join(d, alt))
     return d
 
 outs = {}

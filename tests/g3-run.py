@@ -5,12 +5,19 @@ Usage: PEABRAIN_STATE_DIR must NOT be preset; the runner mints per-suite
 dirs itself. Exits nonzero on any suite failure or live drift."""
 import os, subprocess, sys, hashlib
 
-LIVE_DB = os.path.expanduser("~/.local/share/peabrain/tinythink.db")
-LIVE_RK = os.path.expanduser("~/.local/share/peabrain/rank.pbmd")
-TIX = "/scratch/tmp/tixbuild"
-TIXSC = "/scratch/tmp/tixbuild-scalar"
-OLD = "/scratch/fasm-webserver/tinythink/tinythink"
-SUITES = "/scratch/tmp/rank/suites"
+LIVE_DIR = os.path.expanduser("~/.local/share/peabrain")
+def _live_file(*names):
+    for n in names:
+        p = os.path.join(LIVE_DIR, n)
+        if os.path.isfile(p):
+            return p
+    raise SystemExit("g3-run: no live canonical file (tried %s)" % (names,))
+LIVE_DB = _live_file("peabrain.db", "tinythink.db")
+LIVE_RK = _live_file("peabrain-rank.pbmd", "rank.pbmd")
+TIX = "/scratch/tmp/PeaBrain"
+TIXSC = "/scratch/tmp/PeaBrain-scalar"
+OLD = "/scratch/tmp/tixbuild"
+SUITES = "/scratch/fasm-webserver/tinythink/tests/suites"
 
 def fp():
     h1 = hashlib.md5(open(LIVE_DB, 'rb').read()).hexdigest()
@@ -23,10 +30,10 @@ def sh(cmd, base):
                           cwd="/tmp", env=env)
 
 PLAN = [
-    ("strunc-matrix", ["python3", "/scratch/tmp/strunc-matrix.py", TIX]),
-    ("tix-quux", ["python3", "/scratch/tmp/tix-quux.py"]),
-    ("tix-stock", ["python3", "/scratch/tmp/tix-stock.py"]),
-    ("tix-oracle", ["python3", "/scratch/tmp/tix-oracle.py"]),
+    ("strunc-matrix", ["python3", "/scratch/fasm-webserver/tinythink/tests/strunc-matrix.py", TIX]),
+    ("tix-quux", ["python3", "/scratch/fasm-webserver/tinythink/tests/tix-quux.py"]),
+    ("tix-stock", ["python3", "/scratch/fasm-webserver/tinythink/tests/tix-stock.py"]),
+    ("tix-oracle", ["python3", "/scratch/fasm-webserver/tinythink/tests/tix-oracle.py"]),
     ("v3diff", ["python3", f"{SUITES}/v3diff-c.py", OLD, TIX]),
     ("advtest", ["python3", f"{SUITES}/advtest-st.py", TIX]),
     ("memtest", ["python3", f"{SUITES}/memtest-st.py", TIX]),
@@ -34,13 +41,13 @@ PLAN = [
     ("thinktest", ["python3", f"{SUITES}/thinktest-st.py", TIX]),
     ("mdtest2-avx2", ["python3", f"{SUITES}/mdtest2-st.py", TIX, "avx2fma"]),
     ("mdtest2-scalar", ["python3", f"{SUITES}/mdtest2-st.py", TIXSC, "reference"]),
-    ("st-battery", ["python3", "/scratch/tmp/st-battery-tix.py"]),
-    ("t-tick", ["python3", "/scratch/tmp/t_tick.py", TIX]),
-    ("rix-diff", ["python3", "/scratch/tmp/rix-diff.py", OLD, TIX]),
-    ("rix-edge", ["python3", "/scratch/tmp/rix-edge.py", OLD, TIX]),
-    ("rix-edge2", ["python3", "/scratch/tmp/rix-edge2.py", OLD, TIX]),
-    ("rix-sparse", ["python3", "/scratch/tmp/rix-sparse.py", OLD, TIX]),
-    ("tix-cap", ["python3", "/scratch/tmp/tix-cap.py", OLD, TIX]),
+    ("st-battery", ["python3", "/scratch/fasm-webserver/tinythink/tests/st-battery-tix.py"]),
+    ("t-tick", ["python3", "/scratch/fasm-webserver/tinythink/tests/t_tick.py", TIX]),
+    ("rix-diff", ["python3", "/scratch/fasm-webserver/tinythink/tests/rix-diff.py", OLD, TIX]),
+    ("rix-edge", ["python3", "/scratch/fasm-webserver/tinythink/tests/rix-edge.py", OLD, TIX]),
+    ("rix-edge2", ["python3", "/scratch/fasm-webserver/tinythink/tests/rix-edge2.py", OLD, TIX]),
+    ("rix-sparse", ["python3", "/scratch/fasm-webserver/tinythink/tests/rix-sparse.py", OLD, TIX]),
+    ("tix-cap", ["python3", "/scratch/fasm-webserver/tinythink/tests/tix-cap.py", OLD, TIX]),
 ]
 
 def main():
