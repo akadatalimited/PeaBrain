@@ -4931,7 +4931,8 @@ do_cached:
     lea rdi, [tm_rankboot]
     call tm_phase_end
     pop rax
-    xor eax, eax
+    mov qword [tm_dbready], 1    ; first database initialisation completed;
+    xor eax, eax                 ; BOOT reports only after this point
     ret
 ; do_escalate: SH holder needs mutation. UN then EX (never upgrade: two
 ; simultaneous upgraders would deadlock), recover, redo from fstat as EX.
@@ -7721,6 +7722,8 @@ tm_op_end:
     call tm_wflush
     cmp qword [tm_bootdone], 0
     jne tmoe_ret
+    cmp qword [tm_dbready], 0    ; no database use yet: protocol-only ops
+    je tmoe_ret                  ; must not freeze zero-valued metrics
     mov qword [tm_bootdone], 1
     mov eax, 98
     xor edi, edi
@@ -7817,7 +7820,7 @@ tm_phase_start:
     TM_PUSH
     cmp qword [tm_on], 0
     je tmps_ret
-    cmp qword [tm_bootdone], 0
+    cmp qword [tm_dbready], 0
     jne tmps_ret
     call tm_clock
     mov rax, [tm_cs]
@@ -7831,7 +7834,7 @@ tm_phase_end:
     TM_PUSH
     cmp qword [tm_on], 0
     je tmpe_ret
-    cmp qword [tm_bootdone], 0
+    cmp qword [tm_dbready], 0
     jne tmpe_ret
     push rdi
     call tm_clock
@@ -15743,6 +15746,7 @@ tm_cur rq 1
 tm_armed rq 1
 tm_bootrep rq 1
 tm_bootdone rq 1
+tm_dbready rq 1
 tm_idle rq 1
 tm_opnamelen rq 1
 tm_ru0 rb 144

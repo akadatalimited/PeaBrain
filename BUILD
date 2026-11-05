@@ -275,11 +275,15 @@ Timing instrumentation (opt-in: PEABRAIN_TIMING=1 in environ, branch only)
   one cmp+branch per hook (suites green, wall-identical). Enabled lines:
   READY (spawn->first-read ms), PB pid/op/idle/serve/lock/fsync ms per
   response (op name mirrored from dispatch, incl. error paths), BOOT
-  (firstop/ensure/useload/rankboot/user/sys ms via getrusage), FB
-  (feedback persist/train/save ms split). flock/fsync sites wrapped as
+  (firstop/ensure/useload/rankboot/rindex_ok/user/sys ms via getrusage),
+  FB (feedback persist/train/save ms split). flock/fsync sites wrapped as
   tm_flock/tm_fsync (per-op lock/fsync totals; unlock paths untouched).
   Same PID across PB lines proves a persistent server; one READY+BOOT per
-  process, so N of them across N calls proves per-call spawning.
+  process, so N of them across N calls proves per-call spawning. BOOT is
+  deferred until the first database initialisation completes (tm_dbready):
+  protocol-only sessions (initialize/list/ping) emit READY+PB only, never
+  misleading zero-valued database metrics; rindex_ok therefore reports the
+  true index state.
   Measured (live-shaped 19,896-row copy): full 6-op learning sequence
   14.5s wall, ~14s of it first-op use_load (user ~2s, sys ~12s); steady
   ops: write ~9ms (fsync ~7), search ~6ms, feedback ~13-15ms
