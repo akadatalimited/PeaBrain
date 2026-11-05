@@ -3208,6 +3208,231 @@ usm_done:
     pop rbx
     ret
 
+; ---- reverse-identity index for legacy usage rows ----
+; One pass over facts+entities at boot maps rowid -> (name, len) so legacy
+; 2-col usage rows resolve in O(1) instead of one full-table rname_of scan
+; each. Extraction mirrors rname_of exactly (parse-ok, col0, len 1..128,
+; no gcols check). All-or-nothing: any capacity miss or walk failure
+; leaves [rk_idx_ok]=0 and the original resolver path runs unchanged.
+; No DB writes. Preserves all GP regs (caller holds live loop state).
+
+; rk_idx_build: pre-scan usage for legacy rows; capacity precheck via
+; tail_max; walk both tables. Best effort, always returns 0.
+rk_idx_build:
+    push rbx
+    push rbp
+    push r12
+    push r13
+    push r14
+    push r15
+    push r8
+    push r9
+    push r10
+    push r11
+    mov rax, [maxrowid]
+    push rax
+    mov rdi, [f_root_use]
+    call walk_leaves
+    test rax, rax
+    jnz rkix_noindex
+    xor r14d, r14d
+rkix_pre:
+    cmp r14, [childn]
+    jae rkix_nolegacy
+    lea rsi, [childtab]
+    mov rax, r14
+    shl rax, 3
+    add rsi, rax
+    mov rdi, [rsi]
+    lea rsi, [pagebuf]
+    call pg_read_nc
+    test rax, rax
+    jnz rkix_prenext
+    cmp byte [pagebuf], 0x0D
+    jne rkix_prenext
+    lea rsi, [pagebuf + 3]
+    call be16_ld
+    mov rbx, rax
+    xor r13d, r13d
+rkix_pcell:
+    cmp r13, rbx
+    jae rkix_prenext
+    lea rsi, [pagebuf + 8]
+    mov rax, r13
+    shl rax, 1
+    add rsi, rax
+    call be16_ld
+    lea rsi, [pagebuf]
+    add rsi, rax
+    call parse_row
+    test rax, rax
+    jnz rkix_pcinc
+    cmp qword [gcols], 2
+    je rkix_foundleg
+rkix_pcinc:
+    inc r13
+    jmp rkix_pcell
+rkix_prenext:
+    inc r14
+    jmp rkix_pre
+rkix_nolegacy:
+    jmp rkix_noindex
+rkix_foundleg:
+    mov rdi, [f_root_facts]
+    call tail_max
+    test rax, rax
+    jnz rkix_noindex
+    cmp qword [maxrowid], RK_IDX_MAX
+    jae rkix_noindex
+    mov rdi, [f_root_ent]
+    call tail_max
+    test rax, rax
+    jnz rkix_noindex
+    cmp qword [maxrowid], RK_IDX_MAX
+    jae rkix_noindex
+    mov qword [rk_ixused], 0
+    mov rdi, [f_root_facts]
+    lea rax, [rk_ixf]
+    mov [rk_ixbase], rax
+    call rkix_walk
+    test rax, rax
+    jnz rkix_noindex
+    mov rdi, [f_root_ent]
+    lea rax, [rk_ixe]
+    mov [rk_ixbase], rax
+    call rkix_walk
+    test rax, rax
+    jnz rkix_noindex
+    mov qword [rk_idx_ok], 1
+    jmp rkix_done
+rkix_noindex:
+    mov qword [rk_idx_ok], 0
+rkix_done:
+    pop rax
+    mov [maxrowid], rax
+    pop r11
+    pop r10
+    pop r9
+    pop r8
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbp
+    pop rbx
+    ret
+
+; rkix_walk(rdi=root): fill [rk_ixbase] from one table. rax 0 ok / 1 full.
+; Preserves rbx,rbp,r12-r15,r8-r11 (caller loop state); clobbers others.
+rkix_walk:
+    push rbx
+    push rbp
+    push r12
+    push r13
+    push r14
+    push r15
+    push r8
+    push r9
+    push r10
+    push r11
+    call walk_leaves
+    test rax, rax
+    jnz rkixw_fail
+    xor r14d, r14d
+rkixw_page:
+    cmp r14, [childn]
+    jae rkixw_ok
+    lea rsi, [childtab]
+    mov rax, r14
+    shl rax, 3
+    add rsi, rax
+    mov rdi, [rsi]
+    lea rsi, [pagebuf]
+    call pg_read_nc
+    test rax, rax
+    jnz rkixw_nextpg
+    cmp byte [pagebuf], 0x0D
+    jne rkixw_nextpg
+    lea rsi, [pagebuf + 3]
+    call be16_ld
+    mov rbx, rax
+    xor r13d, r13d
+rkixw_cell:
+    cmp r13, rbx
+    jae rkixw_nextpg
+    lea rsi, [pagebuf + 8]
+    mov rax, r13
+    shl rax, 1
+    add rsi, rax
+    call be16_ld
+    lea rsi, [pagebuf]
+    add rsi, rax
+    call parse_row
+    test rax, rax
+    jnz rkixw_incc
+    mov rax, [growid]
+    test rax, rax
+    jz rkixw_incc
+    cmp rax, RK_IDX_MAX
+    jae rkixw_incc
+    mov rsi, qword [gfo]
+    mov rcx, qword [gfl]
+    cmp rcx, 1
+    jb rkixw_incc
+    cmp rcx, 128
+    ja rkixw_incc
+    mov eax, dword [rk_ixused]
+    mov edx, eax
+    add edx, ecx
+    jc rkixw_fail
+    cmp edx, RK_IDX_ARENA
+    ja rkixw_fail
+    push rcx
+    push rsi
+    lea rdi, [rk_ixarena]
+    add rdi, rax
+    rep movsb
+    pop rsi
+    pop rcx
+    mov dword [rk_ixused], edx
+    mov r10, [growid]
+    shl r10, 3
+    add r10, [rk_ixbase]
+    mov [r10], eax
+    mov [r10 + 4], ecx
+rkixw_incc:
+    inc r13
+    jmp rkixw_cell
+rkixw_nextpg:
+    inc r14
+    jmp rkixw_page
+rkixw_ok:
+    xor eax, eax
+    pop r11
+    pop r10
+    pop r9
+    pop r8
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbp
+    pop rbx
+    ret
+rkixw_fail:
+    mov eax, 1
+    pop r11
+    pop r10
+    pop r9
+    pop r8
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbp
+    pop rbx
+    ret
+
 ; use_load: one-time load of usage rows into utab (insert-or-max). Db must be
 ; open+locked with tables ensured. Best effort, always returns 0.
 use_load:
@@ -3217,6 +3442,7 @@ use_load:
     push r12
     push r13
     push r14
+    call rk_idx_build
     mov rdi, [f_root_use]
     call walk_leaves
     test rax, rax
@@ -3401,6 +3627,35 @@ ull_h:
     cmp qword [ulkind], 1
     je ull_obs
     push rbx
+    cmp qword [rk_idx_ok], 1
+    jne rk_leg_old
+    cmp qword [ulkind], 0
+    je rk_leg_ent
+    lea rdi, [rk_ixf]
+    jmp rk_leg_lu
+rk_leg_ent:
+    lea rdi, [rk_ixe]
+rk_leg_lu:
+    cmp rax, RK_IDX_MAX
+    jae rk_leg_miss
+    shl rax, 3
+    add rax, rdi
+    mov ecx, [rax + 4]
+    cmp ecx, 1
+    jb rk_leg_miss
+    cmp ecx, 128
+    ja rk_leg_miss
+    mov edx, [rax]
+    lea rsi, [rk_ixarena]
+    add rsi, rdx
+    lea rdi, [rnbuf]
+    mov [rnlen], rcx
+    rep movsb
+    jmp ull_named
+rk_leg_miss:
+    pop rbx
+    jmp ul_incc
+rk_leg_old:
     mov rsi, rax                ; rowid for rname_of
     mov rdx, [childn]
     cmp rdx, 65536
@@ -7466,6 +7721,10 @@ tm_op_end:
     lea rsi, [tm_l_rankboot]
     call tm_wcstr
     mov rax, [tm_rankboot]
+    call tm_wu64
+    lea rsi, [tm_l_rindexok]
+    call tm_wcstr
+    mov rax, [rk_idx_ok]
     call tm_wu64
     lea rsi, [tm_l_user]
     call tm_wcstr
@@ -15284,6 +15543,9 @@ rk_f05 dd 0.5
 rk_f025 dd 0.25
 rk_seed dq 0x12345678ABCDEF01
 rk_pbpath db 'rank.pbmd', 0
+; Reverse-identity index caps (rowid < RK_IDX_MAX in each table; names arena).
+RK_IDX_MAX = 65536
+RK_IDX_ARENA = 2097152
 ; Timing instrumentation consts (opt-in via PEABRAIN_TIMING=1 in environ).
 tm_envpath db '/proc/self/environ', 0
 tm_envkey db 'PEABRAIN_TIMING=1', 0
@@ -15301,6 +15563,7 @@ tm_l_firstop db ' firstop_ms=', 0
 tm_l_ensure db ' ensure_ms=', 0
 tm_l_useload db ' useload_ms=', 0
 tm_l_rankboot db ' rankboot_ms=', 0
+tm_l_rindexok db ' rindex_ok=', 0
 tm_l_user db ' user_ms=', 0
 tm_l_sys db ' sys_ms=', 0
 tm_l_fb db 'FB pid=', 0
@@ -15385,6 +15648,13 @@ rk_jx1 rb 4
 rk_jdet rq 1
 rk_jheld rb 1
 rk_num5 rb 24
+; Reverse-identity index (boot, read-only): rowid -> (arena off, len).
+rk_ixf rb 524288
+rk_ixe rb 524288
+rk_ixarena rb 2097152
+rk_ixused rq 1
+rk_idx_ok rq 1
+rk_ixbase rq 1
 ; Timing instrumentation BSS (all zero; active only when tm_on==1).
 tm_on rq 1
 tm_pid rq 1

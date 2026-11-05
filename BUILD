@@ -286,8 +286,27 @@ Timing instrumentation (opt-in: PEABRAIN_TIMING=1 in environ, branch only)
   per boot. Root cause: ~10K legacy 2-col usage rows each trigger
   rname_of = full facts/entities scan via pg_read_nc (probe+pread, never
   fills cache) at every boot; in-memory utab is rebuilt per process by
-  design, so warm boots cost the same. No correction implemented;
-  no live modifications; no ranking changes.
+  design, so warm boots cost the same.
+
+Reverse-identity index for legacy usage rows (boot, read-only)
+----------------------------------------------------------------
+  One pass over facts+entities at boot maps rowid -> (arena off, len);
+  the legacy branch does O(1) lookup converging on the shared ull_named
+  merge (identical hashing/collisions/scores). Extraction mirrors rname_of
+  exactly (parse-ok, col0, len 1..128, no gcols check). All-or-nothing
+  with explicit caps (rowid < 65536 via tail_max precheck; 2MB name
+  arena): any miss aborts to the original resolver, so valid records are
+  never silently skipped. Zero DB writes, format untouched. Layout is
+  cache-dense: sequential build, 8B entries, ~256KB hot set (L2-resident);
+  training batches (<=1KB + H=4 weights) stay L1-resident.
+  Measured on live-shaped copy: useload 13,799ms -> 15ms, preads
+  15,792,337 -> 3,566 (4,428x), user 1,955ms -> 2ms, sys 11,805ms -> 13ms,
+  RSS 8.15MB -> 9.48MB (+1.33MB), file +4.6KB (rest NOBITS).
+  Verified: 32,625 explain_rank byte-identical, tracked counts and search
+  corpora identical, 7 malformed + sparse-60000 (rindex 1) + fallback-70000
+  (rindex 0, legacy path) identical, full db/model/learning/concurrency
+  suites green on both backends. BOOT line gains additive rindex_ok.
+  Requires fasm -m 65536 (BSS outgrew the default 16MB assembler limit).
 
 Smoke test
 ----------
