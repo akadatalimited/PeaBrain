@@ -1,4 +1,4 @@
-tinythink - thinking + memory MCP server in pure x86-64 assembly
+peabrain - thinking + memory MCP server in pure x86-64 assembly
 ===============================================================
 
 Sequential-thinking mimic plus a conclusion tool and a small memory
@@ -12,21 +12,21 @@ exit 1 on older CPUs) because FASM emits no runtime check.
 
 Build
 -----
-  fasm -m 65536 tinythink.asm tinythink            # v3 baseline binary
-  fasm -m 65536 -dUSE_SCALAR=1 tinythink.asm tinythink-scalar   # scalar A/B reference
+  fasm -m 65536 peabrain.asm PeaBrain              # v3 baseline binary
+  fasm -m 65536 -dUSE_SCALAR=1 peabrain.asm PeaBrain-scalar     # scalar A/B reference
 (-m 65536: trailing BSS outgrew FASM's default 16 MB heap.)
 
 Run (MCP stdio: newline-delimited JSON-RPC on stdin/stdout)
 -----
-  ./tinythink
+  ./PeaBrain
 
 Use
 ---
 Register as a local MCP server, e.g. opencode.json:
 
-  { "mcp": { "tinythink": {
+  { "mcp": { "peabrain": {
       "type": "local",
-      "command": ["/path/to/tinythink"],
+      "command": ["/path/to/PeaBrain"],
       "enabled": true } } }
 
 Serves both protocol eras: 2026-07-28 clients (server/discover, no
@@ -46,7 +46,7 @@ sequential_thinking: record thoughts, revise, branch, track progress.
 thought_history {limit? 1..64, default 10}: last N thoughts, oldest first.
 thought_reset {confirm:true}: clear the connection history.
 
-Memory tools (tinythink.db, created on first use beside the executable)
+Memory tools (peabrain.db, created on first use in the state directory)
 -----------------------------------------------------------------------
 conclusion {reason, thought?, conclusion?, valid?}: conclusions table
   (reason TEXT, thought TEXT, conclusion TEXT, valid INTEGER).
@@ -252,11 +252,11 @@ Continual-learning ranker (shadow mode, deterministic order authoritative)
   then store_full rejects), independent of PBMD. Bounded incremental train
   piggybacks feedback: newest-first window skipping held-out, batch <= 128,
   H=4 leaky fixed, lr 0.05, 5 steps, momentum path reused; weights
-  auto-saved to rank.pbmd (best effort) and auto-loaded at boot/on demand.
+  auto-saved to peabrain-rank.pbmd (best effort) and auto-loaded at boot/on demand.
   Ownership safeguard: any successful model_init/model_load sets rank_owned;
   rank automation (init/load/train/save/infer) then goes dormant with
   model_owned rejects — a user model is never overwritten. Rank weights
-  live only in rank.pbmd, never peabrain.pbmd. Held-out is identity-grouped
+  live only in peabrain-rank.pbmd, never peabrain.pbmd. Held-out is identity-grouped
   (((key>>4)+(h2>>4)+kind)%10==0; obs via ukey_rowid; same memory always
   one side; held never trained). model_status gains additive
   rank{owner,examples,heldout,revision,rejected[6],lift} where lift =
@@ -272,11 +272,11 @@ Canonical state directory (PEABRAIN_STATE_DIR, else ~/.local/share/peabrain)
 ------------------------------------------------------------------------------
   Replaces historical executable-relative database resolution (readlink
   /proc/self/exe with CWD fallback), which silently split state across
-  launch directories: the DB followed the exe/CWD while rank.pbmd followed
-  the CWD, producing divergent weight lineages (repo step 10 vs live
-  step 120) and forked empty stores.
+  launch directories: the DB followed the exe/CWD while the weights
+  followed the CWD (then tinythink.db / rank.pbmd), producing divergent
+  weight lineages (repo step 10 vs live step 120) and forked empty stores.
   Contract: explicit PEABRAIN_STATE_DIR wins, else ~/.local/share/peabrain;
-  tinythink.db + rank.pbmd resolve from the same dir; dirs 0700, files
+  peabrain.db + peabrain-rank.pbmd resolve from the same dir; dirs 0700, files
   0600 (db open already enforces 0600+owner; creations use 0600+fchmod).
   Explicit user-model paths (model_save/load {path}) stay CWD-relative.
   Fresh-install guard: populated legacy store (exe-dir or CWD, any size>0)
@@ -409,8 +409,8 @@ Smoke test
 ----------
   printf '%s\n' \
     '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"sequential_thinking","arguments":{"thought":"hi","nextThoughtNeeded":false,"thoughtNumber":1,"totalThoughts":1}}}' \
-  | ./tinythink
+  | ./PeaBrain
   printf '%s\n' \
     '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"write_fact","arguments":{"name":"sky","text":"blue"}}}' \
-  | ./tinythink
-  sqlite3 tinythink.db "select name,body from facts; pragma integrity_check;"
+  | ./PeaBrain
+  sqlite3 peabrain.db "select name,body from facts; pragma integrity_check;"

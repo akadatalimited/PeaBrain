@@ -3,7 +3,7 @@ Companion to BUILD (MCP engine). Stages: 1 arena+save/load, 2 AVX2/FMA
 FP32 engine, 3 backprop+validation, 4 VNNI/INT8(+INT4/FP16) inference,
 5 GPU feasibility probe, 6 GPU only if proven. Prototype lives in model/
 standalone; MCP tools (model_init/train/predict/save/load/status) wire up
-only after Stage 3 is green. Live tinythink.db is never touched by tests.
+only after Stage 3 is green. Live peabrain.db is never touched by tests.
 
 ARENA: mmap 4GiB MAP_PRIVATE|MAP_ANONYMOUS|MAP_NORESERVE (reserve address
 space, commit on demand). Internal align = max(request,4096) so mincore
@@ -79,7 +79,7 @@ STAGE 3 RESULTS (2026-11-04, all strict asserts green, exit 0):
   Same quirk exists in mat.asm (left as-is: distribution-independent
   proofs there).
 - Future: H=32 capacity, target normalisation, per-param eps, INT4/FP16
-  (Stage 4), GPU probe (Stage 5). Live tinythink.db never touched.
+  (Stage 4), GPU probe (Stage 5). Live peabrain.db never touched.
 
 QUANT (Stage 4): INT8 symmetric per-tensor scale (+INT4 nibble packing and
 FP16 storage evaluated where they win); inference-only, training stays FP32;
@@ -115,7 +115,7 @@ leaky-ReLU with He-scale weights (the representative PeaBrain-init case),
   quant bytes into the correction table and leaving A1q zero (both INT8
   paths agreed vacuously; FP32-vs-INT8 caught it); (3) qb2v pointer-vs-
   value (stored b2f address, added pointer bits); (4) FNV is a hash.
-- Live tinythink.db never touched (model/ + /tmp only). No GPU (Stage 5).
+- Live peabrain.db never touched (model/ + /tmp only). No GPU (Stage 5).
 
 GPU (Stage 5: feasibility PROBE, 2026-11-04 — read-only recon, no devices
 opened, no ioctls, no driver changes; verdict: NOT FEASIBLE under the hard

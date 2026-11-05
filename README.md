@@ -3,9 +3,8 @@
 Persistent agent memory in ~62 KB: a pure-FASM x86-64 MCP server backed by
 a genuine on-disk SQLite database. No libc, no interpreter, no runtime —
 raw syscalls only. It speaks MCP stdio JSON-RPC and stores thoughts,
-facts, entities, relations, and tasks in `tinythink.db` next to the binary.
-(The executable keeps its historical name `tinythink`; the project is
-PeaBrain.)
+facts, entities, relations, and tasks in `peabrain.db` in the state directory
+(`$PEABRAIN_STATE_DIR`, else `~/.local/share/peabrain`).
 
 ## Features
 
@@ -63,8 +62,8 @@ PeaBrain.)
 ## Build
 
 ```sh
-fasm -m 65536 tinythink.asm tinythink        # vector build (default)
-fasm -m 65536 -dUSE_SCALAR=1 tinythink.asm tinythink-scalar   # portable fallback
+fasm -m 65536 peabrain.asm PeaBrain          # vector build (default)
+fasm -m 65536 -dUSE_SCALAR=1 peabrain.asm PeaBrain-scalar     # portable fallback
 ```
 
 Both builds are behaviorally identical (differential suites assert this).
@@ -74,23 +73,23 @@ If the linker complains the target is busy (`ETXTBSY`), build to a temp
 file and rename over it:
 
 ```sh
-fasm -m 65536 tinythink.asm /tmp/tt0 && mv /tmp/tt0 tinythink
+fasm -m 65536 peabrain.asm /tmp/pb0 && mv /tmp/pb0 PeaBrain
 ```
 
 ## Run
 
-The repo ships the built application as `tinythink` — no build needed,
+The repo ships the built application as `PeaBrain` — no build needed,
 no dependencies (not even libc). It runs on any Linux x86-64 machine
 with an x86-64-v3 CPU (AVX/AVX2/FMA/BMI1/BMI2/LZCNT; anything from ~2013
 onward — it refuses with a clear error otherwise):
 
 ```sh
-chmod +x tinythink
-./tinythink   # speaks MCP stdio JSON-RPC; Ctrl-D / stdin close to stop
+chmod +x PeaBrain
+./PeaBrain     # speaks MCP stdio JSON-RPC; Ctrl-D / stdin close to stop
 ```
 
-`tinythink` is an MCP stdio server: newline-delimited JSON-RPC on
-stdin/stdout. Persistent state (`tinythink.db` + `rank.pbmd`) lives in
+`PeaBrain` is an MCP stdio server: newline-delimited JSON-RPC on
+stdin/stdout. Persistent state (`peabrain.db` + `peabrain-rank.pbmd`) lives in
 one state directory: `$PEABRAIN_STATE_DIR` when set, otherwise
 `~/.local/share/peabrain` — independent of where the binary runs from
 (historically the database sat next to the executable, which silently
@@ -100,9 +99,9 @@ genuinely fresh installation is created on first write. Minimal client
 config (opencode):
 
 ```json
-{ "mcp": { "tinythink": {
+{ "mcp": { "peabrain": {
   "type": "local",
-  "command": ["/path/to/tinythink"],
+  "command": ["/path/to/PeaBrain"],
   "enabled": true } } }
 ```
 
@@ -111,7 +110,7 @@ Smoke test:
 ```sh
 echo '{"jsonrpc":"2.0","id":1,"method":"tools/call",
   "params":{"name":"write_fact","arguments":{"name":"hello","text":"world"}}}' \
-  | ./tinythink
+  | ./PeaBrain
 ```
 
 Every response uses the MCP `content` envelope.
@@ -165,7 +164,7 @@ preserved counts.
 Yes, the Python under `tests/` looks out of place in a 100% assembly
 project — it is developer tooling, not part of PeaBrain. The server
 itself has zero dependencies (not even libc); nothing here is needed
-to build it (`fasm tinythink.asm`) or to run it (the static `tinythink`
+to build it (`fasm peabrain.asm`) or to run it (the static `PeaBrain`
 binary plus a state directory).
 
 What the scripts are: black-box verification harnesses. They spawn a
@@ -188,10 +187,10 @@ touched.
 
 ## Repository
 
-- `tinythink` — the built PeaBrain application, committed so anyone can
-  run it immediately (rebuilt from `tinythink.asm` byte-identically;
+- `PeaBrain` — the built PeaBrain application, committed so anyone can
+  run it immediately (rebuilt from `peabrain.asm` byte-identically;
   see Build).
-- `tinythink.asm` — the server (~11.5k lines) plus model code in
+- `peabrain.asm` — the server plus model code in
   `model/md_code.asm` (included into the executable segment),
   `model/md_consts.asm` / `model/md_data.asm` (initialized data /
   trailing NOBITS); `model/MODEL` records the arena/matmul/MLP/quant
@@ -199,7 +198,7 @@ touched.
 - `BUILD` — build notes, tool/capacity/security documentation.
 - `tests/` — Python verification harnesses (see Tests above).
   Developer-only; not needed to build or run the server.
-- Databases (`tinythink.db*`) and backups (`*.bak-*`) are untracked by
+- Databases (`peabrain.db*`, legacy `tinythink.db*`) and backups (`*.bak-*`) are untracked by
   design (see `.gitignore`) — your memory stays yours.
 
 ## Binary layout (for the curious)

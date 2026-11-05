@@ -93,13 +93,10 @@ v3_fail:
     syscall
 v3_ok:
     cld
-    call tm_init
-    call st_resolve
     lea rax, [outbuf]
     mov [outptr], rax
 
 read_loop:
-    call tm_first_read
     mov eax, 0                ; read(stdin, inbuf, 4096)
     xor edi, edi
     lea rsi, [inbuf]
@@ -149,9 +146,7 @@ end_of_line:
     lea rsi, [line]
     mov rdx, [linelen]
     mov qword [linelen], 0
-    call tm_req_start
     call handle_line
-    call tm_req_end
     jmp byte_loop
 line_overflow:
     mov byte [discard], 1
@@ -397,7 +392,6 @@ wa_bad:
     ret
 
 emit:
-    call tm_op_end
     mov edi, 1                ; looped write: big history output may partial-write
     lea rsi, [outbuf]
     mov rdx, [outlen]
@@ -1641,42 +1635,6 @@ do_call:
     call cmp_name
     test rax, rax
     jnz op_explain
-    lea rsi, [toolbuf]
-    mov rdx, [toollen]
-    lea rdi, [t_modinit]
-    call cmp_name
-    test rax, rax
-    jnz op_modinit
-    lea rsi, [toolbuf]
-    mov rdx, [toollen]
-    lea rdi, [t_modtrain]
-    call cmp_name
-    test rax, rax
-    jnz op_modtrain
-    lea rsi, [toolbuf]
-    mov rdx, [toollen]
-    lea rdi, [t_modpredict]
-    call cmp_name
-    test rax, rax
-    jnz op_modpredict
-    lea rsi, [toolbuf]
-    mov rdx, [toollen]
-    lea rdi, [t_modsave]
-    call cmp_name
-    test rax, rax
-    jnz op_modsave
-    lea rsi, [toolbuf]
-    mov rdx, [toollen]
-    lea rdi, [t_modload]
-    call cmp_name
-    test rax, rax
-    jnz op_modload
-    lea rsi, [toolbuf]
-    mov rdx, [toollen]
-    lea rdi, [t_modstatus]
-    call cmp_name
-    test rax, rax
-    jnz op_modstatus
     lea rdi, [c_params]
     lea rsi, [m_notool]
     jmp err_id
@@ -2666,10 +2624,8 @@ uq_space:
     pop r12
     pop rbx
     ret
-; use_bump_name(rdi=kind, rsi=ptr, rdx=len, rcx=tick or 0=auto):
-; access++, tick, enqueue on 0->1 dirty. A nonzero tick is stored as-is
-; (shared query tick from search emission); 0 advances the global clock.
-; Preserves rbx,rcx,rdx,rsi,rdi,r12-r15.
+; use_bump_name(rdi=kind, rsi=ptr, rdx=len): access++, tick, enqueue on
+; 0->1 dirty. Preserves rbx,rcx,rdx,rsi,rdi,r12-r15.
 use_bump_name:
     push rbx
     push rcx
@@ -2690,14 +2646,8 @@ use_bump_name:
     mov dword [rdx + 12], 1
     mov dword [rdx + 16], 0
     mov dword [rdx + 20], 0
-    cmp dword [rsp + 24], 0
-    jne ubn_tickgiven0
     inc qword [utick]
     mov eax, dword [utick]
-    jmp ubn_tickdone0
-ubn_tickgiven0:
-    mov eax, dword [rsp + 24]
-ubn_tickdone0:
     mov [rdx + 24], eax
     mov word [rdx + 28], 0
     mov byte [rdx + 30], 1
@@ -2708,14 +2658,8 @@ ubn_hit:
     jae ubn_ticked
     inc dword [rdx + 12]
 ubn_ticked:
-    cmp dword [rsp + 24], 0
-    jne ubn_tickgiven1
     inc qword [utick]
     mov eax, dword [utick]
-    jmp ubn_tickdone1
-ubn_tickgiven1:
-    mov eax, dword [rsp + 24]
-ubn_tickdone1:
     mov [rdx + 24], eax
     cmp byte [rdx + 30], 0
     jne ubn_done
@@ -2732,10 +2676,9 @@ ubn_done:
     pop rcx
     pop rbx
     ret
-; use_bump_id(rdi=kind, rsi=rowid, rcx=tick or 0=auto): same for rowid
-; identities. Flush coverage via decimal-name queue entries (u64_dec of
-; the rowid into uqnum; uenqueue copies): the loader re-derives the rowid
-; the same way.
+; use_bump_id(rdi=kind, rsi=rowid): same for rowid identities. Flush
+; coverage via decimal-name queue entries (u64_dec of the rowid into uqnum;
+; uenqueue copies): the loader re-derives the rowid the same way.
 ; Preserves rbx,rcx,rdx,rsi,rdi,r12-r15.
 use_bump_id:
     push rbx
@@ -2753,14 +2696,8 @@ use_bump_id:
     mov dword [rdx + 12], 1
     mov dword [rdx + 16], 0
     mov dword [rdx + 20], 0
-    cmp dword [rsp + 24], 0
-    jne ubi_tickgiven0
     inc qword [utick]
     mov eax, dword [utick]
-    jmp ubi_tickdone0
-ubi_tickgiven0:
-    mov eax, dword [rsp + 24]
-ubi_tickdone0:
     mov [rdx + 24], eax
     mov word [rdx + 28], 0
     mov byte [rdx + 30], 1
@@ -2771,14 +2708,8 @@ ubi_hit:
     jae ubi_ticked
     inc dword [rdx + 12]
 ubi_ticked:
-    cmp dword [rsp + 24], 0
-    jne ubi_tickgiven1
     inc qword [utick]
     mov eax, dword [utick]
-    jmp ubi_tickdone1
-ubi_tickgiven1:
-    mov eax, dword [rsp + 24]
-ubi_tickdone1:
     mov [rdx + 24], eax
     cmp byte [rdx + 30], 0
     jne ubi_done
@@ -3236,231 +3167,6 @@ usm_done:
     pop rbx
     ret
 
-; ---- reverse-identity index for legacy usage rows ----
-; One pass over facts+entities at boot maps rowid -> (name, len) so legacy
-; 2-col usage rows resolve in O(1) instead of one full-table rname_of scan
-; each. Extraction mirrors rname_of exactly (parse-ok, col0, len 1..128,
-; no gcols check). All-or-nothing: any capacity miss or walk failure
-; leaves [rk_idx_ok]=0 and the original resolver path runs unchanged.
-; No DB writes. Preserves all GP regs (caller holds live loop state).
-
-; rk_idx_build: pre-scan usage for legacy rows; capacity precheck via
-; tail_max; walk both tables. Best effort, always returns 0.
-rk_idx_build:
-    push rbx
-    push rbp
-    push r12
-    push r13
-    push r14
-    push r15
-    push r8
-    push r9
-    push r10
-    push r11
-    mov rax, [maxrowid]
-    push rax
-    mov rdi, [f_root_use]
-    call walk_leaves
-    test rax, rax
-    jnz rkix_noindex
-    xor r14d, r14d
-rkix_pre:
-    cmp r14, [childn]
-    jae rkix_nolegacy
-    lea rsi, [childtab]
-    mov rax, r14
-    shl rax, 3
-    add rsi, rax
-    mov rdi, [rsi]
-    lea rsi, [pagebuf]
-    call pg_read_nc
-    test rax, rax
-    jnz rkix_prenext
-    cmp byte [pagebuf], 0x0D
-    jne rkix_prenext
-    lea rsi, [pagebuf + 3]
-    call be16_ld
-    mov rbx, rax
-    xor r13d, r13d
-rkix_pcell:
-    cmp r13, rbx
-    jae rkix_prenext
-    lea rsi, [pagebuf + 8]
-    mov rax, r13
-    shl rax, 1
-    add rsi, rax
-    call be16_ld
-    lea rsi, [pagebuf]
-    add rsi, rax
-    call parse_row
-    test rax, rax
-    jnz rkix_pcinc
-    cmp qword [gcols], 2
-    je rkix_foundleg
-rkix_pcinc:
-    inc r13
-    jmp rkix_pcell
-rkix_prenext:
-    inc r14
-    jmp rkix_pre
-rkix_nolegacy:
-    jmp rkix_noindex
-rkix_foundleg:
-    mov rdi, [f_root_facts]
-    call tail_max
-    test rax, rax
-    jnz rkix_noindex
-    cmp qword [maxrowid], RK_IDX_MAX
-    jae rkix_noindex
-    mov rdi, [f_root_ent]
-    call tail_max
-    test rax, rax
-    jnz rkix_noindex
-    cmp qword [maxrowid], RK_IDX_MAX
-    jae rkix_noindex
-    mov qword [rk_ixused], 0
-    mov rdi, [f_root_facts]
-    lea rax, [rk_ixf]
-    mov [rk_ixbase], rax
-    call rkix_walk
-    test rax, rax
-    jnz rkix_noindex
-    mov rdi, [f_root_ent]
-    lea rax, [rk_ixe]
-    mov [rk_ixbase], rax
-    call rkix_walk
-    test rax, rax
-    jnz rkix_noindex
-    mov qword [rk_idx_ok], 1
-    jmp rkix_done
-rkix_noindex:
-    mov qword [rk_idx_ok], 0
-rkix_done:
-    pop rax
-    mov [maxrowid], rax
-    pop r11
-    pop r10
-    pop r9
-    pop r8
-    pop r15
-    pop r14
-    pop r13
-    pop r12
-    pop rbp
-    pop rbx
-    ret
-
-; rkix_walk(rdi=root): fill [rk_ixbase] from one table. rax 0 ok / 1 full.
-; Preserves rbx,rbp,r12-r15,r8-r11 (caller loop state); clobbers others.
-rkix_walk:
-    push rbx
-    push rbp
-    push r12
-    push r13
-    push r14
-    push r15
-    push r8
-    push r9
-    push r10
-    push r11
-    call walk_leaves
-    test rax, rax
-    jnz rkixw_fail
-    xor r14d, r14d
-rkixw_page:
-    cmp r14, [childn]
-    jae rkixw_ok
-    lea rsi, [childtab]
-    mov rax, r14
-    shl rax, 3
-    add rsi, rax
-    mov rdi, [rsi]
-    lea rsi, [pagebuf]
-    call pg_read_nc
-    test rax, rax
-    jnz rkixw_nextpg
-    cmp byte [pagebuf], 0x0D
-    jne rkixw_nextpg
-    lea rsi, [pagebuf + 3]
-    call be16_ld
-    mov rbx, rax
-    xor r13d, r13d
-rkixw_cell:
-    cmp r13, rbx
-    jae rkixw_nextpg
-    lea rsi, [pagebuf + 8]
-    mov rax, r13
-    shl rax, 1
-    add rsi, rax
-    call be16_ld
-    lea rsi, [pagebuf]
-    add rsi, rax
-    call parse_row
-    test rax, rax
-    jnz rkixw_incc
-    mov rax, [growid]
-    test rax, rax
-    jz rkixw_incc
-    cmp rax, RK_IDX_MAX
-    jae rkixw_incc
-    mov rsi, qword [gfo]
-    mov rcx, qword [gfl]
-    cmp rcx, 1
-    jb rkixw_incc
-    cmp rcx, 128
-    ja rkixw_incc
-    mov eax, dword [rk_ixused]
-    mov edx, eax
-    add edx, ecx
-    jc rkixw_fail
-    cmp edx, RK_IDX_ARENA
-    ja rkixw_fail
-    push rcx
-    push rsi
-    lea rdi, [rk_ixarena]
-    add rdi, rax
-    rep movsb
-    pop rsi
-    pop rcx
-    mov dword [rk_ixused], edx
-    mov r10, [growid]
-    shl r10, 3
-    add r10, [rk_ixbase]
-    mov [r10], eax
-    mov [r10 + 4], ecx
-rkixw_incc:
-    inc r13
-    jmp rkixw_cell
-rkixw_nextpg:
-    inc r14
-    jmp rkixw_page
-rkixw_ok:
-    xor eax, eax
-    pop r11
-    pop r10
-    pop r9
-    pop r8
-    pop r15
-    pop r14
-    pop r13
-    pop r12
-    pop rbp
-    pop rbx
-    ret
-rkixw_fail:
-    mov eax, 1
-    pop r11
-    pop r10
-    pop r9
-    pop r8
-    pop r15
-    pop r14
-    pop r13
-    pop r12
-    pop rbp
-    pop rbx
-    ret
-
 ; use_load: one-time load of usage rows into utab (insert-or-max). Db must be
 ; open+locked with tables ensured. Best effort, always returns 0.
 use_load:
@@ -3470,7 +3176,6 @@ use_load:
     push r12
     push r13
     push r14
-    call rk_idx_build
     mov rdi, [f_root_use]
     call walk_leaves
     test rax, rax
@@ -3655,35 +3360,6 @@ ull_h:
     cmp qword [ulkind], 1
     je ull_obs
     push rbx
-    cmp qword [rk_idx_ok], 1
-    jne rk_leg_old
-    cmp qword [ulkind], 0
-    je rk_leg_ent
-    lea rdi, [rk_ixf]
-    jmp rk_leg_lu
-rk_leg_ent:
-    lea rdi, [rk_ixe]
-rk_leg_lu:
-    cmp rax, RK_IDX_MAX
-    jae rk_leg_miss
-    shl rax, 3
-    add rax, rdi
-    mov ecx, [rax + 4]
-    cmp ecx, 1
-    jb rk_leg_miss
-    cmp ecx, 128
-    ja rk_leg_miss
-    mov edx, [rax]
-    lea rsi, [rk_ixarena]
-    add rsi, rdx
-    lea rdi, [rnbuf]
-    mov [rnlen], rcx
-    rep movsb
-    jmp ull_named
-rk_leg_miss:
-    pop rbx
-    jmp ul_incc
-rk_leg_old:
     mov rsi, rax                ; rowid for rname_of
     mov rdx, [childn]
     cmp rdx, 65536
@@ -3897,17 +3573,11 @@ use_flush:
     lea rdi, [svstate + 224]
     mov ecx, 8
     rep movsq
-    ; Fresh usage high-water mark: the shared [maxrowid] may hold another
-    ; table's max (every op refreshes it for its own table) or a pre-flush
-    ; value, so bare ++[maxrowid] rowids can collide with existing usage
-    ; rows (duplicates) or land below the true max (out-of-order cells).
-    ; O(depth) rightmost descent; also primes dstack for the right-edge
-    ; place_cell calls below. Failure here wrote nothing, so the normal
-    ; abort path (which restores the untouched counter) stays correct.
-    mov rdi, [f_root_use]
-    call tail_max
-    test rax, rax
-    jnz uf_abort
+    ; No scan_max here (it was O(rows) per flush -> O(n^2) total once every
+    ; write flushes): [maxrowid] is already txn-fresh (scanned at open,
+    ; our own inserts ++ it, concurrent writers are locked out by our EX
+    ; lock), so ++maxrowid rowids cannot collide. A scan remains only for
+    ; cold opens, not per-flush.
 uf_slot:
     mov rax, [uq_head]
     cmp rax, [uq_tail]
@@ -4014,22 +3684,9 @@ uf_done:
     test rax, rax
     jnz uf_abort
     mov qword [udirty], 0
-    push rax                       ; hdr_touch status (0): use_flush must
-    mov rax, [maxrowid]            ; return 0 on success, so save it first;
-    mov qword [svstate + 8], rax   ; then refresh the slot with the advanced
-    jmp uf_restore                 ; high-water mark for the shared restore
+    push rax
+    jmp uf_restore
 uf_abort:
-    ; Placed rows persist (the piggyback commits with the outer txn, and
-    ; the exit path commits too), so the pre-flush counter must not come
-    ; back: re-sync to the true max. If the re-sync itself fails the tree
-    ; is unreadable and the stale value is no worse.
-    mov rdi, [f_root_use]
-    call tail_max
-    test rax, rax
-    jnz uf_abortkeep
-    mov rax, [maxrowid]
-    mov qword [svstate + 8], rax
-uf_abortkeep:
     push rax
     mov rax, 1
     mov [rsp], rax
@@ -4409,8 +4066,9 @@ jw_full:
     syscall
     cmp rax, 4096
     jne jw_err
+    mov eax, 74                   ; fsync journal before the data write
     mov rdi, [jfd]
-    call tm_fsync                ; fsync journal before the data write
+    syscall
     test rax, rax
     js jw_err
     lea rax, [jpages]
@@ -4523,16 +4181,18 @@ jrc_next:
     jne jrc_err
     jmp jrc_next
 jrc_commit:
+    mov eax, 74                 ; fsync restored pages
     mov rdi, [dbfd]
-    call tm_fsync                ; fsync restored pages
+    syscall
     mov rax, r15
     shl rax, 12
     mov rsi, rax                ; len = orig*4096
     mov eax, 77                 ; ftruncate back (drops grown tail)
     mov rdi, [dbfd]
     syscall
+    mov eax, 74
     mov rdi, [dbfd]
-    call tm_fsync
+    syscall
     mov eax, 3
     mov rdi, r14
     syscall
@@ -4693,309 +4353,6 @@ is_tombstoned:
     call scan_key_latest
     ret
 
-; tix_build: snapshot tombstones into the per-query index. Call once per
-; read query right after db_open (same SH hold as the walks: snapshot and
-; emission are atomic against writers, which need EX). Sets tix_ready=1 on
-; a fully clean table, else 0 (caller uses is_tombstoned: exact fallback).
-; Cell rules mirror scan_key_latest one-for-one: TEXT-only col0 (serial 0
-; = empty name; 1..12 and even serials never match, so are skipped, not
-; stored); structural faults (bad varints, hdrsize >= 128, header/serial
-; mismatch, oversize ptr array, zero-serial rows whose legacy outcome
-; depends on stale gfo/gfl) ABANDON the build rather than risk divergence.
-; Names longer than 128 are skipped: both lookup sites reject len > 128
-; before consulting the index, so they can never match (proven, not heuristic).
-; Clobbers pagebuf, childtab/childn. Preserves rbx,rbp,r12-r15.
-tix_build:
-    push rbx
-    push rbp
-    push r12
-    push r13
-    push r14
-    push r15
-    mov qword [tix_ready], 0
-    mov rdi, [f_root_tomb]
-    test rdi, rdi
-    jz tx_done                   ; no table: legacy path owns the outcome
-    lea rdi, [tix_tab]
-    mov ecx, 32768
-    xor eax, eax
-tx_zero:
-    mov [rdi], rax                ; empty = hash 0 (len/pool stale, unread)
-    add rdi, 16
-    dec ecx
-    jnz tx_zero
-    mov qword [tix_n], 0
-    mov qword [tix_pooln], 0
-    mov rdi, [f_root_tomb]
-    call walk_leaves
-    test rax, rax
-    jnz tx_done                  ; walk failed: legacy reproduces the error
-    xor r12d, r12d               ; pi: leaf index (set semantics: any order)
-tx_page:
-    cmp r12, [childn]
-    jae tx_ok
-    lea rsi, [childtab]
-    mov rax, r12
-    shl rax, 3
-    add rsi, rax
-    mov rdi, [rsi]
-    lea rsi, [pagebuf]
-    call pg_read_nc              ; single pass: probe ok, evict nothing
-    test rax, rax
-    jnz tx_nextpg                ; unreadable page: legacy skips it too
-    cmp byte [pagebuf], 0x0D
-    jne tx_nextpg
-    lea rsi, [pagebuf + 3]
-    call be16_ld
-    test rax, rax
-    jz tx_nextpg
-    cmp rax, 2048                ; ptr array must fit the page; legacy would
-    ja tx_done                   ; misread it, so abandon (fallback is exact)
-    mov r13, rax                 ; ncell
-    xor r14d, r14d               ; ci
-tx_cell:
-    cmp r14, r13
-    jae tx_nextpg
-    lea rsi, [pagebuf + 8]
-    mov rax, r14
-    shl rax, 1
-    add rsi, rax
-    call be16_ld                 ; coff
-    lea rsi, [pagebuf]
-    add rsi, rax
-    lea rdx, [pagebuf + 4096]
-    call varint_get              ; plen
-    test rcx, rcx
-    jz tx_done
-    mov rsi, rcx
-    call varint_get              ; rowid (value ignored, validity required)
-    test rcx, rcx
-    jz tx_done
-    mov rsi, rcx
-    call varint_get              ; hdrsize
-    test rcx, rcx
-    jz tx_done
-    cmp rax, 128
-    jae tx_done
-    mov [tx_sptr], rcx
-    lea rdx, [rcx]
-    add rdx, rax
-    dec rdx
-    mov [tx_body], rdx           ; body = sptr + hval - 1 (hval < 128: 1 byte)
-    mov qword [tx_cnt], 0
-    mov qword [tx_s0], 0
-    mov byte [tx_first], 1
-tx_ser:
-    cmp qword [tx_cnt], 5
-    jae tx_serdone
-    mov rsi, [tx_sptr]
-    cmp rsi, [tx_body]
-    jae tx_serdone
-    lea rdx, [pagebuf + 4096]
-    call varint_get
-    test rcx, rcx
-    jz tx_done
-    cmp byte [tx_first], 0
-    je tx_sernext
-    mov [tx_s0], rax
-    mov byte [tx_first], 0
-tx_sernext:
-    mov [tx_sptr], rcx
-    inc qword [tx_cnt]
-    jmp tx_ser
-tx_serdone:
-    mov rax, [tx_sptr]
-    cmp rax, [tx_body]
-    jne tx_done                  ; serials must exactly fill header
-    cmp qword [tx_cnt], 0
-    je tx_done                   ; zero-serial row: legacy reads stale gfo/gfl;
-                                 ; abandon so the fallback preserves it exactly
-    mov rax, [tx_s0]
-    test rax, rax
-    jz tx_store0                 ; serial 0: empty name, usable
-    cmp rax, 13
-    jb tx_nextcell               ; 1..12 incl. BLOB-0: never match, skip
-    test al, 1
-    jz tx_nextcell               ; even serials (BLOB): never match, skip
-    sub rax, 13
-    shr rax, 1                   ; TEXT len
-    jmp tx_store1
-tx_store0:
-    xor eax, eax
-tx_store1:
-    mov rbx, rax                 ; len (rbx survives helpers)
-    cmp rbx, 128
-    ja tx_nextcell               ; unmatchable at both lookup sites: skip
-    mov rax, [tx_body]
-    add rax, rbx
-    lea rdx, [pagebuf + 4096]
-    cmp rax, rdx
-    ja tx_nextcell               ; out of page: legacy skips the row too
-    mov r15, [tx_body]           ; name ptr (r15 survives fnv1a64)
-    cmp qword [tix_n], 24576
-    jae tx_done                  ; table cap: abandon (fallback stays exact;
-                                 ; 24576 < 32768 keeps an empty slot, so every
-                                 ; lookup probe provably terminates)
-    mov rax, [tix_pooln]
-    add rax, rbx
-    cmp rax, 1048576
-    ja tx_done                   ; pool cap: abandon, same guarantee
-    mov rsi, r15
-    mov rdx, rbx
-    call fnv1a64
-    mov rbp, rax                 ; hash (rbp free: serial loop is done)
-    test rbp, rbp
-    jnz tx_hok
-    mov rbp, 1                   ; hash 0 is the empty mark: remap (lookup
-tx_hok:                          ; applies the identical mapping)
-    mov eax, ebp
-    and eax, 32767
-    mov r11d, eax                ; slot cursor (r11 free until memcmp)
-tx_probe:
-    lea r10, [tix_tab]
-    mov eax, r11d
-    shl rax, 4
-    add r10, rax                  ; r10 = slot
-    cmp [r10], rbp
-    jne tx_maybeempty            ; different hash: empty or keep probing
-    cmp [r10 + 8], ebx            ; len match?
-    jne tx_nextslot
-    test rbx, rbx
-    jz tx_nextcell               ; two empty names are equal: duplicate
-    push rsi                     ; full key compare: collisions cost probes,
-    push rdi                     ; never wrong results
-    push rcx
-    mov rsi, r15
-    mov eax, [r10 + 12]
-    lea rdi, [tix_pool]
-    add rdi, rax
-    mov rcx, rbx
-    repe cmpsb
-    pop rcx
-    pop rdi
-    pop rsi
-    je tx_nextcell               ; duplicate: already stored, skip
-    jmp tx_nextslot
-tx_maybeempty:
-    cmp qword [r10], 0
-    jne tx_nextslot              ; occupied: keep probing
-    mov [r10], rbp               ; empty slot: store hash/len/pool-off
-    mov [r10 + 8], ebx
-    mov rax, [tix_pooln]
-    mov [r10 + 12], eax
-    push rsi
-    push rdi
-    push rcx
-    mov rsi, r15
-    mov eax, [r10 + 12]
-    lea rdi, [tix_pool]
-    add rdi, rax
-    mov rcx, rbx
-    rep movsb
-    pop rcx
-    pop rdi
-    pop rsi
-    add [tix_pooln], rbx
-    inc qword [tix_n]
-    jmp tx_nextcell
-tx_nextslot:
-    inc r11d
-    and r11d, 32767
-    jmp tx_probe
-tx_nextcell:
-    inc r14
-    jmp tx_cell
-tx_nextpg:
-    inc r12
-    jmp tx_page
-tx_ok:
-    mov qword [tix_ready], 1
-tx_done:
-    pop r15
-    pop r14
-    pop r13
-    pop r12
-    pop rbp
-    pop rbx
-    ret
-
-; tix_lookup(rsi=name, rdx=len): rax 1 member / 0 absent. Call only when
-; tix_ready=1. Pure predicate: touches only tix_tab/tix_pool, never
-; pagebuf, childtab, gfo/gfl or growid, so the caller's walk continues
-; undisturbed (no spill/restore, no page re-read on either outcome).
-; Termination is structural: a ready index holds at most 24576 entries in
-; 32768 slots, so an empty slot always ends the probe. Preserves
-; rbx,rbp,r12-r15,rsi,rdi; clobbers rax,rcx,rdx,r8-r11.
-tix_lookup:
-    push rbx
-    push rbp
-    push r12
-    push r13
-    push r14
-    push r15
-    push rsi
-    push rdi
-    cmp rdx, 128
-    ja lx_no                    ; longer than any stored name: exact absent
-    mov rbx, rdx                ; len (survives fnv1a64)
-    mov r15, rsi                ; name (survives fnv1a64)
-    call fnv1a64
-    mov rbp, rax
-    test rbp, rbp
-    jnz lx_hok
-    mov rbp, 1                  ; identical remap as the build side
-lx_hok:
-    mov eax, ebp
-    and eax, 32767
-    mov r11d, eax
-lx_probe:
-    lea r10, [tix_tab]
-    mov eax, r11d
-    shl rax, 4
-    add r10, rax
-    cmp [r10], rbp
-    jne lx_maybeempty
-    cmp [r10 + 8], ebx
-    jne lx_next
-    test rbx, rbx
-    jz lx_yes                   ; two empty names are equal
-    push rsi
-    push rdi
-    push rcx
-    mov rsi, r15
-    mov eax, [r10 + 12]
-    lea rdi, [tix_pool]
-    add rdi, rax
-    mov rcx, rbx
-    repe cmpsb                  ; full key: a collision can never hide a miss
-    pop rcx                     ; nor invent a hit
-    pop rdi
-    pop rsi
-    je lx_yes
-    jmp lx_next
-lx_maybeempty:
-    cmp qword [r10], 0
-    je lx_no                    ; empty slot ends the probe: absent
-lx_next:
-    inc r11d
-    and r11d, 32767
-    jmp lx_probe
-lx_yes:
-    mov eax, 1
-    jmp lx_out
-lx_no:
-    xor eax, eax
-lx_out:
-    pop rdi
-    pop rsi
-    pop r15
-    pop r14
-    pop r13
-    pop r12
-    pop rbp
-    pop rbx
-    ret
-
 ; db_open: shared/read (LOCK_SH). db_open_ex: exclusive/write (LOCK_EX).
 ; Readers never block each other; any journal/creation/missing-table case
 ; escalates a reader to EX (UN then EX, never upgrade) before mutating.
@@ -5006,8 +4363,40 @@ db_open_ex:
     mov edi, 1
 do_open_body:
     mov [dbwmode], rdi
-    ; dbpath/jpath/dbdirb arrive pre-resolved from st_resolve (boot);
-    ; legacy exe-dir/CWD locations are never opened, only STATed there.
+    mov eax, 89                 ; readlink /proc/self/exe
+    lea rdi, [dbexe]
+    lea rsi, [exebuf]
+    mov edx, 1024
+    syscall
+    cmp rax, 0
+    jle do_cwd
+    mov rcx, rax
+    lea r10, [exebuf]             ; base in reg: PIE-safe (no label+index)
+do_sl:
+    dec rcx
+    js do_cwd
+    cmp byte [r10 + rcx], '/'
+    jne do_sl
+    inc rcx
+    cmp rcx, 1024
+    ja do_cwd
+    mov [dblen], rcx
+    lea rsi, [exebuf]
+    lea rdi, [dbpath]
+    rep movsb
+    lea rsi, [dbfile]
+    mov ecx, 12
+    rep movsb
+    mov byte [rdi], 0
+    add qword [dblen], 12
+    jmp do_paths
+do_cwd:
+    lea rsi, [dbfile]
+    lea rdi, [dbpath]
+    mov ecx, 12
+    rep movsb
+    mov byte [rdi], 0
+    mov qword [dblen], 12
 do_paths:
     ; jpath = dbpath + "-journal"; dbdirb = dirname (for dirsync)
     mov rax, [dblen]
@@ -5073,9 +4462,10 @@ do_open:
     js do_closeerr
     cmp qword [dbwmode], 0
     je do_shlock
+    mov eax, 73                 ; flock LOCK_EX (writers)
     mov rdi, [dbfd]
     mov esi, 2
-    call tm_flock                ; flock LOCK_EX (writers)
+    syscall
     test rax, rax
     js do_closeerr
     call jrecover               ; rollback torn txn if journal present
@@ -5083,9 +4473,10 @@ do_open:
     jnz do_closeerr
     jmp do_fstat
 do_shlock:
+    mov eax, 73                 ; flock LOCK_SH (readers share)
     mov rdi, [dbfd]
     mov esi, 1
-    call tm_flock                ; flock LOCK_SH (readers share)
+    syscall
     test rax, rax
     js do_closeerr
 do_fstat:
@@ -5178,46 +4569,31 @@ do_create:
 do_ensure:
     cmp qword [cskip], 0        ; warm: roots/maxrowid/taskseq already live
     jne do_cached
-    call tm_phase_start
     call ensure_tables           ; new tables for old DBs; fills f_root_*
-    push rax
-    lea rdi, [tm_ensure]
-    call tm_phase_end
-    pop rax
     test rax, rax
     jnz do_closeerr
     mov rdi, 2
     call scan_max                ; conclusions max rowid
     test rax, rax
     jnz do_closeerr
-    call tm_phase_start
     call use_load               ; learned prefs, once per process (self-guarded)
-    push rax
-    lea rdi, [tm_useload]
-    call tm_phase_end
-    pop rax
 do_cached:
-    call tm_phase_start
-    call rank_boot               ; rankex examples + rank.pbmd, self-guarded
-    push rax
-    lea rdi, [tm_rankboot]
-    call tm_phase_end
-    pop rax
-    mov qword [tm_dbready], 1    ; first database initialisation completed;
-    xor eax, eax                 ; BOOT reports only after this point
+    xor eax, eax
     ret
 ; do_escalate: SH holder needs mutation. UN then EX (never upgrade: two
 ; simultaneous upgraders would deadlock), recover, redo from fstat as EX.
 do_escalate:
     mov qword [dbwmode], 1
+    mov eax, 73
     mov rdi, [dbfd]
     mov esi, 8
-    call tm_flock
+    syscall
     test rax, rax
     js do_closeerr
+    mov eax, 73
     mov rdi, [dbfd]
     mov esi, 2
-    call tm_flock
+    syscall
     test rax, rax
     js do_closeerr
     call jrecover
@@ -5243,8 +4619,9 @@ db_close:
     je dc_noflush
     call use_flush              ; piggyback learned prefs into this txn; best effort
 dc_noflush:
+    mov eax, 74
     mov rdi, [dbfd]
-    call tm_fsync
+    syscall
     mov eax, 87                 ; unlink journal: commit point
     lea rdi, [jpath]
     syscall
@@ -5255,8 +4632,9 @@ dc_noflush:
     mov rdi, [jfd]
     xor esi, esi
     syscall
+    mov eax, 74
     mov rdi, [jfd]
-    call tm_fsync
+    syscall
 dc_unlinked:
     call dirsync
     mov eax, 3
@@ -5307,7 +4685,8 @@ dirsync:
     test rax, rax
     js ds_done
     mov rdi, rax
-    call tm_fsync
+    mov eax, 74
+    syscall
     mov eax, 3
     syscall                     ; rdi still dirfd
 ds_done:
@@ -7544,2827 +6923,6 @@ etm_err:
     xor eax, eax
     ret
 
-; ---- timing instrumentation (opt-in: PEABRAIN_TIMING=1 in environ) ----
-; CLOCK_MONOTONIC via clock_gettime(228); diagnostics to stderr (fd 2)
-; only; stdout stays pure MCP JSON-RPC. Every routine preserves all GP
-; registers and rflags unless a return value is documented; when disabled
-; each hook costs one cmp+branch. Line prefix PB/READY/BOOT/FB for grep.
-macro TM_PUSH {
-    push rax
-    push rbx
-    push rcx
-    push rdx
-    push rsi
-    push rdi
-    push rbp
-    push r8
-    push r9
-    push r10
-    push r11
-    push r12
-    push r13
-    push r14
-    push r15
-    pushfq
-}
-macro TM_POP {
-    popfq
-    pop r15
-    pop r14
-    pop r13
-    pop r12
-    pop r11
-    pop r10
-    pop r9
-    pop r8
-    pop rbp
-    pop rdi
-    pop rsi
-    pop rdx
-    pop rcx
-    pop rbx
-    pop rax
-}
-
-; tm_clock: [tm_cs],[tm_cn] = now. Preserves everything.
-tm_clock:
-    TM_PUSH
-    mov eax, 228
-    mov edi, 1
-    lea rsi, [tm_cs]
-    syscall
-    TM_POP
-    ret
-
-; tm_diff2(rsi=startpair, rdx=endpair): rax = ms(end-start), saturating 0.
-; Preserves everything except rax,rcx,rdx.
-tm_diff2:
-    push rbx
-    mov rax, [rdx]
-    sub rax, [rsi]
-    mov rcx, [rdx + 8]
-    mov rbx, [rsi + 8]
-    cmp rcx, rbx
-    jae tmd_noborrow
-    dec rax
-    add rcx, 1000000000
-tmd_noborrow:
-    sub rcx, rbx
-    test rax, rax
-    js tmd_zero
-    imul rax, rax, 1000
-    xor edx, edx
-    mov rbx, 1000000
-    xchg rax, rcx
-    div rbx
-    add rax, rcx
-    pop rbx
-    ret
-tmd_zero:
-    xor eax, eax
-    pop rbx
-    ret
-
-; tm_wbegin/tm_wcstr/tm_wu64/tm_wflush: assemble one stderr line in tm_buf.
-tm_wbegin:
-    push rax
-    mov qword [tm_cur], 0
-    pop rax
-    ret
-tm_wcstr:
-    push rax
-    push rcx
-    push rsi
-    push rdi
-    lea rdi, [tm_buf]
-    add rdi, [tm_cur]
-twc_loop:
-    mov al, [rsi]
-    test al, al
-    jz twc_done
-    mov [rdi], al
-    inc rsi
-    inc rdi
-    inc qword [tm_cur]
-    jmp twc_loop
-twc_done:
-    pop rdi
-    pop rsi
-    pop rcx
-    pop rax
-    ret
-tm_wu64:
-    push rax
-    push rdx
-    push rdi
-    push rsi
-    push rcx
-    lea rdi, [tm_tmp]
-    call u64_dec
-    lea rsi, [tm_tmp]
-    mov rdi, [tm_cur]
-    lea rdi, [tm_buf]
-    add rdi, [tm_cur]
-    mov rcx, rdx
-    rep movsb
-    add [tm_cur], rdx
-    pop rcx
-    pop rsi
-    pop rdi
-    pop rdx
-    pop rax
-    ret
-tm_wflush:
-    TM_PUSH
-    mov eax, 1
-    mov edi, 2
-    lea rsi, [tm_buf]
-    mov rdx, [tm_cur]
-    test rdx, rdx
-    jz tmw_ret
-tmw_loop:
-    syscall
-    cmp rax, 0
-    jle tmw_ret
-    add rsi, rax
-    sub rdx, rax
-    test rdx, rdx
-    jnz tmw_loop
-tmw_ret:
-    TM_POP
-    ret
-
-; tm_init: env probe, pid, t0, rusage t0. Called once at process start.
-tm_init:
-    TM_PUSH
-    mov eax, 39
-    syscall
-    mov [tm_pid], rax
-    call tm_clock
-    mov rax, [tm_cs]
-    mov [tm_t0s], rax
-    mov rax, [tm_cn]
-    mov [tm_t0n], rax
-    mov eax, 98
-    xor edi, edi
-    lea rsi, [tm_ru0]
-    syscall
-    mov eax, 257
-    mov rdi, -100
-    lea rsi, [tm_envpath]
-    xor edx, edx
-    xor r10d, r10d
-    syscall
-    test rax, rax
-    js tmi_done
-    mov r12d, eax
-    mov eax, 0
-    mov rdi, r12
-    lea rsi, [tm_ebuf]
-    mov edx, 4100
-    syscall
-    push rax
-    mov eax, 3
-    syscall
-    pop rax
-    test rax, rax
-    jle tmi_done
-    lea rsi, [tm_ebuf]
-    mov rdx, rax
-    sub rdx, tm_envkeylen
-    jb tmi_done
-    inc rdx
-tmi_scan:
-    lea rdi, [tm_envkey]
-    mov rcx, tm_envkeylen
-    push rsi
-    push rdx
-    repe cmpsb
-    pop rdx
-    pop rsi
-    je tmi_found
-    inc rsi
-    dec rdx
-    jnz tmi_scan
-    jmp tmi_done
-tmi_found:
-    mov qword [tm_on], 1
-tmi_done:
-    TM_POP
-    ret
-
-; tm_first_read: READY line once at first read_loop entry; arms read clock.
-tm_first_read:
-    TM_PUSH
-    cmp qword [tm_on], 0
-    je tmfr_ret
-    cmp qword [tm_bootrep], 0
-    jne tmfr_ret
-    mov qword [tm_bootrep], 1
-    call tm_clock
-    mov rax, [tm_cs]
-    mov [tm_rs], rax
-    mov rax, [tm_cn]
-    mov [tm_rn], rax
-    call tm_wbegin
-    lea rsi, [tm_l_ready]
-    call tm_wcstr
-    mov rax, [tm_pid]
-    call tm_wu64
-    lea rsi, [tm_l_ms]
-    call tm_wcstr
-    lea rsi, [tm_t0s]
-    lea rdx, [tm_cs]
-    call tm_diff2
-    call tm_wu64
-    lea rsi, [tm_l_nl]
-    call tm_wcstr
-    call tm_wflush
-tmfr_ret:
-    TM_POP
-    ret
-
-; tm_resolve_name: tm_opname = method, or tool for tools/call (mirrors
-; do_call: params.name at depth, decoys ignored by the same find_val).
-tm_resolve_name:
-    TM_PUSH
-    mov rax, [lp]
-    add rax, [ll]
-    mov [le], rax
-    lea rsi, [tm_l_unknown]
-    lea rdi, [tm_opname]
-    mov rcx, 8
-tmrn_cpy:
-    mov al, [rsi]
-    mov [rdi], al
-    inc rsi
-    inc rdi
-    dec rcx
-    jnz tmrn_cpy
-    mov qword [tm_opnamelen], 7
-    mov rsi, [lp]
-    lea rdi, [k_method]
-    mov ecx, 8
-    call find_val
-    test rax, rax
-    jz tmrn_fvfail
-    mov rsi, rax
-    lea rdi, [tm_opname]
-    mov ecx, 31
-    call parse_str
-    test rax, rax
-    jz tmrn_pfail
-    test rdx, rdx
-    jz tmrn_sanitize
-    cmp rdx, 31
-    ja tmrn_sanitize
-    mov [tm_opnamelen], rdx
-    lea rsi, [tm_opname]
-    mov rdx, [tm_opnamelen]
-    lea rdi, [m_call]
-    call cmp_name
-    test rax, rax
-    jz tmrn_sanitize
-    mov rsi, [lp]
-    lea rdi, [k_params]
-    mov ecx, 8
-    call find_val
-    test rax, rax
-    jz tmrn_sanitize
-    cmp rax, [le]
-    jae tmrn_sanitize
-    cmp byte [rax], '{'
-    jne tmrn_sanitize
-    mov rsi, rax
-    lea rdi, [k_name]
-    mov ecx, 6
-    call find_val
-    test rax, rax
-    jz tmrn_sanitize
-    cmp rax, [le]
-    jae tmrn_sanitize
-    cmp byte [rax], '"'
-    jne tmrn_sanitize
-    mov rsi, rax
-    lea rdi, [tm_opname]
-    mov ecx, 31
-    call parse_str
-    test rax, rax
-    jz tmrn_sanitize
-    test rdx, rdx
-    jz tmrn_sanitize
-    cmp rdx, 31
-    ja tmrn_sanitize
-    mov [tm_opnamelen], rdx
-    jmp tmrn_sanitize
-tmrn_fvfail:
-    mov byte [tm_opname], 'F'
-    mov byte [tm_opname + 1], 'V'
-    mov byte [tm_opname + 2], 'F'
-    mov byte [tm_opname + 3], 'A'
-    mov byte [tm_opname + 4], 'I'
-    mov byte [tm_opname + 5], 'L'
-    mov qword [tm_opnamelen], 6
-    jmp tmrn_sanitize
-tmrn_pfail:
-    mov byte [tm_opname], 'P'
-    mov byte [tm_opname + 1], 'F'
-    mov byte [tm_opname + 2], 'A'
-    mov byte [tm_opname + 3], 'I'
-    mov byte [tm_opname + 4], 'L'
-    mov byte [tm_opname + 5], 'X'
-    mov qword [tm_opnamelen], 6
-tmrn_sanitize:
-    lea rsi, [tm_opname]
-    mov rcx, [tm_opnamelen]
-tmrn_sloop:
-    test rcx, rcx
-    jz tmrn_ret
-    mov al, [rsi]
-    cmp al, 'a'
-    jb tmrn_notlower
-    cmp al, 'z'
-    jbe tmrn_next
-tmrn_notlower:
-    cmp al, 'A'
-    jb tmrn_notupper
-    cmp al, 'Z'
-    jbe tmrn_next
-tmrn_notupper:
-    cmp al, '0'
-    jb tmrn_notspecial
-    cmp al, '9'
-    jbe tmrn_next
-tmrn_notspecial:
-    cmp al, '_'
-    je tmrn_next
-    cmp al, '/'
-    je tmrn_next
-tmrn_q:
-    mov byte [rsi], '?'
-tmrn_next:
-    inc rsi
-    dec rcx
-    jmp tmrn_sloop
-tmrn_ret:
-    TM_POP
-    ret
-
-; tm_req_start(rsi=line, rdx=len): idle calc, serve stash, name, arm.
-tm_req_start:
-    TM_PUSH
-    cmp qword [tm_on], 0
-    je tmrs_ret
-    mov [lp], rsi
-    mov [ll], rdx
-    call tm_clock
-    lea rsi, [tm_rs]
-    lea rdx, [tm_cs]
-    call tm_diff2
-    mov [tm_idle], rax
-    mov rax, [tm_cs]
-    mov [tm_ss], rax
-    mov rax, [tm_cn]
-    mov [tm_sn], rax
-    mov qword [tm_lock], 0
-    mov qword [tm_fsynct], 0
-    call tm_resolve_name
-    mov qword [tm_armed], 1
-tmrs_ret:
-    TM_POP
-    ret
-
-; tm_req_end: read clock restarts after the response is fully written.
-tm_req_end:
-    TM_PUSH
-    cmp qword [tm_on], 0
-    je tmre_ret
-    call tm_clock
-    mov rax, [tm_cs]
-    mov [tm_rs], rax
-    mov rax, [tm_cn]
-    mov [tm_rn], rax
-tmre_ret:
-    TM_POP
-    ret
-
-; tm_op_end: serve calc + PB line (+ BOOT line once). Consumes arm.
-tm_op_end:
-    TM_PUSH
-    cmp qword [tm_on], 0
-    je tmoe_ret
-    cmp qword [tm_armed], 0
-    je tmoe_ret
-    mov qword [tm_armed], 0
-    call tm_clock
-    call tm_wbegin
-    lea rsi, [tm_l_pb]
-    call tm_wcstr
-    mov rax, [tm_pid]
-    call tm_wu64
-    lea rsi, [tm_l_op]
-    call tm_wcstr
-    lea rsi, [tm_opname]
-    mov rbx, [tm_opnamelen]
-    mov rcx, rbx
-    lea rdi, [tm_buf]
-    add rdi, [tm_cur]
-    rep movsb
-    add [tm_cur], rbx
-    lea rsi, [tm_l_idle]
-    call tm_wcstr
-    mov rax, [tm_idle]
-    call tm_wu64
-    lea rsi, [tm_l_serve]
-    call tm_wcstr
-    lea rsi, [tm_ss]
-    lea rdx, [tm_cs]
-    call tm_diff2
-    call tm_wu64
-    lea rsi, [tm_l_lock]
-    call tm_wcstr
-    mov rax, [tm_lock]
-    call tm_wu64
-    lea rsi, [tm_l_fsync]
-    call tm_wcstr
-    mov rax, [tm_fsynct]
-    call tm_wu64
-    lea rsi, [tm_l_nl]
-    call tm_wcstr
-    call tm_wflush
-    cmp qword [tm_bootdone], 0
-    jne tmoe_ret
-    cmp qword [tm_dbready], 0    ; no database use yet: protocol-only ops
-    je tmoe_ret                  ; must not freeze zero-valued metrics
-    mov qword [tm_bootdone], 1
-    mov eax, 98
-    xor edi, edi
-    lea rsi, [tm_ru1]
-    syscall
-    call tm_wbegin
-    lea rsi, [tm_l_boot]
-    call tm_wcstr
-    mov rax, [tm_pid]
-    call tm_wu64
-    lea rsi, [tm_l_firstop]
-    call tm_wcstr
-    lea rsi, [tm_ss]
-    lea rdx, [tm_cs]
-    call tm_diff2
-    call tm_wu64
-    lea rsi, [tm_l_ensure]
-    call tm_wcstr
-    mov rax, [tm_ensure]
-    call tm_wu64
-    lea rsi, [tm_l_useload]
-    call tm_wcstr
-    mov rax, [tm_useload]
-    call tm_wu64
-    lea rsi, [tm_l_rankboot]
-    call tm_wcstr
-    mov rax, [tm_rankboot]
-    call tm_wu64
-    lea rsi, [tm_l_rindexok]
-    call tm_wcstr
-    mov rax, [rk_idx_ok]
-    call tm_wu64
-    lea rsi, [tm_l_user]
-    call tm_wcstr
-    mov rax, qword [tm_ru1]
-    sub rax, qword [tm_ru0]
-    mov rcx, qword [tm_ru1 + 8]
-    sub rcx, qword [tm_ru0 + 8]
-    jns tmoe_uok
-    dec rax
-    add rcx, 1000000
-tmoe_uok:
-    test rax, rax
-    js tmoe_uzero
-    push rcx
-    imul rax, rax, 1000
-    mov rbx, rax
-    mov rax, rcx
-    xor edx, edx
-    mov ecx, 1000
-    div ecx
-    add rax, rbx
-    pop rcx
-    jmp tmoe_uw
-tmoe_uzero:
-    xor eax, eax
-tmoe_uw:
-    call tm_wu64
-    lea rsi, [tm_l_sys]
-    call tm_wcstr
-    mov rax, qword [tm_ru1 + 16]
-    sub rax, qword [tm_ru0 + 16]
-    mov rcx, qword [tm_ru1 + 24]
-    sub rcx, qword [tm_ru0 + 24]
-    jns tmoe_sok
-    dec rax
-    add rcx, 1000000
-tmoe_sok:
-    test rax, rax
-    js tmoe_szero
-    push rcx
-    imul rax, rax, 1000
-    mov rbx, rax
-    mov rax, rcx
-    xor edx, edx
-    mov ecx, 1000
-    div ecx
-    add rax, rbx
-    pop rcx
-    jmp tmoe_sw
-tmoe_szero:
-    xor eax, eax
-tmoe_sw:
-    call tm_wu64
-    lea rsi, [tm_l_nl]
-    call tm_wcstr
-    call tm_wflush
-tmoe_ret:
-    TM_POP
-    ret
-
-; tm_phase_start / tm_phase_end(rdi=slot): boot-phase brackets.
-tm_phase_start:
-    TM_PUSH
-    cmp qword [tm_on], 0
-    je tmps_ret
-    cmp qword [tm_dbready], 0
-    jne tmps_ret
-    call tm_clock
-    mov rax, [tm_cs]
-    mov [tm_as], rax
-    mov rax, [tm_cn]
-    mov [tm_an], rax
-tmps_ret:
-    TM_POP
-    ret
-tm_phase_end:
-    TM_PUSH
-    cmp qword [tm_on], 0
-    je tmpe_ret
-    cmp qword [tm_dbready], 0
-    jne tmpe_ret
-    push rdi
-    call tm_clock
-    lea rsi, [tm_as]
-    lea rdx, [tm_cs]
-    call tm_diff2
-    pop rdi
-    add [rdi], rax
-tmpe_ret:
-    TM_POP
-    ret
-
-; tm_fb_t0 / tm_fb_t1: feedback persist/train split + FB line.
-tm_fb_t0:
-    TM_PUSH
-    cmp qword [tm_on], 0
-    je tmf0_ret
-    mov qword [tm_fbs], 0
-    call tm_clock
-    mov rax, [tm_cs]
-    mov [tm_fb0s], rax
-    mov rax, [tm_cn]
-    mov [tm_fb0n], rax
-tmf0_ret:
-    TM_POP
-    ret
-tm_fb_t1:
-    TM_PUSH
-    cmp qword [tm_on], 0
-    je tmf1_ret
-    call tm_clock
-    lea rsi, [tm_ss]
-    lea rdx, [tm_fb0s]
-    call tm_diff2
-    mov [tm_fbp], rax
-    lea rsi, [tm_fb0s]
-    lea rdx, [tm_cs]
-    call tm_diff2
-    mov [tm_fbt], rax
-    call tm_wbegin
-    lea rsi, [tm_l_fb]
-    call tm_wcstr
-    mov rax, [tm_pid]
-    call tm_wu64
-    lea rsi, [tm_l_persist]
-    call tm_wcstr
-    mov rax, [tm_fbp]
-    call tm_wu64
-    lea rsi, [tm_l_train]
-    call tm_wcstr
-    mov rax, [tm_fbt]
-    call tm_wu64
-    lea rsi, [tm_l_save]
-    call tm_wcstr
-    mov rax, [tm_fbs]
-    call tm_wu64
-    lea rsi, [tm_l_nl]
-    call tm_wcstr
-    call tm_wflush
-tmf1_ret:
-    TM_POP
-    ret
-
-; tm_save_start / tm_save_end: checkpoint-save bracket (rank_train only).
-tm_save_start:
-    TM_PUSH
-    cmp qword [tm_on], 0
-    je tmss_ret
-    call tm_clock
-    mov rax, [tm_cs]
-    mov [tm_fs], rax
-    mov rax, [tm_cn]
-    mov [tm_fn], rax
-tmss_ret:
-    TM_POP
-    ret
-tm_save_end:
-    TM_PUSH
-    cmp qword [tm_on], 0
-    je tmse_ret
-    call tm_clock
-    lea rsi, [tm_fs]
-    lea rdx, [tm_cs]
-    call tm_diff2
-    mov [tm_fbs], rax
-tmse_ret:
-    TM_POP
-    ret
-
-; tm_flock(rdi=fd, esi=op) / tm_fsync(rdi=fd): timed lock/sync.
-; rax=result. All GP except rax preserved; flags clobbered (all sites
-; re-test rax, as before).
-tm_flock:
-    push rbx
-    push rbp
-    push r12
-    push r13
-    push r14
-    push r15
-    push r8
-    push r9
-    push r10
-    push r11
-    push rcx
-    push rdx
-    push rsi
-    push rdi
-    mov ebx, edi
-    mov r10d, esi
-    cmp qword [tm_on], 0
-    je tmfl_plain
-    call tm_clock
-    mov rax, [tm_cs]
-    mov [tm_bs], rax
-    mov rax, [tm_cn]
-    mov [tm_bn], rax
-    mov eax, 73
-    mov rdi, rbx
-    mov esi, r10d
-    syscall
-    mov [tm_ret], rax
-    call tm_clock
-    lea rsi, [tm_bs]
-    lea rdx, [tm_cs]
-    call tm_diff2
-    add [tm_lock], rax
-    mov rax, [tm_ret]
-    jmp tmfl_out
-tmfl_plain:
-    mov eax, 73
-    mov rdi, rbx
-    mov esi, r10d
-    syscall
-tmfl_out:
-    pop rdi
-    pop rsi
-    pop rdx
-    pop rcx
-    pop r11
-    pop r10
-    pop r9
-    pop r8
-    pop r15
-    pop r14
-    pop r13
-    pop r12
-    pop rbp
-    pop rbx
-    ret
-tm_fsync:
-    push rbx
-    push rbp
-    push r12
-    push r13
-    push r14
-    push r15
-    push r8
-    push r9
-    push r10
-    push r11
-    push rcx
-    push rdx
-    push rsi
-    push rdi
-    mov ebx, edi
-    cmp qword [tm_on], 0
-    je tmfs_plain
-    call tm_clock
-    mov rax, [tm_cs]
-    mov [tm_bs], rax
-    mov rax, [tm_cn]
-    mov [tm_bn], rax
-    mov eax, 74
-    mov rdi, rbx
-    syscall
-    mov [tm_ret], rax
-    call tm_clock
-    lea rsi, [tm_bs]
-    lea rdx, [tm_cs]
-    call tm_diff2
-    add [tm_fsynct], rax
-    mov rax, [tm_ret]
-    jmp tmfs_out
-tmfs_plain:
-    mov eax, 74
-    mov rdi, rbx
-    syscall
-tmfs_out:
-    pop rdi
-    pop rsi
-    pop rdx
-    pop rcx
-    pop r11
-    pop r10
-    pop r9
-    pop r8
-    pop r15
-    pop r14
-    pop r13
-    pop r12
-    pop rbp
-    pop rbx
-    ret
-
-; ---- canonical state directory (PEABRAIN_STATE_DIR, else ~/.local/share/peabrain) ----
-; Resolved once at boot (st_resolve); dbpath/jpath/dbdirb + default model
-; paths derive from it. Legacy exe-dir/CWD locations are only STATed for
-; the fresh-install guard — never opened. Fatal errors exit(1) with a
-; stderr message; success preserves all GP registers and flags.
-ST_SMAX = 240
-
-; st_fatal(rsi=msg cstr, rdx=path or 0, rcx=pathlen): stderr + exit(1).
-st_fatal:
-    sub rsp, 32
-    mov [rsp], rsi
-    mov [rsp + 8], rdx
-    mov [rsp + 16], rcx
-    lea rsi, [st_e_prefix]
-    call st_wcstr
-    mov rsi, [rsp]
-    call st_wcstr
-    mov rdx, [rsp + 8]
-    test rdx, rdx
-    jz stf_nl
-    mov byte [st_brk], ' '
-    mov byte [st_brk + 1], '['
-    mov eax, 1
-    mov edi, 2
-    lea rsi, [st_brk]
-    mov edx, 2
-    syscall
-    mov rsi, [rsp + 8]
-    mov rdx, [rsp + 16]
-    mov eax, 1
-    mov edi, 2
-    syscall
-    mov byte [st_brk], ']'
-    mov eax, 1
-    mov edi, 2
-    lea rsi, [st_brk]
-    mov edx, 1
-    syscall
-stf_nl:
-    mov eax, 1
-    mov edi, 2
-    lea rsi, [st_e_nl]
-    mov edx, 1
-    syscall
-    mov eax, 60
-    mov edi, 1
-    syscall
-; st_wcstr(rsi=cstr): stderr bytes. Clobbers rax,rcx,rdx,rdi.
-st_wcstr:
-    push rsi
-    xor ecx, ecx
-stw_len:
-    cmp byte [rsi + rcx], 0
-    je stw_go
-    inc rcx
-    jmp stw_len
-stw_go:
-    mov rdx, rcx
-    pop rsi
-    mov eax, 1
-    mov edi, 2
-    syscall
-    ret
-; st_strlen(rsi): rdx=len (to NUL, cap 1104). Preserves all but rdx/rcx.
-st_strlen:
-    push rax
-    push rcx
-    push rsi
-    xor edx, edx
-sts_loop:
-    cmp edx, 1104
-    jae sts_done
-    cmp byte [rsi + rdx], 0
-    je sts_done
-    inc rdx
-    jmp sts_loop
-sts_done:
-    pop rsi
-    pop rcx
-    pop rax
-    ret
-; st_findkey(rsi=key cstr with '=', rcx=keylen): anchored environ search.
-; rax=1 found (rsi=val, rdx=vallen, possibly 0) else rax=0. Preserves all
-; GP except rax,rsi,rdx,rcx.
-st_findkey:
-    push rbx
-    push rdi
-    push r8
-    push r9
-    push r10
-    mov r8, rsi
-    mov r9, rcx
-    lea rbx, [st_ebuf]
-    mov r10, [st_ebulen]
-    test r10, r10
-    jz stk_miss
-    lea r10, [rbx + r10]
-stk_entry:
-    cmp rbx, r10
-    jae stk_miss
-    mov rsi, rbx
-    mov rdi, r8
-    mov rcx, r9
-    repe cmpsb
-    jne stk_next
-    mov rsi, rbx
-    add rsi, r9
-    mov rdx, rsi
-stk_vlen:
-    cmp rdx, r10
-    jae stk_vdone
-    cmp byte [rdx], 0
-    je stk_vdone
-    inc rdx
-    jmp stk_vlen
-stk_vdone:
-    sub rdx, rsi
-    mov eax, 1
-    pop r10
-    pop r9
-    pop r8
-    pop rdi
-    pop rbx
-    ret
-stk_next:
-    mov rsi, rbx
-stk_skip:
-    cmp rsi, r10
-    jae stk_miss
-    cmp byte [rsi], 0
-    je stk_adv
-    inc rsi
-    jmp stk_skip
-stk_adv:
-    lea rbx, [rsi + 1]
-    jmp stk_entry
-stk_miss:
-    xor eax, eax
-    pop r10
-    pop r9
-    pop r8
-    pop rdi
-    pop rbx
-    ret
-; st_checkdir(rdi=fd): verify dir fd is owner-only 0700. rax 0 ok / 1 bad.
-; Preserves all GP except rax,rcx,rdx.
-st_checkdir:
-    push rbx
-    mov eax, 5
-    lea rsi, [st_statb]
-    syscall
-    test rax, rax
-    js stc_bad
-    mov eax, 102
-    syscall
-    mov ebx, eax
-    mov eax, dword [st_statb + 28]
-    cmp eax, ebx
-    jne stc_bad
-    mov eax, dword [st_statb + 24]
-    and eax, 0xFFF
-    cmp eax, 448
-    jne stc_bad
-    xor eax, eax
-    pop rbx
-    ret
-stc_bad:
-    mov eax, 1
-    pop rbx
-    ret
-; st_resolve: canonical state directory, once at boot. dbpath/jpath/dbdirb
-; + default model paths derive from it. Legacy locations are only STATed
-; for the fresh-install guard, never opened. Fatal errors exit(1).
-; Preserves all GP registers and flags on success.
-st_resolve:
-    push rax
-    push rbx
-    push rcx
-    push rdx
-    push rsi
-    push rdi
-    push rbp
-    push r8
-    push r9
-    push r10
-    push r11
-    push r12
-    push r13
-    push r14
-    push r15
-    pushfq
-    mov eax, 257
-    mov rdi, -100
-    lea rsi, [tm_envpath]
-    xor edx, edx
-    xor r10d, r10d
-    syscall
-    test rax, rax
-    js str_noenv
-    mov r12d, eax
-    xor r13d, r13d
-str_envrd:
-    cmp r13d, 4100
-    jae str_envdone
-    mov eax, 0
-    mov rdi, r12
-    lea rsi, [st_ebuf]
-    add rsi, r13
-    mov edx, 4100
-    sub edx, r13d
-    syscall
-    test rax, rax
-    jle str_envdone
-    add r13d, eax
-    jmp str_envrd
-str_envdone:
-    mov eax, 3
-    mov rdi, r12
-    syscall
-    mov [st_ebulen], r13
-    jmp str_envok
-str_noenv:
-    mov qword [st_ebulen], 0
-str_envok:
-    lea rsi, [st_key_state]
-    mov ecx, st_key_statelen
-    call st_findkey
-    test rax, rax
-    jz str_home
-    test rdx, rdx
-    jz str_home
-    cmp rdx, ST_SMAX
-    ja str_toolong
-    lea rdi, [st_dir]
-    mov rcx, rdx
-    rep movsb
-    mov [st_dirlen], rdx
-    jmp str_havedir
-str_home:
-    lea rsi, [st_key_home]
-    mov ecx, st_key_homelen
-    call st_findkey
-    test rax, rax
-    jz str_nohome
-    test rdx, rdx
-    jz str_nohome
-    mov rbx, rdx
-    add rbx, st_suffixlen
-    cmp rbx, ST_SMAX
-    ja str_toolong
-    lea rdi, [st_dir]
-    mov rcx, rdx
-    rep movsb
-    lea rsi, [st_suffix]
-    mov rcx, st_suffixlen
-    rep movsb
-    mov [st_dirlen], rbx
-    jmp str_havedir
-str_nohome:
-    lea rsi, [st_e_nohome]
-    xor edx, edx
-    call st_fatal
-str_toolong:
-    lea rsi, [st_e_toolong]
-    xor edx, edx
-    call st_fatal
-str_havedir:
-    mov rax, [st_dirlen]
-    cmp rax, 1
-    jbe str_opendir
-    lea rsi, [st_dir]
-    cmp byte [rsi + rax - 1], '/'
-    jne str_opendir
-    dec rax
-    mov [st_dirlen], rax
-    mov byte [rsi + rax], 0
-    jmp str_opendir
-str_opendir:
-    mov rax, [st_dirlen]
-    lea rsi, [st_dir]
-    mov byte [rsi + rax], 0
-    mov eax, 257
-    mov rdi, -100
-    lea rsi, [st_dir]
-    mov edx, 0x10000
-    xor r10d, r10d
-    syscall
-    test rax, rax
-    js str_maybe_create
-    mov rdi, rax
-    push rax
-    call st_checkdir
-    test rax, rax
-    jnz str_badexisting
-    pop rax
-    push rax
-    mov eax, 3
-    pop rdi
-    syscall
-    jmp str_builddb
-str_badexisting:
-    pop rax
-    push rax
-    mov eax, 3
-    pop rdi
-    syscall
-    lea rsi, [st_e_perm]
-    lea rdx, [st_dir]
-    mov rcx, [st_dirlen]
-    call st_fatal
-str_maybe_create:
-    neg rax
-    cmp rax, 2
-    jne str_denied
-    call st_legacy_guard
-    lea rsi, [st_dir]
-    call st_mkdir_each
-    mov eax, 257
-    mov rdi, -100
-    lea rsi, [st_dir]
-    mov edx, 0x10000
-    xor r10d, r10d
-    syscall
-    test rax, rax
-    js str_denied2
-    mov rdi, rax
-    push rax
-    call st_checkdir
-    test rax, rax
-    jnz str_permfail
-    pop rax
-    push rax
-    mov eax, 3
-    pop rdi
-    syscall
-    jmp str_builddb
-str_denied:
-    neg rax
-    push rax
-    lea rsi, [st_e_denied]
-    lea rdx, [st_dir]
-    mov rcx, [st_dirlen]
-    call st_fatal
-str_denied2:
-    lea rsi, [st_e_denied]
-    lea rdx, [st_dir]
-    mov rcx, [st_dirlen]
-    call st_fatal
-str_permfail:
-    pop rax
-    push rax
-    mov eax, 3
-    pop rdi
-    syscall
-    lea rsi, [st_e_perm]
-    lea rdx, [st_dir]
-    mov rcx, [st_dirlen]
-    call st_fatal
-; st_mkdir_each(rsi=NUL-term dir): mkdir -p with mode 0700. Fatal (mkfail)
-; on any real error; EEXIST is fine. Preserves all GP except rax,rcx,rdx.
-st_mkdir_each:
-    push rbx
-    push rsi
-    push rdi
-    push r8
-    push r9
-    lea r8, [st_tmp]
-    mov r9, rsi
-stmk_copy:
-    mov al, [rsi]
-    mov [r8], al
-    test al, al
-    jz stmk_walk
-    inc rsi
-    inc r8
-    jmp stmk_copy
-stmk_walk:
-    lea r8, [st_tmp]
-    cmp byte [r8], '/'
-    jne stmk_next
-    inc r8
-stmk_next:
-    cmp byte [r8], 0
-    je stmk_full
-    cmp byte [r8], '/'
-    jne stmk_adv
-    mov byte [r8], 0
-    mov eax, 83
-    lea rdi, [st_tmp]
-    mov esi, 448
-    syscall
-    test rax, rax
-    js stmk_maybe
-    mov byte [r8], '/'
-    jmp stmk_adv2
-stmk_maybe:
-    neg rax
-    cmp rax, 17
-    je stmk_restore
-    lea rsi, [st_e_mkfail]
-    lea rdx, [st_tmp]
-    mov rcx, r8
-    lea r9, [st_tmp]
-    sub rcx, r9
-    call st_fatal
-stmk_restore:
-    mov byte [r8], '/'
-stmk_adv2:
-    inc r8
-    jmp stmk_next
-stmk_adv:
-    inc r8
-    jmp stmk_next
-stmk_full:
-    mov eax, 83
-    lea rdi, [st_tmp]
-    mov esi, 448
-    syscall
-    test rax, rax
-    js stmk_fullmaybe
-    pop r9
-    pop r8
-    pop rdi
-    pop rsi
-    pop rbx
-    xor eax, eax
-    ret
-stmk_fullmaybe:
-    neg rax
-    cmp rax, 17
-    je stmk_ok
-    lea rsi, [st_e_mkfail]
-    lea rdi, [st_tmp]
-    mov rdx, rdi
-    call st_strlen
-    mov rcx, rdx
-    mov rdx, rdi
-    lea rsi, [st_e_mkfail]
-    call st_fatal
-stmk_ok:
-    pop r9
-    pop r8
-    pop rdi
-    pop rsi
-    pop rbx
-    xor eax, eax
-    ret
-str_builddb:
-    mov rax, [st_dirlen]
-    lea rsi, [st_dir]
-    lea rdi, [dbpath]
-    mov rcx, rax
-    rep movsb
-    mov byte [rdi], '/'
-    inc rdi
-    inc rax
-    lea rsi, [dbfile]
-    mov ecx, 12
-    rep movsb
-    mov byte [rdi], 0
-    add rax, 12
-    mov [dblen], rax
-    mov eax, 4
-    lea rdi, [dbpath]
-    lea rsi, [st_statb]
-    syscall
-    test rax, rax
-    jz str_pbmdpaths
-    neg rax
-    cmp rax, 2
-    jne str_dbdenied
-    call st_legacy_guard
-    jmp str_pbmdpaths
-str_dbdenied:
-    lea rsi, [dbpath]
-    call st_strlen
-    mov rcx, rdx
-    lea rdx, [dbpath]
-    lea rsi, [st_e_denied]
-    call st_fatal
-str_pbmdpaths:
-    lea rsi, [st_dir]
-    lea rdi, [st_pbmd]
-    mov rcx, [st_dirlen]
-    rep movsb
-    mov byte [rdi], '/'
-    inc rdi
-    lea rsi, [md_defpath]
-    call st_wcstr2
-    lea rsi, [st_dir]
-    lea rdi, [st_rkpb]
-    mov rcx, [st_dirlen]
-    rep movsb
-    mov byte [rdi], '/'
-    inc rdi
-    lea rsi, [rk_pbpath]
-    call st_wcstr2
-    popfq
-    pop r15
-    pop r14
-    pop r13
-    pop r12
-    pop r11
-    pop r10
-    pop r9
-    pop r8
-    pop rbp
-    pop rdi
-    pop rsi
-    pop rdx
-    pop rcx
-    pop rbx
-    pop rax
-    ret
-; st_wcstr2(rsi=cstr, rdi=dst): copy incl NUL. Clobbers rax,rcx.
-st_wcstr2:
-    xor ecx, ecx
-stw2_loop:
-    mov al, [rsi + rcx]
-    mov [rdi + rcx], al
-    test al, al
-    jz stw2_done
-    inc rcx
-    jmp stw2_loop
-stw2_done:
-    ret
-; st_legacy_guard: refuse when a populated legacy store exists while the
-; canonical database is absent. Best-effort probes; preserves all GP.
-st_legacy_guard:
-    push rax
-    push rbx
-    push rcx
-    push rdx
-    push rsi
-    push rdi
-    push r8
-    push r9
-    push r10
-    push r11
-    push r12
-    push r13
-    push r14
-    push r15
-    pushfq
-    mov eax, 89
-    lea rdi, [dbexe]
-    lea rsi, [exebuf]
-    mov edx, 1024
-    syscall
-    cmp rax, 0
-    jle stlg_cwd
-    mov rcx, rax
-    lea r10, [exebuf]
-stlg_sl:
-    dec rcx
-    js stlg_cwd
-    cmp byte [r10 + rcx], '/'
-    jne stlg_sl
-    lea rsi, [exebuf]
-    lea rdi, [st_tmp]
-    mov rdx, rcx
-    inc rdx
-    mov rcx, rdx
-    rep movsb
-    lea rsi, [dbfile]
-    mov ecx, 13
-    rep movsb
-    lea rdi, [st_tmp]
-    mov eax, 4
-    lea rsi, [st_statb]
-    syscall
-    test rax, rax
-    jnz stlg_cwd
-    mov rax, qword [st_statb + 48]
-    test rax, rax
-    jz stlg_cwd
-    jmp stlg_found
-stlg_cwd:
-    mov eax, 79
-    lea rdi, [st_tmp]
-    mov esi, 1104
-    syscall
-    test rax, rax
-    js stlg_done
-    lea rsi, [st_tmp]
-    call st_strlen
-    lea rdi, [st_tmp]
-    add rdi, rdx
-    mov byte [rdi], '/'
-    inc rdi
-    inc rdx
-    lea rsi, [dbfile]
-    mov ecx, 13
-    rep movsb
-    lea rdi, [st_tmp]
-    mov eax, 4
-    lea rsi, [st_statb]
-    syscall
-    test rax, rax
-    jnz stlg_done
-    mov rax, qword [st_statb + 48]
-    test rax, rax
-    jz stlg_done
-stlg_found:
-    popfq
-    pop r15
-    pop r14
-    pop r13
-    pop r12
-    pop r11
-    pop r10
-    pop r9
-    pop r8
-    pop rdi
-    pop rsi
-    pop rdx
-    pop rcx
-    pop rbx
-    pop rax
-    lea rsi, [st_dir]
-    lea rdi, [st_ebuf]
-    mov rcx, [st_dirlen]
-    rep movsb
-    mov byte [rdi], ' '
-    mov byte [rdi + 1], '='
-    mov byte [rdi + 2], '>'
-    mov byte [rdi + 3], ' '
-    add rdi, 4
-    push rdi
-    lea rsi, [st_tmp]
-    call st_strlen
-    mov rcx, rdx
-    pop rdi
-    lea rsi, [st_tmp]
-    rep movsb
-    mov rax, [st_dirlen]
-    add rax, 4
-    add rax, rdx
-    mov rcx, rax
-    lea rdx, [st_ebuf]
-    lea rsi, [st_e_legacy]
-    call st_fatal
-stlg_done:
-    popfq
-    pop r15
-    pop r14
-    pop r13
-    pop r12
-    pop r11
-    pop r10
-    pop r9
-    pop r8
-    pop rdi
-    pop rsi
-    pop rdx
-    pop rcx
-    pop rbx
-    pop rax
-    ret
-
-; ---- continual-learning ranker (shadow mode) ----
-; Design: snapshot deterministic features at RETRIEVAL time (rank_snap_hook);
-; explicit useful/misleading feedback joins the snapshot (rank_capture) into a
-; labelled example persisted in the rankex table (rank_persist) and trained
-; incrementally (rank_train). Training consumes ONLY snapshot-time features:
-; slot counters are never re-read after feedback, so the model cannot learn
-; from the answer it is supposed to predict. All routines best-effort: they
-; never fail the outer op. Reject reasons (rk_rej): 0 no_snapshot, 1 stale,
-; 2 tombstone, 3 invalid, 4 store_full, 5 model_owned.
-; Ownership (safeguard): rank automation runs only while [rk_owned]==0.
-; Any successful model_init/model_load sets rk_owned=1: the ranker then
-; trains nothing, loads nothing, saves nothing, infers nothing.
-
-; rank_feat(rdx=slot): eax=x0bits, edx=x1bits (f32).
-; x0 = clamp(pos-neg,-8,8)/8 (net endorsement).
-; x1 = .5*recency + .25*access/32 + .25*conf/64 (freshness/standing).
-; Clobbers rax,rcx,xmm0-2. Destroys rdx (edx is the x1 return).
-rank_feat:
-    mov eax, dword [utick]
-    sub eax, [rdx + 24]
-    cmp eax, 1024
-    jae rkf_rec0
-    mov ecx, 1024
-    sub ecx, eax
-    cvtsi2ss xmm1, ecx
-    divss xmm1, [rk_f1024]
-    jmp rkf_recok
-rkf_rec0:
-    xorps xmm1, xmm1
-rkf_recok:
-    mulss xmm1, [rk_f05]
-    mov eax, [rdx + 12]
-    mov ecx, 32
-    cmp eax, ecx
-    cmovae eax, ecx
-    cvtsi2ss xmm0, eax
-    divss xmm0, [rk_f32]
-    mulss xmm0, [rk_f025]
-    addss xmm1, xmm0
-    movzx eax, word [rdx + 28]
-    mov ecx, 64
-    cmp eax, ecx
-    cmovae eax, ecx
-    cvtsi2ss xmm0, eax
-    divss xmm0, [rk_f64]
-    mulss xmm0, [rk_f025]
-    addss xmm1, xmm0
-    mov eax, [rdx + 16]
-    sub eax, [rdx + 20]
-    mov ecx, 8
-    cmp eax, ecx
-    cmovg eax, ecx
-    mov ecx, -8
-    cmp eax, ecx
-    cmovl eax, ecx
-    cvtsi2ss xmm0, eax
-    divss xmm0, [rk_f8]
-    movd eax, xmm0
-    movd edx, xmm1
-    ret
-
-; rank_snap_hook(): snapshot the current search hit. Inputs [rksmode]
-; (0/1/2 table mode), [rkscore], [scurpg], [stcoff]. Re-parses the current
-; cell (pagebuf holds the restored scan page here) so it depends on no stale
-; scan state. Identity-grouped holdout: held=((key>>4)+(h2>>4)+kind)%10==0,
-; stable per memory across restarts. (Shifted: FNV-1a64 and FNV-1-32 share
-; the same mod-2 recurrence, so raw low bits are always even.) Preserves
-; ALL general registers.
-rank_snap_hook:
-    push rax
-    push rbx
-    push rcx
-    push rdx
-    push rsi
-    push rdi
-    push rbp
-    push r8
-    push r9
-    push r10
-    push r11
-    push r12
-    push r13
-    push r14
-    push r15
-    sub rsp, 48
-    lea rsi, [pagebuf]
-    add rsi, [stcoff]
-    call parse_row
-    test rax, rax
-    jnz rksh_done
-    cmp qword [rksmode], 1
-    je rksh_obs
-    cmp qword [gcols], 1
-    jb rksh_done
-    mov rsi, qword [gfo]
-    mov rdx, qword [gfl]
-    cmp rdx, 1
-    jb rksh_done
-    cmp rdx, 128
-    ja rksh_done
-    mov [rsp], rsi
-    mov [rsp + 8], rdx
-    mov rax, [rksmode]
-    mov [rsp + 16], rax
-    mov rdi, rax
-    call ukey_name
-    mov [rsp + 24], rbx
-    mov [rsp + 32], r8d
-    mov rax, rbx
-    shr rax, 4
-    mov ecx, [rsp + 32]
-    shr ecx, 4
-    add rax, rcx
-    add rax, [rsp + 16]
-    xor edx, edx
-    mov rcx, 10
-    div rcx
-    test rdx, rdx
-    setz al
-    mov [rsp + 36], al
-    mov rdi, [rsp + 16]
-    mov rsi, [rsp]
-    mov rdx, [rsp + 8]
-    call use_slot_name
-    jmp rksh_feat
-rksh_obs:
-    mov rax, [growid]
-    test rax, rax
-    jz rksh_done
-    mov rdi, 1
-    mov rsi, rax
-    call ukey_rowid
-    mov [rsp + 24], rbx
-    mov [rsp + 32], r8d
-    mov qword [rsp + 16], 1
-    mov rax, rbx
-    shr rax, 4
-    mov ecx, r8d
-    shr ecx, 4
-    add rax, rcx
-    add rax, 1
-    xor edx, edx
-    mov rcx, 10
-    div rcx
-    test rdx, rdx
-    setz al
-    mov [rsp + 36], al
-    mov rdi, 1
-    mov rsi, [growid]
-    call use_slot_id
-rksh_feat:
-    test rax, rax
-    jz rksh_nofeat
-    call rank_feat
-    jmp rksh_storefeat
-rksh_nofeat:
-    xor eax, eax
-    xor edx, edx
-rksh_storefeat:
-    mov [rsp + 40], eax
-    mov [rsp + 44], edx
-    mov rcx, [rk_snaphead]
-    and rcx, 255
-    imul rcx, rcx, 48
-    lea rdi, [rk_snap]
-    add rdi, rcx
-    mov rax, [rsp + 16]
-    mov [rdi], rax
-    mov rax, [rsp + 24]
-    mov [rdi + 8], rax
-    mov eax, [rsp + 32]
-    mov [rdi + 16], eax
-    mov al, [rsp + 36]
-    mov [rdi + 20], al
-    mov eax, [rsp + 40]
-    mov [rdi + 24], eax
-    mov eax, [rsp + 44]
-    mov [rdi + 28], eax
-    mov rax, [rkscore]
-    mov [rdi + 32], rax
-    mov eax, dword [utick]
-    mov [rdi + 40], rax
-    inc qword [rk_snaphead]
-rksh_done:
-    add rsp, 48
-    pop r15
-    pop r14
-    pop r13
-    pop r12
-    pop r11
-    pop r10
-    pop r9
-    pop r8
-    pop rbp
-    pop rdi
-    pop rsi
-    pop rdx
-    pop rcx
-    pop rbx
-    pop rax
-    ret
-
-; rank_join_scan(rdi=kind, r9=key, r10d=h2): newest-first ring scan.
-; rax=1 hit ([rk_jx0],[rk_jx1],[rk_jdet],[rk_jheld] set) else 0 (rej counted).
-rank_join_scan:
-    push rbx
-    push rcx
-    push rdx
-    mov rcx, [rk_snaphead]
-    mov ebx, 256
-rkjs_loop:
-    test ebx, ebx
-    jz rkjs_miss
-    dec rcx
-    mov rax, rcx
-    and rax, 255
-    imul rax, rax, 48
-    lea rdx, [rk_snap]
-    add rdx, rax
-    cmp [rdx], rdi
-    jne rkjs_next
-    cmp [rdx + 8], r9
-    jne rkjs_next
-    cmp [rdx + 16], r10d
-    jne rkjs_next
-    mov eax, dword [utick]
-    sub eax, [rdx + 40]
-    cmp eax, 4096
-    ja rkjs_stale
-    mov eax, [rdx + 24]
-    mov dword [rk_jx0], eax
-    mov eax, [rdx + 28]
-    mov dword [rk_jx1], eax
-    mov rax, [rdx + 32]
-    mov [rk_jdet], rax
-    mov al, [rdx + 20]
-    mov [rk_jheld], al
-    mov eax, 1
-    pop rdx
-    pop rcx
-    pop rbx
-    ret
-rkjs_next:
-    dec ebx
-    jmp rkjs_loop
-rkjs_miss:
-    inc qword [rk_rej]
-    xor eax, eax
-    pop rdx
-    pop rcx
-    pop rbx
-    ret
-rkjs_stale:
-    inc qword [rk_rej + 8]
-    xor eax, eax
-    pop rdx
-    pop rcx
-    pop rbx
-    ret
-
-; rank_join_name(rdi=kind, rsi=name, rdx=len): join helper. rax as scan.
-rank_join_name:
-    push rbx
-    push rcx
-    push rsi
-    push rdi
-    push r8
-    push r9
-    push r10
-    push r11
-    mov r11, rdi
-    call ukey_name
-    mov r9, rbx
-    mov r10d, r8d
-    mov rdi, r11
-    call rank_join_scan
-    pop r11
-    pop r10
-    pop r9
-    pop r8
-    pop rdi
-    pop rsi
-    pop rcx
-    pop rbx
-    ret
-
-; rank_join_obs(rsi=rowid): join helper for observations. rax as scan.
-rank_join_obs:
-    push rbx
-    push rcx
-    push rdx
-    push rdi
-    push r8
-    push r9
-    push r10
-    push r11
-    mov rdi, 1
-    call ukey_rowid
-    mov r9, rbx
-    mov r10d, r8d
-    mov rdi, 1
-    call rank_join_scan
-    pop r11
-    pop r10
-    pop r9
-    pop r8
-    pop rdi
-    pop rdx
-    pop rcx
-    pop rbx
-    ret
-
-; rank_capture(): join feedback identity to a retrieval snapshot and persist
-; the labelled example. Called after use_flush (DB open, op state restored).
-; Uses [fbkind],[fbsig],[rsnbuf]/[rsnlen]/[fbobsid]. Preserves all registers.
-rank_capture:
-    push rax
-    push rbx
-    push rcx
-    push rdx
-    push rsi
-    push rdi
-    push rbp
-    push r8
-    push r9
-    push r10
-    push r11
-    push r12
-    push r13
-    push r14
-    push r15
-    cmp qword [rk_owned], 1
-    je rkap_owned
-    cmp qword [fbkind], 1
-    je rkap_obs
-    mov rdi, [fbkind]
-    lea rsi, [rsnbuf]
-    mov rdx, [rsnlen]
-    call rank_join_name
-    jmp rkap_joined
-rkap_obs:
-    mov rsi, [fbobsid]
-    call rank_join_obs
-rkap_joined:
-    test rax, rax
-    jz rkap_done
-    call rank_persist
-    test rax, rax
-    jnz rkap_full
-    mov rax, [rk_next]
-    mov rcx, rax
-    and rcx, 4095
-    imul rcx, rcx, 24
-    lea rdi, [rk_mem]
-    add rdi, rcx
-    mov eax, dword [rk_jx0]
-    mov [rdi], eax
-    mov eax, dword [rk_jx1]
-    mov [rdi + 4], eax
-    mov rax, [rk_jdet]
-    mov [rdi + 8], rax
-    cmp qword [fbsig], 1
-    jne rkap_t0
-    mov eax, 0x3F800000
-    jmp rkap_tok
-rkap_t0:
-    xor eax, eax
-rkap_tok:
-    mov [rdi + 16], eax
-    mov al, [rk_jheld]
-    mov [rdi + 20], al
-    test al, al
-    jz rkap_noheld
-    inc qword [rk_held]
-rkap_noheld:
-    inc qword [rk_next]
-    jmp rkap_done
-rkap_full:
-    inc qword [rk_rej + 32]
-    jmp rkap_done
-rkap_owned:
-    inc qword [rk_rej + 40]
-rkap_done:
-    pop r15
-    pop r14
-    pop r13
-    pop r12
-    pop r11
-    pop r10
-    pop r9
-    pop r8
-    pop rbp
-    pop rdi
-    pop rsi
-    pop rdx
-    pop rcx
-    pop rbx
-    pop rax
-    ret
-
-; rank_persist(): append one rankex row
-; (name,kind,seq,x0,x1,target,det,rev) from feedback memory. DB must be
-; open+locked. Saves/restores op state via svstate (same pattern as
-; use_flush; sequential use, never nested). rax 0 ok / 1 fail.
-rank_persist:
-    cmp qword [rk_dbcount], 4096
-    jae rkp_fullret
-    mov rax, [newrowid]
-    mov qword [svstate], rax
-    mov rax, [maxrowid]
-    mov qword [svstate + 8], rax
-    mov rax, [splitroot]
-    mov qword [svstate + 16], rax
-    mov rax, [ncols]
-    mov qword [svstate + 24], rax
-    lea rsi, [colp]
-    lea rdi, [svstate + 32]
-    mov ecx, 8
-    rep movsq
-    lea rsi, [coll]
-    lea rdi, [svstate + 96]
-    mov ecx, 8
-    rep movsq
-    lea rsi, [gfo]
-    lea rdi, [svstate + 160]
-    mov ecx, 8
-    rep movsq
-    lea rsi, [gfl]
-    lea rdi, [svstate + 224]
-    mov ecx, 8
-    rep movsq
-    mov rdi, [f_root_rankex]
-    call tail_max
-    test rax, rax
-    jnz rkp_abort
-    lea rax, [rsnbuf]
-    mov qword [colp], rax
-    mov rax, [rsnlen]
-    mov qword [coll], rax
-    mov rax, [fbkind]
-    lea rdi, [ukind1]
-    call u64_dec
-    lea rax, [ukind1]
-    mov qword [colp + 8], rax
-    mov qword [coll + 8], rdx
-    mov rax, [rk_next]
-    lea rdi, [unum0]
-    call u64_dec
-    lea rax, [unum0]
-    mov qword [colp + 16], rax
-    mov qword [coll + 16], rdx
-    mov eax, dword [rk_jx0]
-    lea rdi, [unum1]
-    call u64_dec
-    lea rax, [unum1]
-    mov qword [colp + 24], rax
-    mov qword [coll + 24], rdx
-    mov eax, dword [rk_jx1]
-    lea rdi, [unum2]
-    call u64_dec
-    lea rax, [unum2]
-    mov qword [colp + 32], rax
-    mov qword [coll + 32], rdx
-    mov rax, [fbsig]
-    lea rdi, [unum3]
-    call u64_dec
-    lea rax, [unum3]
-    mov qword [colp + 40], rax
-    mov qword [coll + 40], rdx
-    mov rax, [rk_jdet]
-    lea rdi, [unum4]
-    call u64_dec
-    lea rax, [unum4]
-    mov qword [colp + 48], rax
-    mov qword [coll + 48], rdx
-    mov rax, [rk_rev]
-    lea rdi, [rk_num5]
-    call u64_dec
-    lea rax, [rk_num5]
-    mov qword [colp + 56], rax
-    mov qword [coll + 56], rdx
-    mov qword [ncols], 8
-    mov rax, [maxrowid]
-    inc rax
-    mov [newrowid], rax
-    mov [maxrowid], rax
-    call build_record_text
-    mov rax, [f_root_rankex]
-    mov [splitroot], rax
-    call place_cell
-    test rax, rax
-    jnz rkp_abort
-    call hdr_touch
-    test rax, rax
-    jnz rkp_abort
-    inc qword [rk_dbcount]
-    push rax
-    mov rax, [maxrowid]
-    mov qword [svstate + 8], rax
-    jmp rkp_restore
-rkp_abort:
-    mov rdi, [f_root_rankex]
-    call tail_max
-    test rax, rax
-    jnz rkp_abortkeep
-    mov rax, [maxrowid]
-    mov qword [svstate + 8], rax
-rkp_abortkeep:
-    push rax
-    mov rax, 1
-    mov [rsp], rax
-rkp_restore:
-    lea rsi, [svstate + 224]
-    lea rdi, [gfl]
-    mov ecx, 8
-    rep movsq
-    lea rsi, [svstate + 160]
-    lea rdi, [gfo]
-    mov ecx, 8
-    rep movsq
-    lea rsi, [svstate + 96]
-    lea rdi, [coll]
-    mov ecx, 8
-    rep movsq
-    lea rsi, [svstate + 32]
-    lea rdi, [colp]
-    mov ecx, 8
-    rep movsq
-    mov rax, qword [svstate + 24]
-    mov [ncols], rax
-    mov rax, qword [svstate + 16]
-    mov [splitroot], rax
-    mov rax, qword [svstate + 8]
-    mov [maxrowid], rax
-    mov rax, qword [svstate]
-    mov [newrowid], rax
-    pop rax
-    ret
-rkp_fullret:
-    mov eax, 1
-    ret
-
-; rank_train(): bounded incremental training from the in-memory example
-; window (newest-first, skipping held-out). Auto-inits H=4 leaky only when
-; no model is loaded and no user model owns the singleton. Saves weights to
-; rank.pbmd (best effort). Preserves all registers.
-rank_train:
-    push rax
-    push rbx
-    push rcx
-    push rdx
-    push rsi
-    push rdi
-    push rbp
-    push r8
-    push r9
-    push r10
-    push r11
-    push r12
-    push r13
-    push r14
-    push r15
-    cmp qword [rk_owned], 1
-    je rktr_done
-    cmp qword [md_ready], 1
-    je rktr_have
-    mov rcx, 4
-    mov rdx, [rk_seed]
-    mov r8d, 1
-    call md_model_init
-    test rax, rax
-    jnz rktr_memfail
-rktr_have:
-    mov rax, [rk_next]
-    test rax, rax
-    jz rktr_done
-    mov r11, rax
-    cmp r11, 4096
-    jbe rktr_b0
-    sub r11, 4096
-    jmp rktr_b1
-rktr_b0:
-    xor r11d, r11d
-rktr_b1:
-    xor r14d, r14d
-    mov r12, [rk_next]
-    dec r12
-rktr_seq:
-    cmp r12, r11
-    jb rktr_batchok
-    cmp r14, 128
-    jae rktr_batchok
-    mov rax, r12
-    and rax, 4095
-    imul rax, rax, 24
-    lea rsi, [rk_mem]
-    add rsi, rax
-    cmp byte [rsi + 20], 0
-    jne rktr_seqnext
-    mov eax, [rsi]
-    mov ebx, [rsi + 4]
-    mov rcx, r14
-    shl rcx, 3
-    lea rdi, [md_Xbuf]
-    add rdi, rcx
-    mov [rdi], eax
-    mov [rdi + 4], ebx
-    mov eax, [rsi + 16]
-    test eax, eax
-    jz rktr_t0
-    mov eax, 0x3F800000
-    jmp rktr_tok
-rktr_t0:
-    xor eax, eax
-rktr_tok:
-    lea rdi, [md_Tbuf]
-    mov rcx, r14
-    shl rcx, 2
-    add rdi, rcx
-    mov [rdi], eax
-    inc r14
-rktr_seqnext:
-    cmp r12, r11
-    je rktr_batchok
-    dec r12
-    jmp rktr_seq
-rktr_batchok:
-    test r14, r14
-    jz rktr_done
-    mov [md_tn], r14
-    movss xmm0, [rk_lr]
-    movss [md_lr], xmm0
-    mov r15d, 5
-rktr_step:
-    test r15, r15
-    jz rktr_stepsdone
-    lea rdi, [md_Xbuf]
-    lea rsi, [md_Tbuf]
-    mov rdx, r14
-    call md_fwd
-    lea rdi, [md_Xbuf]
-    lea rsi, [md_Tbuf]
-    mov rdx, r14
-    call md_backward
-    call md_sgd
-    inc qword [md_step]
-    dec r15
-    jmp rktr_step
-rktr_stepsdone:
-    mov dword [md_hasloss], 1
-    inc qword [rk_rev]
-    call tm_save_start
-    lea rsi, [st_rkpb]
-    call md_save
-    push rax
-    call tm_save_end
-    pop rax
-rktr_done:
-    pop r15
-    pop r14
-    pop r13
-    pop r12
-    pop r11
-    pop r10
-    pop r9
-    pop r8
-    pop rbp
-    pop rdi
-    pop rsi
-    pop rdx
-    pop rcx
-    pop rbx
-    pop rax
-    ret
-rktr_memfail:
-    inc qword [rk_rej + 40]
-    jmp rktr_done
-
-; rank_try_weights(): file-only auto-load of rank.pbmd iff no model is loaded
-; and no user model owns the singleton. Once per process. No DB needed.
-; Preserves all registers.
-rank_try_weights:
-    push rax
-    push rbx
-    push rcx
-    push rdx
-    push rsi
-    push rdi
-    push rbp
-    push r8
-    push r9
-    push r10
-    push r11
-    push r12
-    push r13
-    push r14
-    push r15
-    cmp qword [md_ready], 1
-    je rktw_done
-    cmp qword [rk_owned], 1
-    je rktw_done
-    cmp qword [rk_wtried], 1
-    je rktw_done
-    mov qword [rk_wtried], 1
-    mov eax, 257
-    mov rdi, -100
-    lea rsi, [st_rkpb]
-    mov edx, 0x80000
-    xor r10d, r10d
-    syscall
-    test rax, rax
-    js rktw_done
-    push rax
-    mov rdi, rax
-    mov eax, 3
-    syscall
-    pop rax
-    call md_arena_init
-    test rax, rax
-    jnz rktw_done
-    lea rsi, [st_rkpb]
-    call md_load
-    test rax, rax
-    jnz rktw_done
-    cmp qword [md_nreg], 8
-    jne rktw_done
-    call md_fetch_addrs
-    mov qword [md_ready], 1
-rktw_done:
-    pop r15
-    pop r14
-    pop r13
-    pop r12
-    pop r11
-    pop r10
-    pop r9
-    pop r8
-    pop rbp
-    pop rdi
-    pop rsi
-    pop rdx
-    pop rcx
-    pop rbx
-    pop rax
-    ret
-
-; rank_boot(): once-per-process: refill the example window from rankex, then
-; auto-load rank.pbmd iff no model is loaded and no user model owns the
-; singleton. Called from the db-open path (DB open, tables ensured).
-rank_boot:
-    push rax
-    push rbx
-    push rcx
-    push rdx
-    push rsi
-    push rdi
-    push rbp
-    push r8
-    push r9
-    push r10
-    push r11
-    push r12
-    push r13
-    push r14
-    push r15
-    cmp qword [rk_bootdone], 1
-    je rkb_done0
-    mov qword [rk_bootdone], 1
-    cmp qword [f_root_rankex], 0
-    je rkb_weights
-    mov rdi, [f_root_rankex]
-    call walk_leaves
-    test rax, rax
-    jnz rkb_weights
-    xor r14d, r14d
-rkb_page:
-    cmp r14, [childn]
-    jae rkb_weights
-    lea rsi, [childtab]
-    mov rax, r14
-    shl rax, 3
-    add rsi, rax
-    mov rdi, [rsi]
-    lea rsi, [pagebuf]
-    call pg_read_nc
-    test rax, rax
-    jnz rkb_nextpg
-    cmp byte [pagebuf], 0x0D
-    jne rkb_nextpg
-    lea rsi, [pagebuf + 3]
-    call be16_ld
-    mov r15, rax
-    xor r13d, r13d
-rkb_cell:
-    cmp r13, r15
-    jae rkb_nextpg
-    lea rsi, [pagebuf + 8]
-    mov rax, r13
-    shl rax, 1
-    add rsi, rax
-    call be16_ld
-    lea rsi, [pagebuf]
-    add rsi, rax
-    call parse_row
-    test rax, rax
-    jnz rkb_incc
-    cmp qword [gcols], 8
-    jne rkb_incc
-    sub rsp, 64
-    mov rsi, qword [gfo]
-    mov rdx, qword [gfl]
-    cmp rdx, 1
-    jb rkb_cellbad
-    cmp rdx, 128
-    ja rkb_cellbad
-    mov [rsp], rsi
-    mov [rsp + 8], rdx
-    mov rsi, qword [gfo + 8]
-    mov rdx, qword [gfl + 8]
-    call dec_parse
-    test rax, rax
-    jnz rkb_cellbad
-    cmp rdx, 3
-    ja rkb_cellbad
-    mov [rsp + 16], rdx
-    mov rsi, qword [gfo + 16]
-    mov rdx, qword [gfl + 16]
-    call dec_parse
-    test rax, rax
-    jnz rkb_cellbad
-    mov [rsp + 24], rdx
-    mov rsi, qword [gfo + 24]
-    mov rdx, qword [gfl + 24]
-    call dec_parse
-    test rax, rax
-    jnz rkb_cellbad
-    mov rax, rdx
-    shr rax, 32
-    jnz rkb_cellbad
-    mov [rsp + 32], edx
-    mov rsi, qword [gfo + 32]
-    mov rdx, qword [gfl + 32]
-    call dec_parse
-    test rax, rax
-    jnz rkb_cellbad
-    mov rax, rdx
-    shr rax, 32
-    jnz rkb_cellbad
-    mov [rsp + 36], edx
-    mov eax, [rsp + 32]
-    mov dword [rk_num5], eax
-    mov eax, [rsp + 36]
-    mov dword [rk_num5 + 4], eax
-    lea rsi, [rk_num5]
-    mov rcx, 2
-    call md_checkmag
-    test rax, rax
-    jnz rkb_cellbad
-    mov rsi, qword [gfo + 40]
-    mov rdx, qword [gfl + 40]
-    call dec_parse
-    test rax, rax
-    jnz rkb_cellbad
-    cmp rdx, 1
-    ja rkb_cellbad
-    mov [rsp + 40], rdx
-    mov rsi, qword [gfo + 48]
-    mov rdx, qword [gfl + 48]
-    call dec_parse
-    test rax, rax
-    jnz rkb_cellbad
-    mov rax, rdx
-    shr rax, 32
-    jnz rkb_cellbad
-    mov [rsp + 44], rdx
-    cmp qword [rsp + 16], 1
-    je rkb_obsrow
-    mov rdi, [rsp + 16]
-    mov rsi, [rsp]
-    mov rdx, [rsp + 8]
-    call ukey_name
-    mov r11, rbx
-    mov r10d, r8d
-    jmp rkb_havekey
-rkb_obsrow:
-    mov rsi, [rsp]
-    mov rdx, [rsp + 8]
-    call dec_parse
-    test rax, rax
-    jnz rkb_cellbad
-    test rdx, rdx
-    jz rkb_cellbad
-    mov rsi, rdx
-    mov rdi, 1
-    call ukey_rowid
-    mov r11, rbx
-    mov r10d, r8d
-rkb_havekey:
-    mov rax, r11
-    shr rax, 4
-    mov ecx, r10d
-    shr ecx, 4
-    add rax, rcx
-    add rax, [rsp + 16]
-    xor edx, edx
-    mov rcx, 10
-    div rcx
-    test rdx, rdx
-    setz r12b
-    mov rax, [rsp + 24]
-    cmp rax, [rk_next]
-    jbe rkb_seqok
-    mov [rk_next], rax
-rkb_seqok:
-    cmp qword [rk_dbcount], 4096
-    jae rkb_dbcap
-    mov rcx, [rk_next]
-    and rcx, 4095
-    imul rcx, rcx, 24
-    lea rdi, [rk_mem]
-    add rdi, rcx
-    mov eax, [rsp + 32]
-    mov [rdi], eax
-    mov eax, [rsp + 36]
-    mov [rdi + 4], eax
-    mov rax, [rsp + 44]
-    mov [rdi + 8], rax
-    mov rax, [rsp + 40]
-    test rax, rax
-    jz rkb_bt0
-    mov eax, 0x3F800000
-    jmp rkb_btok
-rkb_bt0:
-    xor eax, eax
-rkb_btok:
-    mov [rdi + 16], eax
-    mov [rdi + 20], r12b
-    test r12b, r12b
-    jz rkb_bnoheld
-    inc qword [rk_held]
-rkb_bnoheld:
-    inc qword [rk_next]
-    inc qword [rk_dbcount]
-    add rsp, 64
-    jmp rkb_incc
-rkb_dbcap:
-    inc qword [rk_bootskip]
-    add rsp, 64
-    jmp rkb_incc
-rkb_cellbad:
-    inc qword [rk_bootskip]
-    add rsp, 64
-rkb_incc:
-    inc r13
-    jmp rkb_cell
-rkb_nextpg:
-    inc r14
-    jmp rkb_page
-rkb_weights:
-    call rank_try_weights
-rkb_done:
-    pop r15
-    pop r14
-    pop r13
-    pop r12
-    pop r11
-    pop r10
-    pop r9
-    pop r8
-    pop rbp
-    pop rdi
-    pop rsi
-    pop rdx
-    pop rcx
-    pop rbx
-    pop rax
-    xor eax, eax
-    ret
-rkb_done0:
-    pop r15
-    pop r14
-    pop r13
-    pop r12
-    pop r11
-    pop r10
-    pop r9
-    pop r8
-    pop rbp
-    pop rdi
-    pop rsi
-    pop rdx
-    pop rcx
-    pop rbx
-    pop rax
-    xor eax, eax
-    ret
-
-; rank_predict1: eax=x0bits, edx=x1bits -> xmm0=prediction. Caller must
-; ensure md_ready==1 and rk_owned==0. Clobbers per md_fwd + xmm0.
-rank_predict1:
-    mov dword [rk_X1], eax
-    mov dword [rk_X1 + 4], edx
-    movss xmm0, [md_lastloss]
-    movss [md_tmpf], xmm0
-    lea rdi, [rk_X1]
-    lea rsi, [rk_T1]
-    mov edx, 1
-    call md_fwd
-    movss xmm0, [md_tmpf]
-    movss [md_lastloss], xmm0
-    movss xmm0, dword [md_Y]
-    ret
-
-; rank_eval: held-out concordance lift (neural minus deterministic) over the
-; newest 128 held-out examples. rax=1 + [rk_liftf] set, else rax=0 (null).
-; Saves/restores md_lastloss. Preserves all general registers.
-rank_eval:
-    push rax
-    push rbx
-    push rcx
-    push rdx
-    push rsi
-    push rdi
-    push rbp
-    push r8
-    push r9
-    push r10
-    push r11
-    push r12
-    push r13
-    push r14
-    push r15
-    call rank_try_weights
-    cmp qword [md_ready], 1
-    jne rkev_null
-    cmp qword [rk_owned], 1
-    je rkev_null
-    movss xmm0, [md_lastloss]
-    movss [md_tmpf], xmm0
-    sub rsp, 3072
-    xor r14d, r14d
-    mov r12, [rk_next]
-    test r12, r12
-    jz rkev_empty
-    dec r12
-    mov r13, [rk_next]
-    cmp r13, 4096
-    jbe rkev_b0
-    sub r13, 4096
-    jmp rkev_b1
-rkev_b0:
-    xor r13d, r13d
-rkev_b1:
-rkev_gather:
-    cmp r12, r13
-    jb rkev_got
-    cmp r14, 128
-    jae rkev_got
-    mov rax, r12
-    and rax, 4095
-    imul rax, rax, 24
-    lea rsi, [rk_mem]
-    add rsi, rax
-    cmp byte [rsi + 20], 0
-    je rkev_gnext
-    mov eax, [rsi]
-    mov dword [rk_X1], eax
-    mov eax, [rsi + 4]
-    mov dword [rk_X1 + 4], eax
-    lea rdi, [rk_X1]
-    lea rsi, [rk_T1]
-    mov edx, 1
-    call md_fwd
-    movss xmm0, dword [md_Y]
-    mov rax, r14
-    shl rax, 2
-    lea rdi, [rk_evalbuf]
-    add rdi, rax
-    movss [rdi], xmm0
-    mov rax, r12
-    and rax, 4095
-    imul rax, rax, 24
-    lea rsi, [rk_mem]
-    add rsi, rax
-    mov rax, [rsi + 8]
-    mov rdx, r14
-    shl rdx, 4
-    lea rdi, [rsp + 1024]
-    add rdi, rdx
-    mov [rdi], rax
-    mov eax, [rsi + 16]
-    mov [rdi + 8], eax
-    inc r14
-rkev_gnext:
-    cmp r12, r13
-    je rkev_got
-    dec r12
-    jmp rkev_gather
-rkev_got:
-    cmp r14, 2
-    jb rkev_empty
-    xor r12d, r12d
-    xor r13d, r13d
-    xor r15d, r15d
-    xor ebx, ebx
-rkev_ploop:
-    cmp rbx, r14
-    jae rkev_pdone
-    mov r10d, ebx
-    inc r10d
-rkev_qloop:
-    cmp r10, r14
-    jae rkev_qnext
-    mov rax, rbx
-    shl rax, 4
-    lea rsi, [rsp + 1024]
-    add rsi, rax
-    mov rax, r10
-    shl rax, 4
-    lea rdi, [rsp + 1024]
-    add rdi, rax
-    mov eax, [rsi + 8]
-    cmp eax, [rdi + 8]
-    je rkev_qinc
-    inc r12d
-    mov rax, rbx
-    shl rax, 2
-    lea rsi, [rk_evalbuf]
-    add rsi, rax
-    movss xmm0, [rsi]
-    mov rax, r10
-    shl rax, 2
-    lea rdi, [rk_evalbuf]
-    add rdi, rax
-    movss xmm1, [rdi]
-    mov rax, rbx
-    shl rax, 4
-    lea rsi, [rsp + 1024]
-    add rsi, rax
-    mov rax, r10
-    shl rax, 4
-    lea rdi, [rsp + 1024]
-    add rdi, rax
-    mov eax, [rsi + 8]
-    cmp eax, [rdi + 8]
-    jg rkev_tpos
-    ucomiss xmm0, xmm1
-    jb rkev_nmatch
-    jmp rkev_ndone
-rkev_tpos:
-    ucomiss xmm0, xmm1
-    ja rkev_nmatch
-    jmp rkev_ndone
-rkev_nmatch:
-    inc r13d
-rkev_ndone:
-    mov rax, [rsi]
-    cmp rax, [rdi]
-    je rkev_qinc
-    mov eax, [rsi + 8]
-    cmp eax, [rdi + 8]
-    jg rkev_dpos
-    cmp rax, [rdi]
-    jb rkev_dmatch
-    jmp rkev_qinc
-rkev_dpos:
-    cmp rax, [rdi]
-    ja rkev_dmatch
-    jmp rkev_qinc
-rkev_dmatch:
-    inc r15d
-rkev_qinc:
-    inc r10
-    jmp rkev_qloop
-rkev_qnext:
-    inc rbx
-    jmp rkev_ploop
-rkev_pdone:
-    test r12d, r12d
-    jz rkev_empty
-    cvtsi2ss xmm0, r13d
-    cvtsi2ss xmm1, r12d
-    divss xmm0, xmm1
-    cvtsi2ss xmm1, r15d
-    cvtsi2ss xmm2, r12d
-    divss xmm1, xmm2
-    subss xmm0, xmm1
-    movss dword [rk_liftf], xmm0
-    movss xmm0, [md_tmpf]
-    movss [md_lastloss], xmm0
-    add rsp, 3072
-    mov eax, 1
-    pop r15
-    pop r14
-    pop r13
-    pop r12
-    pop r11
-    pop r10
-    pop r9
-    pop r8
-    pop rbp
-    pop rdi
-    pop rsi
-    pop rdx
-    pop rcx
-    pop rbx
-    pop rax
-    mov eax, 1
-    ret
-rkev_empty:
-    movss xmm0, [md_tmpf]
-    movss [md_lastloss], xmm0
-    add rsp, 3072
-rkev_null:
-    xor eax, eax
-    pop r15
-    pop r14
-    pop r13
-    pop r12
-    pop r11
-    pop r10
-    pop r9
-    pop r8
-    pop rbp
-    pop rdi
-    pop rsi
-    pop rdx
-    pop rcx
-    pop rbx
-    pop rax
-    xor eax, eax
-    ret
-
-; rank_status_emit(): additive rank fields for model_status. Preserves regs.
-rank_status_emit:
-    push rax
-    push rbx
-    push rcx
-    push rdx
-    push rsi
-    push rdi
-    push rbp
-    push r8
-    push r9
-    push r10
-    push r11
-    push r12
-    push r13
-    push r14
-    push r15
-    lea rsi, [md_jn_rank]
-    call out_cstr
-    cmp qword [rk_owned], 1
-    je rkse_user
-    cmp qword [md_ready], 1
-    je rkse_ranker
-    lea rsi, [rk_v_none]
-    call out_cstr
-    jmp rkse_counts
-rkse_user:
-    lea rsi, [rk_v_user]
-    call out_cstr
-    jmp rkse_counts
-rkse_ranker:
-    lea rsi, [rk_v_ranker]
-    call out_cstr
-rkse_counts:
-    lea rsi, [md_jn_rex]
-    call out_cstr
-    mov rax, [rk_next]
-    call out_uint
-    lea rsi, [md_jn_rheld]
-    call out_cstr
-    mov rax, [rk_held]
-    call out_uint
-    lea rsi, [md_jn_rrev]
-    call out_cstr
-    mov rax, [rk_rev]
-    call out_uint
-    lea rsi, [md_jn_rej]
-    call out_cstr
-    mov r14d, 0
-    mov [rk_idx], r14
-rkse_rej:
-    mov rax, [rk_idx]
-    cmp rax, 6
-    jae rkse_rejdone
-    shl rax, 3
-    lea rsi, [rk_rej]
-    add rsi, rax
-    mov rax, [rsi]
-    call out_uint
-    cmp qword [rk_idx], 5
-    je rkse_rejnext
-    mov al, ','
-    call out_byte
-rkse_rejnext:
-    inc qword [rk_idx]
-    jmp rkse_rej
-rkse_rejdone:
-    mov al, ']'
-    call out_byte
-    lea rsi, [md_jn_rlift]
-    call out_cstr
-    call rank_eval
-    test rax, rax
-    jz rkse_lnull
-    movss xmm0, dword [rk_liftf]
-    call md_out_f32e6
-    jmp rkse_end
-rkse_lnull:
-    lea rsi, [jnull]
-    call out_cstr
-rkse_end:
-    mov al, '}'
-    call out_byte
-    pop r15
-    pop r14
-    pop r13
-    pop r12
-    pop r11
-    pop r10
-    pop r9
-    pop r8
-    pop rbp
-    pop rdi
-    pop rsi
-    pop rdx
-    pop rcx
-    pop rbx
-    pop rax
-    ret
-
-; rank_explain_neural(): emit neural shadow score or null. Preserves regs.
-rank_explain_neural:
-    push rax
-    push rbx
-    push rcx
-    push rdx
-    push rsi
-    push rdi
-    push rbp
-    push r8
-    push r9
-    push r10
-    push r11
-    push r12
-    push r13
-    push r14
-    push r15
-    call rank_try_weights
-    cmp qword [md_ready], 1
-    jne rkex_null
-    cmp qword [rk_owned], 1
-    je rkex_null
-    cmp qword [fbkind], 1
-    je rkex_obs
-    mov rdi, [fbkind]
-    lea rsi, [rsnbuf]
-    mov rdx, [rsnlen]
-    call use_slot_name
-    jmp rkex_got
-rkex_obs:
-    mov rdi, 1
-    mov rsi, [fbobsid]
-    call use_slot_id
-rkex_got:
-    test rax, rax
-    jz rkex_null
-    call rank_feat
-    call rank_predict1
-    call md_out_f32e6
-    jmp rkex_done
-rkex_null:
-    lea rsi, [jnull]
-    call out_cstr
-rkex_done:
-    pop r15
-    pop r14
-    pop r13
-    pop r12
-    pop r11
-    pop r10
-    pop r9
-    pop r8
-    pop rbp
-    pop rdi
-    pop rsi
-    pop rdx
-    pop rcx
-    pop rbx
-    pop rax
-    ret
-
 ; ensure_tables: create missing memory tables; fills f_root_*.
 ; conclusions with root 2 must exist (else foreign db -> err). rax 0/1.
 ensure_tables:
@@ -10538,28 +7096,6 @@ et_uok:
 et_tf2:
     mov [f_root_tomb], rax
 et_tok:
-    ; rankex (continual-learning examples; plain append, reader-tolerant)
-    lea rsi, [t_rankex_n]
-    mov edx, 6
-    call find_table
-    test rax, rax
-    js et_err
-    jnz et_rxf
-    lea rax, [t_rankex_n]
-    mov [m_name], rax
-    mov qword [m_namelen], 6
-    lea rax, [t_rankex_sql]
-    mov [m_sql], rax
-    mov rax, t_rankex_sqllen
-    mov [m_sqllen], rax
-    call et_mk
-    test rax, rax
-    jz et_err
-    mov [f_root_rankex], rax
-    jmp et_rok
-et_rxf:
-    mov [f_root_rankex], rax
-et_rok:
     xor eax, eax
     ret
 et_err:
@@ -11227,12 +7763,8 @@ sr_cell:
     test rcx, rcx
     jz sr_corrupt
     mov [tmprow], rax
-    cmp rax, [maxrowid]
-    jbe sr_hadmax
-    mov [maxrowid], rax         ; track table max during the walk, so the
-sr_hadmax:                      ; oc_insert ++[maxrowid] below is post-lock
-    mov rsi, rcx                ; fresh under concurrency (zero extra I/O:
-    call varint_get             ; hdrsize every visited cell is read anyway)
+    mov rsi, rcx                ; rec
+    call varint_get             ; hdrsize
     test rcx, rcx
     jz sr_corrupt
     mov rsi, rcx
@@ -11677,7 +8209,6 @@ op_fread:
     mov edi, 2                    ; fact use -> learn (stable name identity)
     lea rsi, [rsnbuf]
     mov rdx, [rsnlen]
-    xor ecx, ecx                  ; single read: advance the global clock
     call use_bump_name
     ; inner {"rowid":N,"name":"R","body":"B"}
     lea rax, [jsontmp]
@@ -11855,7 +8386,6 @@ op_flist:
     call db_open
     test rax, rax
     jnz oc_db
-    call tix_build              ; same per-query snapshot (ready=0 -> legacy)
     mov rdi, [f_root_facts]
     call walk_leaves
     test rax, rax
@@ -11964,15 +8494,6 @@ olf_add:
     mov rcx, r10
     rep movsb
     mov [rsnlen], r10
-    cmp qword [tix_ready], 1
-    jne ofl_tomblegacy
-    lea rsi, [rsnbuf]
-    mov rdx, [rsnlen]
-    call tix_lookup             ; pure predicate: pagebuf intact either way
-    cmp rax, 1
-    je olf_nextcell             ; hidden: no restore needed
-    jmp ofl_live                ; live: skip the restore pread, emit
-ofl_tomblegacy:
     lea rsi, [rsnbuf]
     mov rdx, [rsnlen]
     call is_tombstoned
@@ -11985,7 +8506,6 @@ ofl_tomblegacy:
     call pg_read
     test rax, rax
     jnz olf_nextcell
-ofl_live:
     cmp byte [hfirst], 1
     je olf_first
     mov al, '\'
@@ -12891,39 +9411,9 @@ st_hit:
     rep movsb
     mov rax, qword [gfl]
     mov [rsnlen], rax
-    ; The tomb walk below reuses pagebuf AND walks childtab/childn: spill
-    ; the outer walk's leaf list first (mirror rname_of's chsave pattern;
-    ; sequential use only, never nested). Without this every tomb-checked
-    ; hit derails the rest of the table scan into tomb pages.
-    ; Audited clobber set: pagebuf (restored below as before), childtab/
-    ; childn (restored here), growid (overwritten only on match, which
-    ; always skips — visible rows keep theirs); gfo/gfl/gcols/stab are
-    ; untouched (tomb walk parses manually into tmprow).
-    cmp qword [tix_ready], 1
-    jne st_tomblegacy
-    lea rsi, [rsnbuf]           ; same aside bytes the legacy call would use
-    mov rdx, [rsnlen]
-    call tix_lookup             ; pure predicate: walk state undisturbed
-    cmp rax, 1
-    je st_nextcell              ; hidden: pagebuf/childtab intact, no restore
-    jmp st_collect              ; live: pagebuf intact, no restore
-st_tomblegacy:
-    mov rcx, [childn]
-    mov [sk_cn], rcx
-    lea rsi, [childtab]
-    lea rdi, [chsave]
-    rep movsq
     lea rsi, [rsnbuf]
     mov rdx, [rsnlen]
     call is_tombstoned
-    push rax
-    mov rcx, [sk_cn]
-    lea rsi, [chsave]
-    lea rdi, [childtab]
-    rep movsq
-    mov rax, [sk_cn]
-    mov [childn], rax
-    pop rax
     cmp rax, 1
     je st_skip
     cmp rax, 2
@@ -12978,10 +9468,6 @@ stc_store:
     mov [rdx + 16], rcx
     mov rcx, [stcoff]
     mov [rdx + 24], rcx
-    mov [rkscore], rax
-    mov rax, [smode]
-    mov [rksmode], rax
-    call rank_snap_hook
     inc qword [sncol]
     mov rdi, [scurpg]               ; tomb walk reused pagebuf: restore
     lea rsi, [pagebuf]
@@ -13082,13 +9568,11 @@ se_loop:
     mov rdi, [smode]
     mov rsi, qword [gfo]         ; col0 = name (facts, entities)
     mov rdx, qword [gfl]
-    mov rcx, [ulqtick]           ; shared query tick
     call use_bump_name           ; surfaced -> learn
     jmp se_emitted
 se_obs:
     mov rdi, 1
     mov rsi, [growid]
-    mov rcx, [ulqtick]           ; shared query tick
     call use_bump_id
 se_emitted:
     call st_emit
@@ -13913,7 +10397,7 @@ ofb_open:
     mov rdx, [rsnlen]
     call dec_parse               ; observations: decimal rowid identity
     test rax, rax
-    jnz dc_params
+    jz dc_params
     test rdx, rdx
     jz dc_params
     mov [fbobsid], rdx
@@ -13945,11 +10429,7 @@ ofb_flush:
     call use_flush               ; durable on return: no silent loss
     test rax, rax
     jnz om_dbclose
-    call tm_fb_t0
-    call rank_capture
     call db_close
-    call rank_train
-    call tm_fb_t1
     lea rax, [jsontmp]
     mov [outptr], rax
     mov qword [outlen], 0
@@ -13976,7 +10456,6 @@ ofb_flush:
     jmp oc_envelope
 ofb_tomb:
     call db_close
-    inc qword [rk_rej + 16]
     lea rax, [jsontmp]
     mov [outptr], rax
     mov qword [outlen], 0
@@ -14085,7 +10564,7 @@ oex_db:
     mov rdx, [rsnlen]
     call dec_parse
     test rax, rax
-    jnz dc_params
+    jz dc_params
     test rdx, rdx
     jz dc_params
     mov [fbobsid], rdx
@@ -14175,9 +10654,6 @@ oex_close:
     call out_cstr
     mov rax, [exscore]
     call out_uint
-    lea rsi, [jn_neural]
-    call out_cstr
-    call rank_explain_neural
     lea rsi, [jn_weights]
     call out_cstr
     mov rax, U_WA
@@ -14369,14 +10845,9 @@ op_search:
     ja dc_params
     mov [slim], rax
 os_nolim:
-    inc qword [utick]
-    mov rax, [utick]
-    mov [ulqtick], rax          ; query tick: every memory surfaced by this
-    call db_open                ; search shares one recency timestamp
+    call db_open
     test rax, rax
     jnz oc_db
-    call tix_build              ; snapshot tombstones once per query (same SH
-                                ; hold as the walks; ready=0 -> legacy path)
     lea rax, [jsontmp]
     mov [outptr], rax
     call out_reset
@@ -15936,9 +12407,6 @@ ot_inner_end:
     call out_byte
     jmp emit
 
-; PeaBrain on-board model (Stages 1-3 proven). Code lives in the model dir.
-include 'model/md_code.asm'
-
 segment gnustack
 
 segment readable writeable
@@ -16027,18 +12495,6 @@ k_entity db '"entity"', 0
 k_prefix db '"prefix"', 0
 k_signal db '"signal"', 0
 k_kind db '"kind"', 0
-k_path db '"path"', 0
-k_x db '"x"', 0
-k_y db '"y"', 0
-k_target db '"target"', 0
-k_xs db '"xs"', 0
-k_ys db '"ys"', 0
-k_targets db '"targets"', 0
-k_steps db '"steps"', 0
-k_lr db '"lr"', 0
-k_hidden db '"hidden"', 0
-k_seed db '"seed"', 0
-k_activation db '"activation"', 0
 v_useful db 'useful', 0
 v_mislead db 'misleading', 0
 v_fact db 'fact', 0
@@ -16073,12 +12529,6 @@ t_versions db 'read_fact_versions', 0
 t_health db 'health', 0
 t_feedback db 'feedback', 0
 t_explain db 'explain_rank', 0
-t_modinit db 'model_init', 0
-t_modtrain db 'model_train', 0
-t_modpredict db 'model_predict', 0
-t_modsave db 'model_save', 0
-t_modload db 'model_load', 0
-t_modstatus db 'model_status', 0
 
 c_parse db '-32700', 0
 c_invalid db '-32600', 0
@@ -16129,9 +12579,6 @@ t_tomb_sqllen = $ - t_tomb_sql - 1
 t_use_n db 'usage', 0
 t_use_sql db 'CREATE TABLE usage(name TEXT, kind TEXT, access TEXT, pos TEXT, neg TEXT, last TEXT, conf TEXT, v TEXT)', 0
 t_use_sqllen = $ - t_use_sql - 1
-t_rankex_n db 'rankex', 0
-t_rankex_sql db 'CREATE TABLE rankex(name TEXT, kind TEXT, seq TEXT, x0 TEXT, x1 TEXT, target TEXT, det TEXT, rev TEXT)', 0
-t_rankex_sqllen = $ - t_rankex_sql - 1
 
 dbmagic db 'SQLite format 3', 0
 dbsql db 'CREATE TABLE conclusions(reason TEXT, thought TEXT, conclusion TEXT, valid INTEGER)', 0
@@ -16179,7 +12626,6 @@ jn_last db ',"last_tick":', 0
 jn_now db ',"now_tick":', 0
 jn_conf db ',"confidence":', 0
 jn_score db ',"score":', 0
-jn_neural db ',"neural":', 0
 jn_weights db ',"weights":{"a":', 0
 jn_wp db ',"p":', 0
 jn_wn db ',"n":', 0
@@ -16252,8 +12698,7 @@ r_toolsarr db '[{"name":"sequential_thinking"'
        db ',{"name":"search_nodes"'
        db ',"description":"Substring search over entities, observations, facts."'
        db ',"inputSchema":{"type":"object","properties":{"query":{"type":"string"}'
-       db ',"limit":{"type":"integer","description":"1..20, default 10"}}'
-       db ',"required":["query"]}}'
+       db ',"limit":{"type":"integer"}},"required":["query"]}}'
        db ',{"name":"open_nodes"'
        db ',"description":"Open entities with observations and relations."'
        db ',"inputSchema":{"type":"object","properties":{"names":{"type":"array"'
@@ -16303,36 +12748,11 @@ r_toolsarr db '[{"name":"sequential_thinking"'
        db ',"inputSchema":{"type":"object","properties":{"name":{"type":"string"}'
        db ',"signal":{"type":"string"},"kind":{"type":"string"}}}'
        db ',"required":["name","signal"]}'
-        db ',{"name":"explain_rank"'
-        db ',"description":"Why a memory ranks as it does: signals, score, weights."'
-        db ',"inputSchema":{"type":"object","properties":{"name":{"type":"string"}'
-        db ',"kind":{"type":"string"}}}'
-        db ',"required":["name"]}'
-        db ',{"name":"model_init"'
-        db ',"description":"Initialise the on-board trainable model (2->H->1 leaky MLP, FP32, AVX2/FMA)."'
-        db ',"inputSchema":{"type":"object","properties":{"hidden":{"type":"number"}'
-        db ',"seed":{"type":"number"},"activation":{"type":"string"}}}}'
-        db ',{"name":"model_train"'
-        db ',"description":"Train the on-board model on examples (full-batch SGD+momentum, deterministic)."'
-        db ',"inputSchema":{"type":"object","properties":{"xs":{"type":"array","items":{"type":"number"}}'
-        db ',"ys":{"type":"array","items":{"type":"number"}}'
-        db ',"targets":{"type":"array","items":{"type":"number"}}'
-        db ',"lr":{"type":"number"},"steps":{"type":"number"}}}'
-        db ',"required":["xs","ys","targets"]}'
-        db ',{"name":"model_predict"'
-        db ',"description":"Predict with the on-board model (FP32 forward)."'
-        db ',"inputSchema":{"type":"object","properties":{"xs":{"type":"array","items":{"type":"number"}}'
-        db ',"ys":{"type":"array","items":{"type":"number"}}}}'
-        db ',"required":["xs","ys"]}'
-        db ',{"name":"model_save"'
-        db ',"description":"Save model weights, biases, optimiser state and step (crash-safe PBMD)."'
-        db ',"inputSchema":{"type":"object","properties":{"path":{"type":"string"}}}}'
-        db ',{"name":"model_load"'
-        db ',"description":"Load a model checkpoint (validated; bad files rejected, current kept)."'
-        db ',"inputSchema":{"type":"object","properties":{"path":{"type":"string"}}}}'
-        db ',{"name":"model_status"'
-        db ',"description":"Model dimensions, steps, loss, memory, compute backend."'
-        db ',"inputSchema":{"type":"object","properties":{}}}]', 0
+       db ',{"name":"explain_rank"'
+       db ',"description":"Why a memory ranks as it does: signals, score, weights."'
+       db ',"inputSchema":{"type":"object","properties":{"name":{"type":"string"}'
+       db ',"kind":{"type":"string"}}}'
+       db ',"required":["name"]}]', 0
 
 lp dq 0
 ll dq 0
@@ -16407,7 +12827,6 @@ uloaded dq 0
 ulkey dq 0
 ulhits dq 0
 utick dq 0
-ulqtick dq 0
 uq_head dq 0
 uq_tail dq 0
 udropped dq 0
@@ -16486,7 +12905,6 @@ f_root_rel dq 0
 f_root_tasks dq 0
 f_root_use dq 0
 f_root_tomb dq 0
-f_root_rankex dq 0
 hfirst db 0
 v_num dq 0
 v_total dq 0
@@ -16545,63 +12963,6 @@ dbstat rb 144
 dstack rb 128
 ddepth dq 0
 ppg dq 0
-; PeaBrain on-board model consts (initialized, before trailing BSS).
-include 'model/md_consts.asm'
-; Continual-learning ranker consts (initialized, before trailing BSS).
-rk_lr dd 0.05
-rk_f8 dd 8.0
-rk_f32 dd 32.0
-rk_f64 dd 64.0
-rk_f1024 dd 1024.0
-rk_f05 dd 0.5
-rk_f025 dd 0.25
-rk_seed dq 0x12345678ABCDEF01
-rk_pbpath db 'rank.pbmd', 0
-; Reverse-identity index caps (rowid < RK_IDX_MAX in each table; names arena).
-RK_IDX_MAX = 65536
-RK_IDX_ARENA = 2097152
-; Timing instrumentation consts (opt-in via PEABRAIN_TIMING=1 in environ).
-tm_envpath db '/proc/self/environ', 0
-tm_envkey db 'PEABRAIN_TIMING=1', 0
-tm_envkeylen = $ - tm_envkey - 1
-; Canonical state directory (PEABRAIN_STATE_DIR, else ~/.local/share/peabrain).
-st_key_state db 'PEABRAIN_STATE_DIR=', 0
-st_key_statelen = $ - st_key_state - 1
-st_key_home db 'HOME=', 0
-st_key_homelen = $ - st_key_home - 1
-st_suffix db '/.local/share/peabrain', 0
-st_suffixlen = $ - st_suffix - 1
-st_e_prefix db 'peabrain: state: ', 0
-st_e_nohome db 'no state directory: set PEABRAIN_STATE_DIR or HOME', 0
-st_e_toolong db 'state path too long (max 240): ', 0
-st_e_notdir db 'not a usable directory: ', 0
-st_e_denied db 'inaccessible state path: ', 0
-st_e_mkfail db 'cannot create state directory: ', 0
-st_e_legacy db 'refusing: populated store exists outside empty state dir (migrate it or set PEABRAIN_STATE_DIR): ', 0
-st_e_nl db 10, 0
-st_e_perm db 'directory must be 0700 and owner-only: ', 0
-tm_l_pb db 'PB pid=', 0
-tm_l_op db ' op=', 0
-tm_l_idle db ' idle_ms=', 0
-tm_l_serve db ' serve_ms=', 0
-tm_l_lock db ' lock_ms=', 0
-tm_l_fsync db ' fsync_ms=', 0
-tm_l_ready db 'READY pid=', 0
-tm_l_ms db ' ms=', 0
-tm_l_boot db 'BOOT pid=', 0
-tm_l_firstop db ' firstop_ms=', 0
-tm_l_ensure db ' ensure_ms=', 0
-tm_l_useload db ' useload_ms=', 0
-tm_l_rankboot db ' rankboot_ms=', 0
-tm_l_rindexok db ' rindex_ok=', 0
-tm_l_user db ' user_ms=', 0
-tm_l_sys db ' sys_ms=', 0
-tm_l_fb db 'FB pid=', 0
-tm_l_persist db ' persist_ms=', 0
-tm_l_train db ' train_ms=', 0
-tm_l_save db ' save_ms=', 0
-tm_l_nl db 10, 0
-tm_l_unknown db 'unknown', 0
 sob rb 128
 ktab rb 768
 stab rb 64
@@ -16653,106 +13014,3 @@ obsbuf rb 1024
 fseen rb 16512
 tseetab rb 4096
 thslots rb 137216
-; Continual-learning ranker BSS (uninitialised, trailing: NOBITS).
-rk_snap rb 12288
-rk_snaphead rq 1
-rk_mem rb 98304
-rk_next rq 1
-rk_rev rq 1
-rk_rej rb 48
-rk_owned rq 1
-rk_bootdone rq 1
-rk_dbcount rq 1
-rk_bootskip rq 1
-rk_held rq 1
-rk_idx rq 1
-rk_wtried rq 1
-rk_liftf rb 4
-rk_X1 rb 8
-rk_T1 rb 4
-rk_evalbuf rb 512
-rkscore rq 1
-rksmode rq 1
-rk_jx0 rb 4
-rk_jx1 rb 4
-rk_jdet rq 1
-rk_jheld rb 1
-rk_num5 rb 24
-; Reverse-identity index (boot, read-only): rowid -> (arena off, len).
-rk_ixf rb 524288
-rk_ixe rb 524288
-rk_ixarena rb 2097152
-rk_ixused rq 1
-rk_idx_ok rq 1
-rk_ixbase rq 1
-; Timing instrumentation BSS (all zero; active only when tm_on==1).
-tm_on rq 1
-tm_pid rq 1
-tm_t0s rq 1
-tm_t0n rq 1
-tm_rs rq 1
-tm_rn rq 1
-tm_ss rq 1
-tm_sn rq 1
-tm_as rq 1
-tm_an rq 1
-tm_bs rq 1
-tm_bn rq 1
-tm_cs rq 1
-tm_cn rq 1
-tm_fs rq 1
-tm_fn rq 1
-tm_fb0s rq 1
-tm_fb0n rq 1
-tm_fbp rq 1
-tm_fbt rq 1
-tm_fbs rq 1
-tm_ensure rq 1
-tm_useload rq 1
-tm_rankboot rq 1
-tm_lock rq 1
-tm_fsynct rq 1
-tm_ret rq 1
-tm_cur rq 1
-tm_armed rq 1
-tm_bootrep rq 1
-tm_bootdone rq 1
-tm_dbready rq 1
-tm_idle rq 1
-tm_opnamelen rq 1
-tm_ru0 rb 144
-tm_ru1 rb 144
-tm_opname rb 40
-tm_tmp rb 32
-tm_buf rb 256
-tm_ebuf rb 4100
-; Canonical state directory (resolved once at boot; see st_resolve).
-st_dir rb 1056
-st_dirlen rq 1
-st_ebuf rb 4100
-st_tmp rb 1104
-st_brk rb 2
-st_statb rb 144
-st_pbmd rb 272
-st_rkpb rb 272
-st_ebulen rq 1
-sk_cn rq 1
-; Per-query tombstone membership snapshot (exact, read-only, transient).
-; Built once per read query under the same SH hold as the walks (no writer
-; can interleave: writers need EX). tix_ready=1 only on a fully clean
-; table; ANY anomaly abandons the build and the legacy per-candidate
-; is_tombstoned path runs instead (bit-identical fallback, never wrong).
-; Slots: hash qword (0 = empty; FNV 0 is stored as 1), len dword, pool dword.
-tix_tab rb 524288
-tix_pool rb 1048576
-tix_ready rq 1
-tix_n rq 1
-tix_pooln rq 1
-tx_sptr rq 1
-tx_body rq 1
-tx_s0 rq 1
-tx_cnt rq 1
-tx_first rb 1
-
-; PeaBrain on-board model data (consts, then ALL rb trailing: NOBITS).
-include 'model/md_data.asm'
