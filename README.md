@@ -118,6 +118,38 @@ Every response uses the MCP `content` envelope.
 pending_flush}`; `pending_flush:true` after reads is normal (learned
 hits flush on exit or piggyback on the next write commit).
 
+## Running as a dedicated service user
+
+For shared or unattended operation, run PeaBrain as its own
+unprivileged user (for example `peabrain:peabrain`) rather than as
+the invoking user, and point it at a state directory that user owns:
+
+```sh
+sudo -u peabrain \
+  PEABRAIN_STATE_DIR=/var/saphira/PeaBrain \
+  /usr/bin/peabrain
+```
+
+Requirements, all enforced by the binary itself:
+
+- the state directory must exist, be owned by the service user, and
+  be mode `0700` (anything else is refused before any database work);
+- the database file is created `0600` and ownership-checked on every
+  open, so a store can never be silently shared across accounts;
+- clients that spawn the server non-interactively (no TTY for a
+  password prompt) need a narrow passwordless sudo grant for exactly
+  that command line, e.g. in `/etc/sudoers.d/peabrain`:
+
+```
+%wheel ALL=(peabrain) NOPASSWD: /usr/bin/env PEABRAIN_STATE_DIR=/var/saphira/PeaBrain /usr/bin/peabrain
+```
+
+Do NOT make the binary setuid as a shortcut: a setuid transition
+changes how the process reads its own environment, so the configured
+state directory silently never arrives (the server reports "no state
+directory" and exits). A full user switch via `sudo -u` carries a
+complete environment and is the supported path.
+
 ## Documented limits
 
 - Cells ≤ ~1100 bytes; identifiers 1–128 chars `[A-Za-z0-9._@:+#~-]`; text ASCII only.
