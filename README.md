@@ -254,7 +254,8 @@ table and friends live in zero-backed memory.
 ## Licence
 
 PeaBrain is covered by the Business Source License 1.1 (BUSL-1.1) —
-see [LICENSE](./LICENSE). Copyright (c) 2026 AKADATA LIMITED.
+see [LICENSE](./LICENSE). Copyright (c) 4 November 2026 AKADATA LIMITED —
+code first published 4 November 2026.
 
 In short: you may copy, modify, create derivative works and
 redistribute, and make non-production use. Limited production use is
