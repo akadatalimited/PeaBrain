@@ -250,3 +250,60 @@ before an 8-byte `dq` → 1 MB file; after → 193 bytes). Moving the giant
 tables (`childtab`, `utab`, `thslots`, caches, learning queue) after the
 last initialized datum keeps the file tiny while the 8 MiB learning
 table and friends live in zero-backed memory.
+
+## Licence
+
+PeaBrain is covered by the Business Source License 1.1 (BUSL-1.1) —
+see [LICENSE](./LICENSE). Copyright (c) 2026 AKADATA LIMITED.
+
+In short: you may copy, modify, create derivative works and
+redistribute, and make non-production use. Limited production use is
+permitted except offering the work to third parties on a hosted or
+embedded basis to compete with AKADATA's paid versions or services.
+Each version converts to GPL-2.0-or-later on its Change Date (four
+years after first public distribution of that version).
+
+## Forks vs language ports
+
+Forks are encouraged. Fork it. Clone it. Use it. Modify it in ASM.
+FINE — keep the licence and copyright notices displayed, give visible
+credit with a link back to this repository, and state what you changed.
+
+Language ports are NOT PeaBrain. Nothing comes from ASM apart from
+ASM. Rewriting PeaBrain in Rust, Go, Python or any other language, and
+bolting on vector search, CRDT sync, embeddings, model downloads,
+plugin marketplaces, native loaders or any other code that was never
+part of this repository, does not make it PeaBrain and does not make
+it an evolution of PeaBrain.
+
+Any such port is an unofficial derivative and must be presented as
+one:
+
+- keep the BUSL licence and copyright notices displayed;
+- state prominently that it is unofficial, not affiliated with and not
+  endorsed by AKADATA LIMITED, and not the same thing as ASM PeaBrain;
+- state what was rewritten and what was added, and that the added
+  parts were never part of PeaBrain;
+- do not claim the work originated in the new language;
+- do not name it, package it, or describe it in a way that confuses
+  origin — mark it clearly, e.g. "unofficial Rust port of AKADATA
+  PeaBrain";
+- do not reuse the `peabrain.db` filename, state directory defaults,
+  or tool branding in a way that collides with or overwrites a user's
+  real PeaBrain store.
+
+### Project identity and derivative implementations
+
+PeaBrain is an original AKADATA LIMITED project implemented in x86-64 assembly.
+
+Its assembly implementation, minimal dependencies, local learning architecture and operational guarantees are fundamental to the project.
+
+We encourage studying, experimenting with and building upon our work in accordance with its applicable licence.
+
+Independent ports and rewrites are welcome to identify their relationship to PeaBrain, provided they clearly acknowledge AKADATA LIMITED as the originator and distinguish their own implementation from the original.
+
+A rewrite in Rust, C, Python or another language is not the original PeaBrain implementation. Additional frameworks, downloaded models, plugins or other functionality must be identified as features of that independent implementation, not attributed to AKADATA's original project.
+
+Independent implementations must not imply official status, endorsement, compatibility or equivalent security and operational guarantees without appropriate authorisation or supporting evidence.
+
+Please preserve applicable copyright and licence notices and make substantial changes clear.
